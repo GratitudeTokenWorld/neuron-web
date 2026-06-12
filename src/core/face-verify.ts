@@ -1,0 +1,463 @@
+import * as tf from '@tensorflow/tfjs';
+import * as faceapi from '@vladmandic/face-api';
+import { bytesToHex } from './dag-block';
+
+let modelsLoaded = false;
+
+const MODEL_URL = '/models';
+const MATCH_THRESHOLD = 0.45;
+const ENROLLMENT_SAMPLES = 3;
+/** Quantization bin size - coarser = more stable across sessions, less unique */
+const QUANT_BIN = 0.1;
+
+export interface FaceDescriptor {
+  data: number[];
+  capturedAt: number;
+}
+
+export interface FaceMap {
+  canonical: number[];
+  quantized: number[];
+  hash: string;
+  samples: number;
+  createdAt: number;
+}
+
+// ──── Model Loading ────
+
+export async function loadModels(): Promise<void> {
+  if (modelsLoaded) return;
+  await tf.ready();
+  await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+  await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+  await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+  modelsLoaded = true;
+}
+
+export function areModelsLoaded(): boolean {
+  return modelsLoaded;
+}
+
+// ──── Camera ────
+
+export async function startCamera(video: HTMLVideoElement): Promise<MediaStream> {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+  });
+  video.srcObject = stream;
+  // Resolve only once playback has actually begun — onloadedmetadata fires when dimensions
+  // are known but before any frame is rendered, so awaiting play() here prevents callers
+  // from running face detection against an empty/not-yet-streaming video element.
+  await new Promise<void>((resolve) => {
+    video.onloadedmetadata = () => { void video.play().catch(() => {}).finally(resolve); };
+  });
+  return stream;
+}
+
+export function stopCamera(stream: MediaStream): void {
+  stream.getTracks().forEach((t) => t.stop());
+}
+
+// ──── Face Descriptor Capture ────
+
+export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
+  try {
+    const detection = await faceapi
+      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+      .withFaceLandmarks()
+      .withFaceDescriptor();
+
+    if (!detection) return null;
+
+    return {
+      data: Array.from(detection.descriptor),
+      capturedAt: Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Enroll a face: capture multiple samples, average into canonical descriptor,
+ * then quantize for stable key derivation.
+ */
+export async function enrollFace(
+  video: HTMLVideoElement,
+  onProgress: (step: number, total: number, status: string) => void,
+): Promise<FaceMap | null> {
+  const descriptors: number[][] = [];
+  let retries = 0;
+
+  for (let i = 0; i < ENROLLMENT_SAMPLES; i++) {
+    onProgress(i + 1, ENROLLMENT_SAMPLES, `Capturing sample ${i + 1} of ${ENROLLMENT_SAMPLES}...`);
+    await sleep(800);
+
+    const desc = await captureFaceDescriptor(video);
+    if (!desc) {
+      if (retries++ > 10) return null;
+      onProgress(i + 1, ENROLLMENT_SAMPLES, 'No face detected. Look at the camera.');
+      i--;
+      await sleep(1000);
+      continue;
+    }
+    descriptors.push(desc.data);
+  }
+
+  if (descriptors.length < ENROLLMENT_SAMPLES) return null;
+
+  // Average descriptors
+  const canonical = new Array(128).fill(0);
+  for (const d of descriptors) {
+    for (let i = 0; i < 128; i++) canonical[i] += d[i];
+  }
+  for (let i = 0; i < 128; i++) canonical[i] /= descriptors.length;
+
+  const quantized = quantizeDescriptor(canonical);
+  const hash = await hashDescriptor(quantized);
+
+  return { canonical, quantized, hash, samples: descriptors.length, createdAt: Date.now() };
+}
+
+// ──── Challenge Action Detection ────
+
+type Point = { x: number; y: number };
+
+function dist(a: Point, b: Point): number {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+
+function eyeAspectRatio(pts: Point[]): number {
+  // pts[0..5] = 6 eye landmarks (one eye)
+  // EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+  const A = dist(pts[1], pts[5]);
+  const B = dist(pts[2], pts[4]);
+  const C = dist(pts[0], pts[3]);
+  return C < 0.001 ? 0 : (A + B) / (2 * C);
+}
+
+function smileRatio(pts: Point[]): number {
+  // Mouth corners 48 & 54, top lip 51, bottom lip 57 (in 68-pt model)
+  const mouthWidth  = dist(pts[48], pts[54]);
+  const mouthHeight = dist(pts[51], pts[57]);
+  return mouthWidth < 0.001 ? 0 : mouthHeight / mouthWidth;
+}
+
+/**
+ * Detect a specific facial action before face capture.
+ * Blocks until the action is confirmed or the timeout expires.
+ *
+ * Actions:
+ *   blink      — eyes seen open, then EAR drops below threshold for 2+ consecutive frames
+ *   look-left  — nose X shifts left ≥8 % of video width
+ *   look-right — nose X shifts right ≥8 % of video width
+ *   smile      — mouth height/width ratio exceeds threshold
+ *
+ * Returns true when the action is detected, false on timeout.
+ */
+export async function detectChallenge(
+  video: HTMLVideoElement,
+  type: 'blink' | 'look-left' | 'look-right' | 'smile',
+  timeoutMs = 12000,
+  onStatus?: (msg: string) => void,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const EAR_THRESHOLD = 0.28;
+  // Require ≥2 consecutive below-threshold frames (~160ms at 80ms/frame), and only
+  // after the eyes have been seen open — a static photo (eyes always open OR always
+  // closed) and single-frame sensor noise can no longer register as a blink.
+  const BLINK_FRAMES  = 2;
+  // mouthHeight/mouthWidth. A relaxed/neutral closed mouth sits well below this;
+  // a genuine smile (mouth widens / parts) clears it without straining. Empirically
+  // a full smile reaches ~0.28, so 0.22 gives margin above neutral and headroom to pass.
+  const SMILE_THRESHOLD = 0.22;
+  let earBelowCount = 0;
+  let sawEyesOpen = false;
+  let baselineNoseX: number | null = null;
+  const baselineSamples: number[] = [];
+
+  const actionLabel =
+    type === 'blink' ? 'blink' :
+    type === 'smile' ? 'smile' :
+    type === 'look-left' ? 'look left' : 'look right';
+
+  onStatus?.(`${actionLabel.toUpperCase()} now — keep looking at the camera`);
+
+  while (Date.now() < deadline) {
+    let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
+    let det: { landmarks?: { positions: Point[] } } | undefined;
+    try {
+      det = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
+    } catch {
+      await sleep(100); continue;
+    }
+    if (!det?.landmarks) { await sleep(100); continue; }
+
+    const pts = det.landmarks.positions as Point[];
+    const videoWidth = video.videoWidth || 640;
+
+    if (type === 'blink') {
+      const rightEAR = eyeAspectRatio(pts.slice(36, 42));
+      const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
+      const ear = (rightEAR + leftEAR) / 2;
+      if (ear < EAR_THRESHOLD) {
+        // Only count a closure as a blink once we've confirmed the eyes were open —
+        // this requires a real open→closed transition, defeating a static photo.
+        if (sawEyesOpen) {
+          earBelowCount++;
+          if (earBelowCount >= BLINK_FRAMES) { onStatus?.('Blink detected!'); return true; }
+        }
+      } else {
+        sawEyesOpen = true;
+        earBelowCount = 0;
+      }
+      onStatus?.(`BLINK — open your eyes, then close them briefly (EAR ${ear.toFixed(2)})`);
+
+    } else if (type === 'look-left' || type === 'look-right') {
+      const nose = pts[30];
+      if (baselineNoseX === null) {
+        baselineSamples.push(nose.x);
+        if (baselineSamples.length >= 5) {
+          baselineNoseX = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
+        } else {
+          await sleep(80); continue;
+        }
+      }
+      const delta = Math.abs(nose.x - baselineNoseX);
+      const threshold = videoWidth * 0.08;
+      if (delta > threshold * 0.85) { onStatus?.(`${type === 'look-left' ? 'Look-left' : 'Look-right'} detected!`); return true; }
+      const pct = Math.min(99, Math.round((delta / threshold) * 100));
+      onStatus?.(`LOOK ${type === 'look-left' ? 'LEFT' : 'RIGHT'} — turn your head (${pct}%)`);
+
+    } else if (type === 'smile') {
+      const ratio = smileRatio(pts);
+      if (ratio > SMILE_THRESHOLD) { onStatus?.('Smile detected!'); return true; }
+      const pct = Math.min(99, Math.round((ratio / SMILE_THRESHOLD) * 100));
+      onStatus?.(`SMILE! (${pct}%)`);
+    }
+
+    await sleep(80);
+  }
+
+  onStatus?.(`Challenge timed out — ${actionLabel} not detected`);
+  return false;
+}
+
+// ──── Liveness Detection (Movement) ────
+
+/**
+ * Liveness detection via face movement.
+ *
+ * Tracks the nose landmark across frames and confirms the user
+ * moved their head (proving live person, not a static photo).
+ * Much more reliable than blink/EAR detection.
+ */
+export async function detectLiveness(
+  video: HTMLVideoElement,
+  timeoutMs = 15000,
+  onStatus?: (msg: string) => void,
+): Promise<boolean> {
+  const startTime = Date.now();
+  let framesWithFace = 0;
+  let framesWithoutFace = 0;
+  const nosePositions: { x: number; y: number }[] = [];
+  const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
+  const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
+
+  // Don't claim a face was found before we've actually looked — show a neutral prompt until
+  // the detection loop confirms one (otherwise "Face detected" flashes before the camera
+  // has even produced a frame).
+  onStatus?.('Position your face in the frame...');
+
+  while (Date.now() - startTime < timeoutMs) {
+    // Skip detection until the camera is actually streaming frames — running face-api on a
+    // not-yet-playing video element wastes a cycle and can briefly report a stale result.
+    if (video.readyState < 2 || !video.videoWidth) { await sleep(100); continue; }
+
+    let detection;
+    try {
+      detection = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks();
+    } catch {
+      await sleep(200);
+      continue;
+    }
+
+    if (detection) {
+      framesWithFace++;
+      const nose = detection.landmarks.positions[30];
+      nosePositions.push({ x: nose.x, y: nose.y });
+      if (nosePositions.length > 40) nosePositions.shift();
+
+      if (nosePositions.length >= 5) {
+        const xs = nosePositions.map((p) => p.x);
+        const ys = nosePositions.map((p) => p.y);
+        const totalRange = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+
+        // Count direction changes in X axis (left-right reversals)
+        let dirChanges = 0;
+        for (let i = 2; i < nosePositions.length; i++) {
+          const dx1 = nosePositions[i - 1].x - nosePositions[i - 2].x;
+          const dx2 = nosePositions[i].x - nosePositions[i - 1].x;
+          if ((dx1 > 1 && dx2 < -1) || (dx1 < -1 && dx2 > 1)) dirChanges++;
+        }
+
+        const movementPct = Math.min(50, Math.round((totalRange / MIN_MOVEMENT) * 50));
+        const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
+        const progress = movementPct + dirPct;
+
+        onStatus?.(`Liveness: ${progress}% - turn head left then right`);
+
+        if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
+          onStatus?.('Liveness confirmed!');
+          return true;
+        }
+      } else {
+        onStatus?.(`Face detected (${framesWithFace}) - slowly move your head...`);
+      }
+    } else {
+      framesWithoutFace++;
+      if (framesWithoutFace % 8 === 0) {
+        onStatus?.('No face detected - move closer, ensure good lighting.');
+      }
+    }
+    await sleep(100);
+  }
+
+  onStatus?.(`Liveness failed (${framesWithFace} face frames). Try with better lighting.`);
+  return false;
+}
+
+// ──── Quantization ────
+
+/**
+ * Quantize a 128-D descriptor into stable bins.
+ * Each value is rounded to the nearest QUANT_BIN.
+ * This ensures the same face produces the same quantized vector
+ * across sessions (within tolerance).
+ */
+export function quantizeDescriptor(descriptor: number[]): number[] {
+  return descriptor.map((v) => Math.round(v / QUANT_BIN) * QUANT_BIN);
+}
+
+// ──── Face-Derived Key ────
+
+/**
+ * Derive a stable AES encryption key from a quantized face descriptor.
+ * Salt is per-account: "neuronchain-face-v2:<accountPub>" - prevents cross-account
+ * rainbow tables even if two accounts share similar descriptors.
+ */
+export async function deriveFaceKey(quantized: number[], accountPub: string): Promise<CryptoKey> {
+  const descriptorStr = quantized.map((v) => v.toFixed(4)).join(',');
+  const encoded = new TextEncoder().encode(descriptorStr);
+  const salt = new TextEncoder().encode(`neuronchain-face-v2:${accountPub}`);
+
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', encoded, 'PBKDF2', false, ['deriveKey'],
+  );
+
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+/**
+ * Derive 32 raw bytes from a quantized face descriptor using PBKDF2-SHA-256.
+ * Uses the same per-account salt as deriveFaceKey.
+ */
+export async function deriveFaceRawBits(quantized: number[], accountPub: string): Promise<Uint8Array> {
+  const descriptorStr = quantized.map((v) => v.toFixed(4)).join(',');
+  const encoded = new TextEncoder().encode(descriptorStr);
+  const salt = new TextEncoder().encode(`neuronchain-face-v2:${accountPub}`);
+
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', encoded, 'PBKDF2', false, ['deriveBits'],
+  );
+
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/**
+ * Encrypt data with a face-derived AES-GCM key.
+ */
+export async function encryptWithFaceKey(data: string, faceKey: CryptoKey): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = new TextEncoder().encode(data);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    faceKey,
+    encoded,
+  );
+  // Combine IV + ciphertext, encode as base64
+  const combined = new Uint8Array(iv.length + new Uint8Array(ciphertext).length);
+  combined.set(iv);
+  combined.set(new Uint8Array(ciphertext), iv.length);
+  return uint8ToBase64(combined);
+}
+
+/**
+ * Decrypt data with a face-derived AES-GCM key.
+ * Returns null if decryption fails (wrong face / corrupted data).
+ */
+export async function decryptWithFaceKey(encrypted: string, faceKey: CryptoKey): Promise<string | null> {
+  try {
+    const raw = atob(encrypted);
+    const combined = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) combined[i] = raw.charCodeAt(i);
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      faceKey,
+      ciphertext,
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    return null; // Wrong face - decryption failed
+  }
+}
+
+// ──── Comparison ────
+
+export function compareFaces(a: number[], b: number[]): { distance: number; match: boolean } {
+  let sum = 0;
+  for (let i = 0; i < 128; i++) sum += (a[i] - b[i]) ** 2;
+  const distance = Math.sqrt(sum);
+  return { distance, match: distance < MATCH_THRESHOLD };
+}
+
+// ──── Hashing ────
+
+export async function hashDescriptor(descriptor: number[]): Promise<string> {
+  const str = descriptor.map((v) => v.toFixed(4)).join(',');
+  const encoded = new TextEncoder().encode(str);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+  return bytesToHex(new Uint8Array(hashBuffer));
+}
+
+// ──── Helpers ────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Encode Uint8Array to base64 without spread operator (safe for large arrays). */
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+export { MATCH_THRESHOLD, ENROLLMENT_SAMPLES, QUANT_BIN };

@@ -4,3 +4,14 @@ dist/
 .DS_Store
 coverage/
 .vitest/
+.vite/
+.certs/
+.relay-data/
+*.local
+
+# Relay runtime state — secrets/biometrics, never commit
+.relay-signing-key.json
+.relay-face-db.json
+.relay-face-counts.json
+.relay-peer-id.json
+reload.log

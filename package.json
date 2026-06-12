@@ -1,29 +1,58 @@
 {
   "name": "neuron-web",
-  "version": "0.0.1",
-  "description": "Scalable, sharded, age-weighted-personhood account-chain core. Phase 0 foundations.",
+  "version": "0.1.0",
+  "description": "Scalable social-dApp core (sharded, age-weighted-personhood) plus the app shell (UI, transport, face+PIN, relay) carried over from neuronchain.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "src/main.ts",
   "scripts": {
+    "dev": "vite",
+    "relay": "node relay-server.js",
+    "tunnel": "npx untun@latest tunnel http://localhost:5173",
+    "build": "vite build",
+    "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "typecheck": "tsc --noEmit -p tsconfig.engine.json",
+    "postinstall": "patch-package"
   },
-  "keywords": [
-    "blockchain",
-    "p2p",
-    "sharding",
-    "proof-of-personhood"
-  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GratitudeTokenWorld/neuron-web.git"
+  },
   "license": "MIT",
   "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@libp2p/bootstrap": "^12.0.15",
+    "@libp2p/circuit-relay-v2": "^4.1.7",
+    "@libp2p/identify": "^4.0.14",
+    "@libp2p/kad-dht": "^16.1.7",
+    "@libp2p/ping": "^3.0.14",
+    "@libp2p/tcp": "^11.0.14",
+    "@libp2p/webrtc": "^6.0.15",
+    "@libp2p/websockets": "^10.1.7",
+    "@libp2p/yamux": "^8.0.1",
+    "@mediapipe/tasks-vision": "^0.10.34",
     "@noble/curves": "^1.6.0",
-    "@noble/hashes": "^1.5.0"
+    "@noble/hashes": "^1.5.0",
+    "@noble/post-quantum": "^0.6.1",
+    "@sinclair/smoke": "^0.8.9",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "buffer": "^6.0.3",
+    "idb": "^8.0.1",
+    "libp2p": "^3.1.7",
+    "multiformats": "^13.4.2",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
-    "typescript": "^5.6.3",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "patch-package": "^8.0.1",
     "vitest": "^2.1.8"
+  },
+  "overrides": {
+    "node-fetch": "^3.3.2"
   }
 }
