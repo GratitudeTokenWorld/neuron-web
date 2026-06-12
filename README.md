@@ -13,7 +13,7 @@ serves:
 ## Status — Phase 0 (foundations)
 
 Phase 0 establishes the cryptographic primitives every later phase builds on.
-All implemented with tests (`npm test` — 31 passing) and typechecked.
+(The whole project: `npm test` — 86 passing across all phases, typechecked.)
 
 | Module | Purpose |
 |--------|---------|
@@ -111,6 +111,30 @@ DHT) and the 100 MB-file crash (quota-guarded chunking).
 
 See [`src/content/discovery.test.ts`](src/content/discovery.test.ts).
 
+## Status — Phase 4 (economy & relay federation)
+
+The incentive and connectivity layers that make the tiered network self-sustaining.
+
+| Module | Purpose |
+|--------|---------|
+| [`src/economy/rewards.ts`](src/economy/rewards.ts) | Capped reward inflation minted to active validators/providers by contribution |
+| [`src/net/relay-directory.ts`](src/net/relay-directory.ts) | Relay federation via rendezvous (HRW) hashing — scales past the old 1024 cap |
+
+**Phase 4 properties (tested):** emission is capped at a parts-per-million rate of
+supply (with a bootstrap floor) and nothing mints without contributors; relay
+assignment is deterministic + balanced, reshuffles <10% of peers when a relay
+joins, and scales by *adding relays* (1B peers ÷ 100k/relay = 20k relays) rather
+than raising any single relay's ceiling.
+
+## End-to-end capstone
+
+[`src/integration.test.ts`](src/integration.test.ts) exercises **all four phases in
+one scenario**: open accounts with identity attestations + global dedup (P0) →
+followers partially replicate only what they follow (P1) → a double-spend is caught,
+a committee resolves the fork and an equivocating validator is slashed, the
+double-spend is independently proven (P2) → 20 MB media is chunked, stored
+quota-safely, announced to the DHT, and discovered by another node (P3).
+
 ## Develop
 
 ```sh
@@ -131,7 +155,9 @@ npm run build     # tsc → dist/
 - **Phase 3 ✓** — content addressing + chunking (quota-safe large files), Chord
   provider-record DHT (distributed index, O(log N) discovery). (Real libp2p
   Kademlia + smoke-HTTP transport + replication/repair land with transport.)
-- **Phase 4** — relay federation, incentives, security hardening.
+- **Phase 4 ✓** — capped reward inflation + relay federation (rendezvous hashing).
+  (Live transport wiring, real beacon/VRF, and load tests are the remaining
+  integration work; every interface they need is built and tested here.)
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full plan, the consensus
 threat model, and the defense-in-depth around the personhood dependency.

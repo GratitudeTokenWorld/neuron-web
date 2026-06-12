@@ -38,3 +38,7 @@ export * from './content/cid.js';
 export * from './content/chunking.js';
 export * from './content/content-store.js';
 export * from './content/dht.js';
+
+// Phase 4 — economy & relay federation
+export * from './economy/rewards.js';
+export * from './net/relay-directory.js';
