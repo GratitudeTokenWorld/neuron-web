@@ -84,6 +84,33 @@ with the cap = the free mint.
 - **Equivocation is self-incriminating** — double-voting / double-spending
   produces verifiable evidence that burns the offender's bond.
 
+## Status — Phase 3 (content & discovery)
+
+Fixes the two storage killers from the audit: the global file index (replaced by a
+DHT) and the 100 MB-file crash (quota-guarded chunking).
+
+| Module | Purpose |
+|--------|---------|
+| [`src/content/cid.ts`](src/content/cid.ts) | Content addressing (SHA-256 CIDs, integrity check) |
+| [`src/content/chunking.ts`](src/content/chunking.ts) | Chunk/manifest/reassemble — no blob exceeds the chunk size |
+| [`src/content/content-store.ts`](src/content/content-store.ts) | Quota-aware store; pre-checks space, dedups chunks |
+| [`src/content/dht.ts`](src/content/dht.ts) | Chord provider-record DHT — distributed index, O(log N) discovery |
+
+**Phase 3 validation criteria (met, measured):**
+- **100 MB media works** — chunked into bounded blobs, reassembled by CID; an
+  undersized quota fails cleanly with nothing written (no crash).
+- **Per-node index independent of total files** — grows the network + files 16×,
+  per-node provider-record index stays flat while old global-index would grow:
+
+```
+  N      files    avg index   max index   max hops   log2(N)
+  64     256      32.0        59          6          6
+  256    1024     32.0        76          7          8
+  1024   4096     32.0        72          8          10
+```
+
+See [`src/content/discovery.test.ts`](src/content/discovery.test.ts).
+
 ## Develop
 
 ```sh
@@ -101,7 +128,9 @@ npm run build     # tsc → dist/
   conflict voting, slashing, double-spend fraud proofs, stake-bonded rate limit.
   (Real randomness beacon + per-validator VRF proofs, and the end-to-end
   cross-shard settlement flow, land when wired to transport.)
-- **Phase 3** — content/media CDN via DHT provider records; quota-safe large files.
+- **Phase 3 ✓** — content addressing + chunking (quota-safe large files), Chord
+  provider-record DHT (distributed index, O(log N) discovery). (Real libp2p
+  Kademlia + smoke-HTTP transport + replication/repair land with transport.)
 - **Phase 4** — relay federation, incentives, security hardening.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full plan, the consensus

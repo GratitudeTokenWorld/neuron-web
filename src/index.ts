@@ -32,3 +32,9 @@ export * from './consensus/vote.js';
 export * from './consensus/slashing.js';
 export * from './consensus/fraud.js';
 export * from './consensus/rate-limit.js';
+
+// Phase 3 — content & discovery
+export * from './content/cid.js';
+export * from './content/chunking.js';
+export * from './content/content-store.js';
+export * from './content/dht.js';
