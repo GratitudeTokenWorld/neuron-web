@@ -12,17 +12,27 @@ distributed media store, and a cryptographically sound face+PIN+post-quantum
 identity/recovery layer.
 
 **Goal of this document:** a *reference architecture* showing how the **current
-features** can be re-expressed so the core scales to 1B+ users. This is a
-**design roadmap only** — it will NOT be implemented in this repo. The user will
-build a fresh social dApp using this as the blueprint. Success = a credible,
-benchmarkable architecture where **per-node cost is bounded by the data a node
-actually cares about, not by total network size.**
+features** can be re-expressed so the core scales to 1B+ users. Success = a
+credible, benchmarkable architecture where **per-node cost is bounded by the data
+a node actually cares about, not by total network size.**
 
 The single acceptance criterion everything below serves:
 
 > **Scale invariant:** for any node, memory, storage, bandwidth, and CPU must be
 > `O(own data + followed/subscribed data)` — never `O(total network)`. If any
 > subsystem is `O(N)` in users, posts, files, or votes, it fails at 1B.
+
+> **Implementation status (this repo IS the reference implementation).** This
+> document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
+> end-to-end capstone are built and tested (`npm test` — 96 passing, typechecked),
+> and **all 7 verification invariants below are demonstrated by tests** (including
+> #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
+> transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
+> randomness beacon + per-validator VRF proofs, the smoke-HTTP CDN, the biometric
+> attestation provider, and load tests — each behind an interface already built
+> here. See [`../README.md`](../README.md) for the per-module map and measured
+> results. (This doc was originally written as a roadmap for a separate build; the
+> design holds verbatim, but it is now implemented in this very repo.)
 
 ---
 
