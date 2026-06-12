@@ -58,6 +58,32 @@ grows linearly:
 
 See [`src/sim/scenario.test.ts`](src/sim/scenario.test.ts).
 
+## Status — Phase 2 (consensus: age-weighted personhood)
+
+The consensus layer: capital cannot buy dominance; weight comes from being a
+unique, long-active human. `weight = saturating_activity_age × √(bonded ≤ cap)`,
+with the cap = the free mint.
+
+| Module | Purpose |
+|--------|---------|
+| [`src/consensus/weight.ts`](src/consensus/weight.ts) | Voting weight (age × concave stake); documents why 1h1a enables concave weighting |
+| [`src/consensus/validators.ts`](src/consensus/validators.ts) | Validator set: bond/unbond (capped, lockable), activity-age, slashing |
+| [`src/consensus/committee.ts`](src/consensus/committee.ts) | Beacon-seeded per-shard committee sortition (unbiasable, non-grindable, seniority floor) |
+| [`src/consensus/vote.ts`](src/consensus/vote.ts) | Weighted optimistic + conflict-only voting with equivocation detection |
+| [`src/consensus/slashing.ts`](src/consensus/slashing.ts) | Burn an equivocator's bond — skin in the game |
+| [`src/consensus/fraud.ts`](src/consensus/fraud.ts) | Double-spend fraud proof — basis of recipient-witnessed cross-shard finality |
+| [`src/consensus/rate-limit.ts`](src/consensus/rate-limit.ts) | Stake-bonded per-epoch write/fork budget (anti-spam moat) |
+
+**Phase 2 security properties (tested):**
+- **No whale dominance** — stake capped + concave; a fully-aged validator is at
+  most `MAX_AGE_MULTIPLIER`× a fresh one.
+- **Concave weighting is Sybil-safe** *only because of* 1h1a — the splitting
+  exploit is demonstrated and shown to require Sybil accounts.
+- **Single-shard takeover resistance** — a 40%-global attacker holds a committee
+  majority in <5% of randomly-sampled committees (random-sampling argument).
+- **Equivocation is self-incriminating** — double-voting / double-spending
+  produces verifiable evidence that burns the offender's bond.
+
 ## Develop
 
 ```sh
@@ -71,8 +97,10 @@ npm run build     # tsc → dist/
 
 - **Phase 1 ✓** — partial replication + account-scoped delta sync; scale invariant
   measured. (Real libp2p/DHT transport replaces the simulation substrate later.)
-- **Phase 2** — sharded consensus (per-shard committees, VRF assignment),
-  age-weighted-personhood voting + slashing, pluggable-attestation quorum on open.
+- **Phase 2 ✓** — age-weighted-personhood consensus: committee sortition, weighted
+  conflict voting, slashing, double-spend fraud proofs, stake-bonded rate limit.
+  (Real randomness beacon + per-validator VRF proofs, and the end-to-end
+  cross-shard settlement flow, land when wired to transport.)
 - **Phase 3** — content/media CDN via DHT provider records; quota-safe large files.
 - **Phase 4** — relay federation, incentives, security hardening.
 

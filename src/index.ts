@@ -18,3 +18,17 @@ export * from './core/attestation.js';
 export * from './core/identity.js';
 export * from './core/block.js';
 export * from './core/light-verify.js';
+
+// Phase 1 — partial replication
+export * from './node/account-store.js';
+export * from './node/subscription.js';
+export * from './node/delta-sync.js';
+
+// Phase 2 — consensus
+export * from './consensus/weight.js';
+export * from './consensus/validators.js';
+export * from './consensus/committee.js';
+export * from './consensus/vote.js';
+export * from './consensus/slashing.js';
+export * from './consensus/fraud.js';
+export * from './consensus/rate-limit.js';
