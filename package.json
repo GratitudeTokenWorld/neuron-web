@@ -1,0 +1,29 @@
+{
+  "name": "neuron-web",
+  "version": "0.0.1",
+  "description": "Scalable, sharded, age-weighted-personhood account-chain core. Phase 0 foundations.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "keywords": [
+    "blockchain",
+    "p2p",
+    "sharding",
+    "proof-of-personhood"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}
