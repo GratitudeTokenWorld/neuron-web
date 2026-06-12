@@ -13,7 +13,10 @@ serves:
 ## Status — Phase 0 (foundations)
 
 Phase 0 establishes the cryptographic primitives every later phase builds on.
-(The whole project: `npm test` — 86 passing across all phases, typechecked.)
+(The whole project: `npm test` — 96 passing across all phases, typechecked.)
+
+**All 7 plan scale-invariants are now met by a test** — including #7 (no destructive
+history loss): see archival tiering below.
 
 | Module | Purpose |
 |--------|---------|
@@ -41,6 +44,8 @@ so per-node cost is `O(own + followed)`, not `O(network)`.
 | [`src/node/account-store.ts`](src/node/account-store.ts) | Per-node store of held account chains, fully validated on apply |
 | [`src/node/subscription.ts`](src/node/subscription.ts) | Interest model — light client (own+followed) vs super-node (shards) |
 | [`src/node/delta-sync.ts`](src/node/delta-sync.ts) | Account-scoped delta sync (catch up one account's tail independently) |
+| [`src/node/archive.ts`](src/node/archive.ts) + [`archiving-store.ts`](src/node/archiving-store.ts) | Bounded hot window + cold history archived to content-addressed storage — **invariant #7**: archived blocks stay provable + retrievable, nothing destroyed |
+| [`src/node/snapshot.ts`](src/node/snapshot.ts) | Per-shard snapshots — bootstrap trusted account heads from proofs alone (no replay) |
 | [`src/sim/network.ts`](src/sim/network.ts) | Interest-routed simulation substrate with per-node metrics |
 | [`src/sim/scenario.ts`](src/sim/scenario.ts) | Scale-invariant scenario builder |
 
@@ -95,6 +100,7 @@ DHT) and the 100 MB-file crash (quota-guarded chunking).
 | [`src/content/chunking.ts`](src/content/chunking.ts) | Chunk/manifest/reassemble — no blob exceeds the chunk size |
 | [`src/content/content-store.ts`](src/content/content-store.ts) | Quota-aware store; pre-checks space, dedups chunks |
 | [`src/content/dht.ts`](src/content/dht.ts) | Chord provider-record DHT — distributed index, O(log N) discovery |
+| [`src/content/replication.ts`](src/content/replication.ts) | Redundancy tracking, churn-repair to target, TTL/refcount GC |
 
 **Phase 3 validation criteria (met, measured):**
 - **100 MB media works** — chunked into bounded blobs, reassembled by CID; an

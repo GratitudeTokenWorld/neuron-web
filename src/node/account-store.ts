@@ -1,5 +1,6 @@
 import { type Block, computeContentHash, verifyBlockSignature, GENESIS_PREV } from '../core/block.js';
 import { AccountAccumulator } from '../core/accumulator.js';
+import type { AccountHeadProof } from '../core/light-verify.js';
 import type { Hex } from '../core/hash.js';
 
 /**
@@ -61,6 +62,25 @@ export class AccountStore {
 
   chain(id: Hex): readonly Block[] {
     return this.accounts.get(id)?.blocks ?? [];
+  }
+
+  accountIds(): Hex[] {
+    return [...this.accounts.keys()];
+  }
+
+  /**
+   * A compact, light-verifiable proof of an account's head: its open block, its
+   * head block, and an inclusion proof tying the open block into the head's
+   * accumulator. Consumable by `verifyAccountHead` — the unit a snapshot ships.
+   */
+  headProof(accountId: Hex): AccountHeadProof | null {
+    const a = this.accounts.get(accountId);
+    if (!a || a.blocks.length === 0) return null;
+    return {
+      openBlock: a.blocks[0]!,
+      headBlock: a.blocks[a.blocks.length - 1]!,
+      openInclusionProof: a.accumulator.proofHex(0),
+    };
   }
 
   /** Apply a block, validating it fully. Idempotent on already-known blocks. */

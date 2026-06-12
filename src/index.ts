@@ -23,6 +23,9 @@ export * from './core/light-verify.js';
 export * from './node/account-store.js';
 export * from './node/subscription.js';
 export * from './node/delta-sync.js';
+export * from './node/archive.js';
+export * from './node/archiving-store.js';
+export * from './node/snapshot.js';
 
 // Phase 2 — consensus
 export * from './consensus/weight.js';
@@ -38,6 +41,7 @@ export * from './content/cid.js';
 export * from './content/chunking.js';
 export * from './content/content-store.js';
 export * from './content/dht.js';
+export * from './content/replication.js';
 
 // Phase 4 — economy & relay federation
 export * from './economy/rewards.js';

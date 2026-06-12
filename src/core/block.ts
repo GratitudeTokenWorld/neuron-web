@@ -1,4 +1,4 @@
-import { hashJson, type Hex } from './hash.js';
+import { hashJson, canonicalJson, utf8ToBytes, type Hex } from './hash.js';
 import { sign, verify } from './keys.js';
 import { getShard, DEFAULT_NUM_SHARDS } from './partition.js';
 import { AccountAccumulator } from './accumulator.js';
@@ -119,6 +119,19 @@ export function verifyBlock(block: Block): boolean {
 /** Signature-only check (assumes/!\ does not re-derive the content hash). */
 export function verifyBlockSignature(block: Block): boolean {
   return verify(block.signature, blockSigningMessage(block.hash, block.accumulatorRoot), block.accountId);
+}
+
+/** Serialize a block to bytes (canonical, bigint-safe) for storage/archival. */
+export function encodeBlock(block: Block): Uint8Array {
+  return utf8ToBytes(canonicalJson(block));
+}
+
+/** Deserialize a block produced by {@link encodeBlock}, reviving bigint fields. */
+export function decodeBlock(bytes: Uint8Array): Block {
+  const raw = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+  const block = { ...raw, balance: BigInt(raw.balance as string) } as unknown as Block;
+  if (raw.amount !== undefined) block.amount = BigInt(raw.amount as string);
+  return block;
 }
 
 export interface OpenAccountParams {
