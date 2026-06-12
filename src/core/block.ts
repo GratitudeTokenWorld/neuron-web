@@ -113,6 +113,11 @@ export function createBlock(
  */
 export function verifyBlock(block: Block): boolean {
   if (computeContentHash(block) !== block.hash) return false;
+  return verifyBlockSignature(block);
+}
+
+/** Signature-only check (assumes/!\ does not re-derive the content hash). */
+export function verifyBlockSignature(block: Block): boolean {
   return verify(block.signature, blockSigningMessage(block.hash, block.accumulatorRoot), block.accountId);
 }
 

@@ -31,6 +31,33 @@ account's head — its identity quorum and its membership in the account's histo
 from an `O(log n)` proof, without holding or replaying the chain. See
 [`src/core/light-verify.test.ts`](src/core/light-verify.test.ts).
 
+## Status — Phase 1 (partial replication + discovery)
+
+Partial replication: a node holds and receives only the accounts it cares about,
+so per-node cost is `O(own + followed)`, not `O(network)`.
+
+| Module | Purpose |
+|--------|---------|
+| [`src/node/account-store.ts`](src/node/account-store.ts) | Per-node store of held account chains, fully validated on apply |
+| [`src/node/subscription.ts`](src/node/subscription.ts) | Interest model — light client (own+followed) vs super-node (shards) |
+| [`src/node/delta-sync.ts`](src/node/delta-sync.ts) | Account-scoped delta sync (catch up one account's tail independently) |
+| [`src/sim/network.ts`](src/sim/network.ts) | Interest-routed simulation substrate with per-node metrics |
+| [`src/sim/scenario.ts`](src/sim/scenario.ts) | Scale-invariant scenario builder |
+
+**Phase 1 validation criterion (met, measured):** sweeping the network 16× (40 →
+640 accounts) with a fixed follow count, per-node receive/store cost stays
+**constant** while the broadcast baseline (old "everyone sees everything" gossip)
+grows linearly:
+
+```
+  N      per-node recv   per-node store   broadcast would be   saving
+  40     33              33               120                  3.6x
+  160    33              33               480                  14.5x
+  640    33              33               1920                 58.2x
+```
+
+See [`src/sim/scenario.test.ts`](src/sim/scenario.test.ts).
+
 ## Develop
 
 ```sh
@@ -42,7 +69,8 @@ npm run build     # tsc → dist/
 
 ## Roadmap (next phases)
 
-- **Phase 1** — partial replication + DHT discovery; account-scoped delta sync.
+- **Phase 1 ✓** — partial replication + account-scoped delta sync; scale invariant
+  measured. (Real libp2p/DHT transport replaces the simulation substrate later.)
 - **Phase 2** — sharded consensus (per-shard committees, VRF assignment),
   age-weighted-personhood voting + slashing, pluggable-attestation quorum on open.
 - **Phase 3** — content/media CDN via DHT provider records; quota-safe large files.

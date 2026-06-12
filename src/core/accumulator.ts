@@ -127,6 +127,15 @@ export class AccountAccumulator {
     return bytesToHex(this.root());
   }
 
+  /**
+   * The root this accumulator WOULD have if `leaf` were appended — without
+   * mutating. Lets a store verify a block's claimed accumulator root before
+   * committing the block (append-only, no rollback needed).
+   */
+  rootWithHex(leaf: Uint8Array | Hex): Hex {
+    return bytesToHex(merkleRoot([...this.leaves, toBytes(leaf)]));
+  }
+
   /** Audit path (hex) for the leaf at `index`. */
   proofHex(index: number): Hex[] {
     return merkleProof(this.leaves, index).map(bytesToHex);
