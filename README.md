@@ -12,7 +12,7 @@ face+PIN identity, relay) carried over and being re-platformed onto a new
 ## Run / deploy
 
 ```sh
-npm install          # .npmrc sets legacy-peer-deps (vitest vs vite 8 peer)
+npm install          # clean install, 0 vulnerabilities
 npm run dev          # Vite dev server + auto-spawned relay — open the printed URL
 npm run relay        # standalone relay (production)
 npm run build        # → dist/ (static deployable bundle)
