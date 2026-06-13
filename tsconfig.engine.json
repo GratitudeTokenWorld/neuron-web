@@ -4,7 +4,10 @@
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-    "lib": ["ES2022"]
+    // WebWorker (not DOM) gives the web-standard globals the engine uses
+    // (console, TextEncoder/TextDecoder) while keeping document/window out, so
+    // the engine stays browser/worker-portable and DOM-free.
+    "lib": ["ES2022", "WebWorker"]
   },
   "include": ["src/engine/**/*.ts"]
 }
