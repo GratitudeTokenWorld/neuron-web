@@ -839,7 +839,8 @@ $$('.tab-btn').forEach((btn) => {
 });
 
 function setNodeDependentTabs(enabled: boolean) {
-  const tabs = ['account', 'transfer', 'contracts', 'storage'];
+  // Contracts + Storage are deferred to the dApp phase (no engine equivalent yet).
+  const tabs = ['account', 'transfer'];
   tabs.forEach((t) => {
     const btn = document.querySelector(`.tab-btn[data-tab="${t}"]`) as HTMLButtonElement;
     if (btn) btn.disabled = !enabled;
@@ -1902,31 +1903,33 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     }
 
     const { keys, faceKey } = recoveryResult;
+    // On-chain identity = engine pubkey derived from the recovered (face-unlocked) keys.
+    const accountId = engineAccountId(keys.priv);
 
     // Reset attempt counter on successful recovery
     await recordPinSuccess(blob.pub);
     const updatedBlob = await updateAttemptStateInBlob(blob, faceKey, { failedAttempts: 0, lockedUntil: 0 });
-    await node.net.saveKeyBlob(keys.pub, updatedBlob as unknown as Record<string, unknown>);
+    await node.net.saveKeyBlob(accountId, updatedBlob as unknown as Record<string, unknown>);
 
     // Cache PIN key + raw bits for this session (raw bits needed for combined-key face update)
     if (pin && blob.pinSalt) {
       const saltBytes = Uint8Array.from(atob(blob.pinSalt), c => c.charCodeAt(0));
       const pinRawBits = await derivePinRawBits(pin, saltBytes);
       const pinKey = await crypto.subtle.importKey('raw', pinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-      cachePinKey(keys.pub, pinKey, pinRawBits);
+      cachePinKey(accountId, pinKey, pinRawBits);
     }
 
     // Recovery successful!
-    const account = buildAccount(username, keys.pub, blob.faceMapHash, {
+    const account = buildAccount(username, accountId, blob.faceMapHash, {
       pinSalt: blob.pinSalt,
       pinVerifier: blob.pinVerifier,
       linkedAnchor: blob.linkedAnchor,
     });
     node.ledger.registerAccount(account);
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 0 };
-    if (!localAccounts.find((a) => a.pub === keys.pub)) {
+    if (!localAccounts.find((a) => a.pub === accountId)) {
       localAccounts.push(fullAcc);
-      node.addLocalKey(keys.pub, keys);
+      node.addLocalKey(accountId, keys);
       saveWallet();
     }
 
