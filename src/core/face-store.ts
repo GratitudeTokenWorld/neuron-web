@@ -42,7 +42,7 @@ export interface EncryptedKeyBlob {
   faceMapHash: string;
   /** Username */
   username: string;
-  /** Account public key */
+  /** On-chain account identity (engine compressed-hex pubkey). Also the face-key salt. */
   pub: string;
   /** Timestamp */
   createdAt: number;
@@ -128,9 +128,17 @@ export async function createEncryptedKeyBlob(
   canonicalDescriptor: number[],
   faceMapHash: string,
   pin?: string,
+  /**
+   * On-chain account identity (engine compressed-hex pubkey). Stored as `blob.pub`
+   * and used as the salt for the face-key derivation and the linkedAnchor. Must be
+   * the SAME value the account is registered under, so loadAccount(blob.pub), the
+   * linkedAnchor integrity check, and PIN-change/face-update (which salt with
+   * acc.pub) all stay consistent. Defaults to keys.pub for legacy/test callers.
+   */
+  accountId: string = keys.pub,
 ): Promise<EncryptedKeyBlob> {
   const quantized = quantizeDescriptor(canonicalDescriptor);
-  const faceKey = await deriveFaceKey(quantized, keys.pub);  // used for pinAttemptState
+  const faceKey = await deriveFaceKey(quantized, accountId);  // used for pinAttemptState
   const keysJson = JSON.stringify(keys);
 
   let encryptedKeys: string;
@@ -150,7 +158,7 @@ export async function createEncryptedKeyBlob(
     const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 
     // Combined key: XOR(faceBytes, pinBytes) - both factors required to decrypt
-    const faceBytes = await deriveFaceRawBits(quantized, keys.pub);
+    const faceBytes = await deriveFaceRawBits(quantized, accountId);
     const sharedKey = await deriveCombinedKey(faceBytes, pinBytes);
     encryptedKeys = await encryptWithPinKey(keysJson, sharedKey);  // single layer
 
@@ -161,13 +169,13 @@ export async function createEncryptedKeyBlob(
     encryptedKeys = await encryptWithFaceKey(keysJson, faceKey);
   }
 
-  const linkedAnchor = await computeLinkedAnchor(encryptedKeys, faceMapHash, keys.pub);
+  const linkedAnchor = await computeLinkedAnchor(encryptedKeys, faceMapHash, accountId);
 
   const blob: EncryptedKeyBlob = {
     encryptedKeys,
     faceMapHash,
     username,
-    pub: keys.pub,
+    pub: accountId,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     linkedAnchor,

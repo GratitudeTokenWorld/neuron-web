@@ -1169,11 +1169,18 @@ export class Libp2pNetwork extends EventEmitter {
   }
 
   async findKeyBlobByUsername(username: string, timeoutMs = 6000): Promise<Record<string, unknown> | null> {
-    // Fast path: local IDB
+    // Fast path: local IDB. A username can have several blobs if an account was
+    // deleted and recreated (each keypair → a different accountId key), so return
+    // the NEWEST match — never let a stale blob from a deleted account shadow the
+    // current one.
     try {
       const all = await this.db.getAll('keyblobs');
-      const found = all.find(b => (b as Record<string, unknown>).username === username);
-      if (found) return found as Record<string, unknown>;
+      const matches = all.filter(b => (b as Record<string, unknown>).username === username);
+      if (matches.length) {
+        const ts = (b: Record<string, unknown>) => Number(b.updatedAt ?? b.createdAt ?? 0);
+        matches.sort((a, b) => ts(b as Record<string, unknown>) - ts(a as Record<string, unknown>));
+        return matches[0] as Record<string, unknown>;
+      }
     } catch { /* fall through */ }
 
     // Slow path: ask peers over GossipSub and wait for a response

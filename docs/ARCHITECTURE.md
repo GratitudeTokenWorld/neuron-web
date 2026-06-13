@@ -373,6 +373,51 @@ untenable at 1B.
 credential-quorum verification. **Replace:** per-relay face DB + hash-only ledger
 count → global commitment registry + pluggable attestation quorum.
 
+### Implementation status & the single-attester SPOF (current build)
+
+**What "nullifier" means here.** A nullifier is a per-human tag — the same human
+always maps to the same nullifier — so the engine can enforce one-human-one-account
+*without* storing the biometric. The attester assigns a random `nid` to a face the
+first time it sees it; the per-account nullifier is `nid#index` (`FACE_MAX`=1 on
+mainnet → only `nid#0`, =3 on testnet for dev). The engine derives
+`commitment = hash("identity {nullifier} {accountPub}")` and keeps an append-only
+**used-nullifier registry** that rejects any reuse
+([`src/engine/core/identity.ts`](../src/engine/core/identity.ts),
+wired in [`src/ledger/engine-ledger.ts`](../src/ledger/engine-ledger.ts) `openAccount`).
+So "1 face → 1 account" = attester issues one nullifier per face **and** the engine
+dedups it globally and permanently.
+
+**This is currently a single point of failure — by design, deferred, not solved.**
+The testnet runs a **single attester** (the relay). Two failure modes:
+1. *Availability* — attester down ⇒ no new accounts can be created (existing accounts
+   and payments are unaffected; only onboarding stalls).
+2. *Trust* — the attester decides who is a unique human. A compromised/malicious
+   attester can sign attestations for fake humans ⇒ mint unlimited nullifiers ⇒ break
+   one-human-one-account. Because consensus is age-weighted **personhood**, breaking
+   identity breaks consensus. This is the "identity is consensus-critical" risk above.
+
+Also note `.relay-face-db.json` is a **per-relay, local** dev/operational artifact
+(face → count), with **no cross-relay dedup**: run N independent relays and the same
+human gets N distinct `nid`s ⇒ N nullifiers ⇒ N accounts that all pass engine dedup.
+The engine only dedups a *given* nullifier.
+
+**Planned remediation (Subsystem 5 + Subsystem 2 defense-in-depth):**
+- **k-of-N quorum of independent attesters/methods.** The engine already verifies an
+  attestation *quorum* (`checkQuorum` against an `identityPolicy`); raising the policy
+  from 1 to k-of-N is a policy change, not a redesign — one compromised attester then
+  isn't enough.
+- **Federated, redundant attester tier** (discoverable, many relays) ⇒ no single
+  attester required for liveness.
+- **Global commitment/nullifier registry** replacing per-relay face DBs ⇒ closes the
+  cross-attester gap; ideally a ZK-derived nullifier so no attester is trusted to
+  assign `nid`.
+- **Containment if breached anyway** (Layer 3): sharding + recipient-witnessed finality
+  + slashing + fraud proofs + weak-subjectivity checkpoints bound the blast radius.
+
+Acceptable for current single-attester testnet testing; **must** become quorum +
+federation before production. This layer warrants the most adversarial testing of any
+component in the system.
+
 ---
 
 ## Cross-cutting

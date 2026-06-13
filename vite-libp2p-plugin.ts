@@ -65,6 +65,22 @@ export function libp2pRelay(): Plugin {
         });
       });
 
+      // Forward the /log-reload debug beacon to the relay best-effort. Handled
+      // here instead of via server.proxy so that a relay which hasn't bound port
+      // 9092 yet (startup race) doesn't spam the Vite console with ECONNREFUSED —
+      // we just swallow the error and 204. The client fetch is already fire-and-forget.
+      server.middlewares.use('/log-reload', (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+        import('http').then(({ request }) => {
+          const fwd = request(
+            { host: 'localhost', port: 9092, path: '/log-reload', method: 'POST', headers: req.headers },
+            (proxyRes) => { proxyRes.resume(); res.writeHead(204); res.end(); },
+          );
+          fwd.on('error', () => { res.writeHead(204); res.end(); });
+          req.pipe(fwd);
+        });
+      });
+
       console.log('  libp2p relay: starting on port 9090');
 
       server.httpServer?.on('close', () => {

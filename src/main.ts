@@ -1723,7 +1723,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     }
 
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Encrypting keys with face + PIN...</span>';
-    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin);
+    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin, accountId);
 
     // Encrypt face descriptor with PIN key for local privacy
     const pinSalt = keyBlob.pinSalt!;
@@ -1973,12 +1973,12 @@ $('#btnRecoverFace').addEventListener('click', async () => {
         const newPin = await promptSetPin();
         if (newPin) {
           try {
-            const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin);
-            await node.net.saveKeyBlob(keys.pub, newBlob as unknown as Record<string, unknown>);
+            const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin, accountId);
+            await node.net.saveKeyBlob(accountId, newBlob as unknown as Record<string, unknown>);
             const saltBytes = Uint8Array.from(atob(newBlob.pinSalt!), c => c.charCodeAt(0));
             const newRawBits = await derivePinRawBits(newPin, saltBytes);
             const newPinKey = await crypto.subtle.importKey('raw', newRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-            cachePinKey(keys.pub, newPinKey, newRawBits);
+            cachePinKey(accountId, newPinKey, newRawBits);
             toast('PIN added - account upgraded to face + PIN security', 'success');
           } catch {
             toast('PIN setup failed - account still accessible via face', 'error');
@@ -2021,11 +2021,22 @@ $('#btnRecoverKeys').addEventListener('click', async () => {
     // On-chain identity = engine pubkey derived from the recovered keys.
     const accountId = engineAccountId(keys.priv);
 
+    // The entered username must provably belong to these keys. Both the on-chain
+    // account record and the network key-blob bind username -> account pub; require
+    // at least one and verify it equals accountId. Fail CLOSED when no binding is
+    // reachable, so a valid backup key can never be attached to a username it does
+    // not own (previously the check short-circuited when the username was unknown,
+    // letting any username through).
     const existing = node.ledger.getAccountByUsername(username);
-    if (existing && existing.pub !== accountId) { toast('Key does not match this username', 'error'); return; }
-
     // Fetch the key blob to reliably get pinSalt/pinVerifier - don't rely on sync timing
     const blobData = await node.net.findKeyBlobByUsername(username);
+    if (!existing && !blobData) {
+      toast('No account found for this username', 'error');
+      $('#recoverStatus').innerHTML = '<span style="color:var(--danger)">No account found for that username. Check the username and that your node is running/synced.</span>';
+      return;
+    }
+    if (existing && existing.pub !== accountId) { toast('This key does not match this username', 'error'); return; }
+    if (blobData && String(blobData.pub) !== accountId) { toast('This key does not match this username', 'error'); return; }
     const blobPinSalt = blobData?.pinSalt ? String(blobData.pinSalt) : (existing as Account & { pinSalt?: string } | undefined)?.pinSalt;
     const blobPinVerifier = blobData?.pinVerifier ? String(blobData.pinVerifier) : (existing as Account & { pinVerifier?: string } | undefined)?.pinVerifier;
 
@@ -2051,6 +2062,29 @@ $('#btnRecoverKeys').addEventListener('click', async () => {
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch { toast('Invalid backup code or JSON', 'error'); }
 });
+
+/**
+ * Sync the on-chain (IDB) account record after a key/anchor rotation so the
+ * recovery integrity check — which compares the served blob against the account
+ * record's linkedAnchor (node.net.loadAccount) — stays consistent.
+ *
+ * The engine slice has no on-chain account-update *block* yet (EngineLedger
+ * .createUpdate is deferred); for single-node testing we update the account
+ * record directly. Multi-node verifiable rotation lands with the update block.
+ * Re-signs when a signed field (faceMapHash) changes; otherwise keeps the _sig.
+ */
+async function syncAccountRecord(
+  acc: AccountWithKeys & { createdAt: number },
+  changed: Record<string, unknown>,
+): Promise<void> {
+  const existing = (await node.net.loadAccount(acc.pub)) ?? {};
+  const merged: Record<string, unknown> = { ...existing, ...changed, pub: acc.pub, username: acc.username };
+  if ('faceMapHash' in changed) {
+    const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${String(changed.faceMapHash)}`;
+    merged._sig = await signData(payload, acc.keys);
+  }
+  await node.net.saveAccount(acc.pub, merged as Parameters<typeof node.net.saveAccount>[1]);
+}
 
 // ──── Update PIN ────
 $('#btnUpdatePin').addEventListener('click', async () => {
@@ -2148,15 +2182,9 @@ $('#btnUpdatePin').addEventListener('click', async () => {
     const anchorBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(newAnchorInput));
     const newLinkedAnchor = Array.from(new Uint8Array(anchorBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // Publish update block
-    const updateResult = await node.ledger.createUpdate(acc.pub, acc.keys, {
-      newLinkedAnchor, newPQPub: acc.pqPub, newPQKemPub: acc.pqKemPub,
-    });
-    if ('error' in updateResult && updateResult.error) { toast(`Update failed: ${updateResult.error}`, 'error'); statusEl.innerHTML = ''; return; }
-    const sub = await node.submitBlock(updateResult.block!);
-    if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
-
-    // Publish the full updated blob to the P2P network
+    // Persist the rotated blob, then sync the account record's linkedAnchor so
+    // face recovery's integrity check stays consistent. (On-chain account-update
+    // block is deferred with multi-node sync — see syncAccountRecord.)
     const updatedBlob: EncryptedKeyBlob = {
       ...blob,
       updatedAt: Date.now(),
@@ -2168,6 +2196,10 @@ $('#btnUpdatePin').addEventListener('click', async () => {
       encryptedCanonical: newEncryptedCanonical ?? blob.encryptedCanonical,
     };
     await node.net.saveKeyBlob(acc.pub, updatedBlob as unknown as Record<string, unknown>);
+    await syncAccountRecord(acc, {
+      linkedAnchor: newLinkedAnchor, pinSalt: newPinSalt, pinVerifier: newPinVerifier,
+      encryptedFaceDescriptor: newEncryptedFaceDescriptor,
+    });
 
     // Update local account
     Object.assign(acc, { pinSalt: newPinSalt, pinVerifier: newPinVerifier, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor, encryptedCanonical: newEncryptedCanonical });
@@ -2316,13 +2348,13 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     };
     await node.net.saveKeyBlob(acc.pub, newBlob as unknown as Record<string, unknown>);
 
-    // Publish update block
-    const updateResult = await node.ledger.createUpdate(acc.pub, acc.keys, {
-      newFaceMapHash, newLinkedAnchor, newPQPub: acc.pqPub, newPQKemPub: acc.pqKemPub,
+    // Sync the account record (linkedAnchor + faceMapHash, re-signed) so face
+    // recovery's integrity check stays consistent. (On-chain account-update block
+    // is deferred with multi-node sync — see syncAccountRecord.)
+    await syncAccountRecord(acc, {
+      linkedAnchor: newLinkedAnchor, faceMapHash: newFaceMapHash,
+      encryptedFaceDescriptor: newEncryptedCanonical,
     });
-    if ('error' in updateResult && updateResult.error) { toast(`Update failed: ${updateResult.error}`, 'error'); statusEl.innerHTML = ''; return; }
-    const sub = await node.submitBlock(updateResult.block!);
-    if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
 
     // Update local account
     Object.assign(acc, { faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedCanonical });

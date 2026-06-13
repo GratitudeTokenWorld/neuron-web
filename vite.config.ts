@@ -28,9 +28,8 @@ export default defineConfig({
         target: 'ws://localhost:9092',
         ws: true,
       },
-      '/log-reload': {
-        target: 'http://localhost:9092',
-      },
+      // NOTE: /log-reload is handled by a dev middleware in libp2pRelay() (not
+      // proxied here) so a not-yet-started relay doesn't spam ECONNREFUSED.
       '/face-verify': {
         target: 'http://localhost:9092',
       },
