@@ -45,6 +45,29 @@ let localAccounts: AccountWithKeys[] = [];
 function engineSigner(acc: { keys: KeyPair }) {
   return engineKeysFromAppPrivate(acc.keys.priv);
 }
+
+// ── Block field normalization (engine blocks use accountId/amount/sourceHash;
+//    the old AccountBlock renderers expect accountPub/receiveAmount/sendFrom) ──
+type AnyBlock = Record<string, unknown>;
+/** The account that authored a block (engine accountId, falling back to legacy accountPub). */
+function blockAccount(b: AnyBlock): string {
+  return String(b.accountId ?? b.accountPub ?? '');
+}
+/** Amount moved by a send/receive block, as a number (engine amount is bigint). */
+function blockAmount(b: AnyBlock): number {
+  const a = b.amount ?? b.receiveAmount ?? 0;
+  return typeof a === 'bigint' ? Number(a) : Number(a);
+}
+/** For a receive block, the account that sent it (resolved via the source send block). */
+function blockSender(b: AnyBlock): string {
+  const src = b.sourceHash ?? b.sendBlockHash;
+  if (b.sendFrom) return String(b.sendFrom);
+  if (typeof src === 'string') {
+    const send = node.ledger.getBlock(src) as AnyBlock | undefined;
+    if (send) return blockAccount(send);
+  }
+  return '';
+}
 let cameraStream: MediaStream | null = null;
 let isRecovering = false;
 let pendingGenerationReset = false;
@@ -634,8 +657,9 @@ function showAccountDetail(pub: string) {
     const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
     const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
     let detail2 = '-';
-    if (b.type === 'send') detail2 = `→ ${resolveName(b.recipient || '')} ${formatUNIT(b.amount || 0)} UNIT`;
-    else if (b.type === 'receive') detail2 = `← ${resolveName(b.sendFrom || '')} +${formatUNIT(b.receiveAmount || 0)} UNIT`;
+    const eb = b as unknown as AnyBlock;
+    if (b.type === 'send') detail2 = `→ ${resolveName(String(eb.recipient ?? ''))} ${formatUNIT(blockAmount(eb))} UNIT`;
+    else if (b.type === 'receive') detail2 = `← ${resolveName(blockSender(eb))} +${formatUNIT(blockAmount(eb))} UNIT`;
     else if (b.type === 'open') detail2 = `+${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT (genesis)`;
     else if (b.type === 'deploy' && b.contractData) { try { const d = JSON.parse(b.contractData) as { name?: string }; detail2 = escHtml(d.name || 'contract'); } catch { /**/ } }
     else if (b.type === 'call' && b.contractData) { try { const d = JSON.parse(b.contractData) as { contractId: string; method: string }; const c = node.ledger.contracts.get(d.contractId); detail2 = `${escHtml(c?.name ?? trunc(d.contractId))}.${escHtml(d.method)}()`; } catch { /**/ } }
@@ -904,10 +928,10 @@ function refreshChain() {
         return `<tr>
           <td>${copyBtn(b.hash)}</td>
           <td><span class="badge badge-${b.type === 'send' ? 'transfer' : b.type === 'receive' ? 'create' : b.type === 'deploy' ? 'deploy' : b.type === 'call' ? 'call' : 'verify'}">${b.type}</span></td>
-          <td>${resolveName(b.accountPub)}</td>
+          <td>${resolveName(blockAccount(b as unknown as AnyBlock))}</td>
           <td>${
-            b.type === 'send' ? '-' + formatUNIT(b.amount || 0) :
-            b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) :
+            b.type === 'send' ? '-' + formatUNIT(blockAmount(b as unknown as AnyBlock)) :
+            b.type === 'receive' ? '+' + formatUNIT(blockAmount(b as unknown as AnyBlock)) :
             b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) :
             b.type === 'storage-register' && b.contractData ? (() => { try { return (JSON.parse(b.contractData) as { capacityGB: number }).capacityGB + ' GB'; } catch { return '-'; } })() :
             b.type === 'storage-deregister' && b.contractData ? (() => { try { return `-${(JSON.parse(b.contractData) as { capacityGB: number }).capacityGB} GB`; } catch { return '0 GB'; } })() :
@@ -1157,7 +1181,7 @@ async function autoClaimPending(): Promise<void> {
         const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, engineSigner(acc));
         if (result.block) {
           await node.submitBlock(result.block);
-          addLog(`Auto-claimed ${formatUNIT(result.block.receiveAmount || 0)} UNIT from ${resolveNamePlain(u.fromPub)}`, 'success');
+          addLog(`Auto-claimed ${formatUNIT(u.amount)} UNIT from ${resolveNamePlain(u.fromPub)}`, 'success');
         }
       }
     }
@@ -1180,13 +1204,14 @@ function renderExplorerRow(b: AccountBlock): string {
   let counterparty = '-';
   let name = '-';
   let amount = '-';
+  const eb = b as unknown as AnyBlock;
 
   if (b.type === 'send') {
-    counterparty = resolveName(b.recipient || '');
-    amount = formatUNIT(b.amount || 0);
+    counterparty = resolveName(String(eb.recipient ?? ''));
+    amount = formatUNIT(blockAmount(eb));
   } else if (b.type === 'receive') {
-    counterparty = resolveName(b.sendFrom || '');
-    amount = formatUNIT(b.receiveAmount || 0);
+    counterparty = resolveName(blockSender(eb));
+    amount = formatUNIT(blockAmount(eb));
   } else if (b.type === 'open') {
     amount = formatUNIT(VERIFICATION_MINT_AMOUNT);
   } else if (b.type === 'deploy' && b.contractData) {
@@ -1236,7 +1261,7 @@ function renderExplorerRow(b: AccountBlock): string {
   return `<tr>
     <td>${copyBtn(b.hash)}</td>
     <td><span class="badge ${typeClass}">${b.type}</span></td>
-    <td>${cpBtn(b.accountPub)}${resolveName(b.accountPub)}</td>
+    <td>${cpBtn(blockAccount(eb))}${resolveName(blockAccount(eb))}</td>
     <td>${counterparty}</td>
     <td>${name}</td>
     <td>${amount}</td>
@@ -2426,7 +2451,7 @@ $('#btnExplorerSearch').addEventListener('click', () => {
     detail.innerHTML = `<div class="card"><div class="card-title">Block Detail</div><div class="stats-grid">
       <div class="stat-item"><div class="stat-label">Hash</div><div class="stat-value small">${cpBtn(block.hash)}${block.hash}</div></div>
       <div class="stat-item"><div class="stat-label">Type</div><div class="stat-value small">${block.type}</div></div>
-      <div class="stat-item"><div class="stat-label">Account</div><div class="stat-value small">${cpBtn(block.accountPub)}${resolveName(block.accountPub)}</div></div>
+      <div class="stat-item"><div class="stat-label">Account</div><div class="stat-value small">${cpBtn(blockAccount(block as unknown as AnyBlock))}${resolveName(blockAccount(block as unknown as AnyBlock))}</div></div>
       <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${formatUNIT(block.balance)} UNIT</div></div>
       <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small">${status}</div></div>
       <div class="stat-item"><div class="stat-label">Approve Stake</div><div class="stat-value">${tally?.approveStake ?? 0}</div></div>
@@ -2517,16 +2542,16 @@ function wireNodeEvents() {
   if (nodeEventsWired) return;
   nodeEventsWired = true;
   node.on('block:confirmed', (b: unknown) => {
-    const block = b as { type: string; accountPub: string };
-    addLog(`Confirmed: ${block.type} by ${resolveNamePlain(block.accountPub)}`, 'success');
+    const block = b as AnyBlock;
+    addLog(`Confirmed: ${String(block.type)} by ${resolveNamePlain(blockAccount(block))}`, 'success');
     debouncedRefreshTab();
     // Storage blocks need an immediate refresh so provider stats stay current even
     // when the confirmed block arrives while the user is on another tab.
-    if (block.type.startsWith('storage-')) refreshStorage();
+    if (String(block.type).startsWith('storage-')) refreshStorage();
   });
   node.on('block:conflict', (b: unknown) => {
-    const block = b as { hash: string; type: string; accountPub: string };
-    addLog(`CONFLICT: fork detected for ${block.type} by ${resolveNamePlain(block.accountPub)} - voting started`, 'warn');
+    const block = b as AnyBlock;
+    addLog(`CONFLICT: fork detected for ${String(block.type)} by ${resolveNamePlain(blockAccount(block))} - voting started`, 'warn');
     debouncedRefreshTab();
   });
   node.on('block:rejected', (b: unknown) => {
