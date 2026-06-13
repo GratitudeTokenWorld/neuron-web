@@ -147,6 +147,7 @@ export class EngineLedger extends EventEmitter {
       acc,
     );
     this.held.set(pub, { chain: [block], acc });
+    this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block); // optimistic
     return block;
@@ -179,6 +180,7 @@ export class EngineLedger extends EventEmitter {
     );
     h.chain.push(block);
     this.unclaimedSends.set(block.hash, { fromPub: senderPub, toPub: recipientPub, amount });
+    this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block);
     return { block };
@@ -209,6 +211,7 @@ export class EngineLedger extends EventEmitter {
     );
     h.chain.push(block);
     this.unclaimedSends.delete(sendBlockHash);
+    this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block);
     return { block };
@@ -246,6 +249,7 @@ export class EngineLedger extends EventEmitter {
     } else if (block.type === 'receive' && block.sourceHash) {
       this.unclaimedSends.delete(block.sourceHash);
     }
+    this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block);
     return { success: true };
@@ -269,5 +273,93 @@ export class EngineLedger extends EventEmitter {
     let blocks = 0;
     for (const h of this.held.values()) blocks += h.chain.length;
     return { accounts: this.accountsByPub.size, blocks, network: this.network };
+  }
+
+  // ── Drop-in surface for the app (DAGLedger compatibility) ─────────────────────
+  // These let node.ts / main.ts treat EngineLedger like the old ledger. Features
+  // not in this slice (contracts, storage-provider economy, fork voting) are
+  // stubbed empty/no-op and reshaped in the dApp phase.
+
+  /** All blocks by hash, maintained as blocks are added/applied. */
+  readonly allBlocks = new Map<string, Block>();
+  /** Deferred: storage-provider economy. */
+  readonly storageProviders = new Map<string, unknown>();
+  /** Deferred: smart contracts. */
+  readonly contracts = new Map<string, unknown>();
+  /** Deferred: fork voting (optimistic confirmation is used). */
+  readonly votes = { registerBlock: () => 'confirmed' as const, getStatus: () => 'confirmed' as const };
+
+  getAccountByPub(pub: string): LedgerAccount | undefined {
+    return this.accountsByPub.get(pub);
+  }
+  getBlock(hash: string): Block | undefined {
+    return this.allBlocks.get(hash);
+  }
+  getBlockStatus(hash: string): 'confirmed' | 'unknown' {
+    return this.allBlocks.has(hash) ? 'confirmed' : 'unknown';
+  }
+  getStorageProviders(): unknown[] {
+    return [];
+  }
+  getMaxAccountsPerFace(): number {
+    return this.network === 'mainnet' ? 1 : 3;
+  }
+  getFaceAccountCount(): number {
+    return 0; // dedup is by nullifier now, not faceMapHash
+  }
+  estimateBlockchainSizeBytes(): number {
+    return this.allBlocks.size * 600;
+  }
+  countHeartbeatsLast24h(): number {
+    return 0;
+  }
+  getBlocksSince(): Block[] {
+    return [];
+  }
+  checkPublishFeasibility(): { feasible: boolean; reason?: string } {
+    return { feasible: true };
+  }
+  castVote(): void {
+    /* optimistic confirmation — no fork voting in this slice */
+  }
+  processConflicts(): void {}
+  refreshHeartbeatCounts(): void {}
+  updateProviderScore(): void {}
+  purgeAccount(pub: string): void {
+    this.held.delete(pub);
+    const acc = this.accountsByPub.get(pub);
+    if (acc) this.usernameToPub.delete(acc.username);
+    this.accountsByPub.delete(pub);
+  }
+  reset(): void {
+    this.held.clear();
+    this.accountsByPub.clear();
+    this.usernameToPub.clear();
+    this.unclaimedSends.clear();
+    this.allBlocks.clear();
+  }
+  private deferred(feature: string): { error: string } {
+    return { error: `${feature} is not available in the engine slice (dApp phase)` };
+  }
+  createDeploy(): { error: string } {
+    return this.deferred('Contracts');
+  }
+  createCall(): { error: string } {
+    return this.deferred('Contracts');
+  }
+  createUpdate(): { error: string } {
+    return this.deferred('Account update');
+  }
+  createStorageRegister(): { error: string } {
+    return this.deferred('Storage providers');
+  }
+  createStorageDeregister(): { error: string } {
+    return this.deferred('Storage providers');
+  }
+  createStorageHeartbeat(): { error: string } {
+    return this.deferred('Storage providers');
+  }
+  createStorageReward(): { error: string } {
+    return this.deferred('Storage providers');
   }
 }
