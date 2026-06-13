@@ -1,4 +1,5 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
+import { EngineLedger } from '../ledger/engine-ledger';
 import { Libp2pNetwork } from './libp2p-network';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
@@ -70,7 +71,7 @@ export interface NodeStats {
 }
 
 export class NeuronNode extends EventEmitter {
-  ledger: DAGLedger;
+  ledger: EngineLedger;
   /** libp2p P2P network layer */
   net: Libp2pNetwork;
   /** Smoke content store (IndexedDB + HTTP-over-WebRTC) */
@@ -109,7 +110,7 @@ export class NeuronNode extends EventEmitter {
 
   constructor(network: NetworkType = 'testnet') {
     super();
-    this.ledger = new DAGLedger(network);
+    this.ledger = new EngineLedger(network);
     this.net = new Libp2pNetwork(network);
     this.store = new SmokeStore();
     this.storage = new StorageManager(this.ledger, this.net, this.store, this.localKeys);

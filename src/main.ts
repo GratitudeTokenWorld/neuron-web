@@ -8,6 +8,8 @@ import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCre
 import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
+import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
+import type { TypedAttestation } from './engine/core/attestation';
 import { initStreamSW, registerStreamURL, unregisterStreamURL } from './network/stream-sw';
 import {
   derivePinRawBits, encryptWithPinKey, decryptWithPinKey,
@@ -36,6 +38,11 @@ let node = new NeuronNode(savedNetwork);
 // Register Service Worker for seekable video/audio streaming (range-request proxy)
 initStreamSW(node.store);
 let localAccounts: AccountWithKeys[] = [];
+
+/** Bridge an account's app (WebCrypto JWK) keys into engine signer keys for signing blocks. */
+function engineSigner(acc: { keys: KeyPair }) {
+  return engineKeysFromAppPrivate(acc.keys.priv);
+}
 let cameraStream: MediaStream | null = null;
 let isRecovering = false;
 let pendingGenerationReset = false;
@@ -1143,7 +1150,7 @@ async function autoClaimPending(): Promise<void> {
     for (const acc of localAccounts) {
       const unclaimed = node.ledger.getUnclaimedForAccount(acc.pub);
       for (const u of unclaimed) {
-        const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, acc.keys);
+        const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, engineSigner(acc));
         if (result.block) {
           await node.submitBlock(result.block);
           addLog(`Auto-claimed ${formatUNIT(result.block.receiveAmount || 0)} UNIT from ${resolveNamePlain(u.fromPub)}`, 'success');
@@ -1371,15 +1378,13 @@ async function startNode() {
       const stored = (acc as AccountWithKeys & { openBlock?: AccountBlock }).openBlock;
       try {
         if (stored) {
-          // Replay the original signed open block (carries its relay credentials and
-          // original hash) — re-creating it would lack credentials and fork the chain.
+          // Replay the original signed engine open block verbatim (carries its
+          // attestations + accumulator root) — re-creating it would fork the chain.
           await node.submitBlock(stored);
         } else {
-          // Legacy account saved before open blocks were persisted: re-open will only
-          // succeed once relay credentials are available, otherwise the ledger syncs it
-          // from the network. Don't let one failure abort the rest of startup.
-          const block = await node.ledger.openAccount(acc.pub, acc.faceMapHash, acc.keys);
-          await node.submitBlock(block);
+          // No stored open block (e.g. legacy/imported): can't re-open without a fresh
+          // attestation; the ledger will sync it from the network. Don't abort startup.
+          addLog(`Account ${acc.username}: no stored open block; will sync from network`, 'warn');
         }
       } catch (e) {
         addLog(`Account ${acc.username}: open block not replayed (${(e as Error).message}); will sync from network`, 'warn');
@@ -1528,43 +1533,46 @@ async function getRelayChallenges(
   return results;
 }
 
-/** Phase 2 — send the enrolled descriptor to relays for signing, AFTER face capture. */
-async function collectRelayCredentials(
+/**
+ * Phase 2 — send the enrolled descriptor + engine accountId to the attester(s),
+ * AFTER face capture, and collect engine personhood attestations + the nullifier.
+ */
+async function collectAttestation(
   challenges: PendingChallenge[],
   descriptor: number[],
   faceMapHash: string,
+  accountId: string,
   onStatus: (msg: string) => void,
-): Promise<{ credentials: RelayCredential[]; faceLimitError?: string }> {
-  const credentials: RelayCredential[] = [];
+): Promise<{ nullifier?: string; attestations: TypedAttestation[]; faceLimitError?: string }> {
+  const attestations: TypedAttestation[] = [];
   const seen = new Set<string>();
-  // A relay that responds with a face-limit rejection is up and working — it's deliberately
-  // refusing because this face already hit the per-face account cap. Capture that reason so
-  // the caller can report the real cause instead of "is the relay running?".
+  let nullifier: string | undefined;
   let faceLimitError: string | undefined;
   for (const ch of challenges) {
     try {
       const res = await fetch(faceVerifyEndpoint(ch.faceVerifyBase, 'verify'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network },
-        body: JSON.stringify({ descriptor, faceMapHash, challengeId: ch.challengeId }),
+        body: JSON.stringify({ descriptor, faceMapHash, accountId, challengeId: ch.challengeId }),
         signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
         if (res.status === 429 && /face limit/i.test(String(err.error))) faceLimitError = String(err.error);
-        onStatus(`Relay ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
+        onStatus(`Attester ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
         continue;
       }
-      const { sig, signingPub } = await res.json() as { sig: string; signingPub: string };
-      if (!sig || !signingPub || seen.has(signingPub)) continue;
-      seen.add(signingPub);
-      credentials.push({ relayPub: signingPub, sig });
-      onStatus(`Relay ${ch.peerId.slice(0, 8)} endorsed ✓ (${credentials.length}/${challenges.length})`);
+      const data = await res.json() as { nullifier?: string; attestation?: TypedAttestation };
+      if (!data.attestation || seen.has(data.attestation.attesterPub)) continue;
+      seen.add(data.attestation.attesterPub);
+      nullifier = data.nullifier;
+      attestations.push(data.attestation);
+      onStatus(`Attester ${ch.peerId.slice(0, 8)} attested ✓ (${attestations.length}/${challenges.length})`);
     } catch (e) {
-      onStatus(`Relay ${ch.peerId.slice(0, 8)}: ${(e as Error).message}`);
+      onStatus(`Attester ${ch.peerId.slice(0, 8)}: ${(e as Error).message}`);
     }
   }
-  return { credentials, faceLimitError };
+  return { nullifier, attestations, faceLimitError };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1644,45 +1652,38 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       restoreCreateBtn(); return;
     }
 
-    // Step 3: Send descriptor to relays for signing (camera closed, no video needed)
-    let relayCredentials: RelayCredential[] = [];
+    // Step 3: generate the account keys now (so we have the engine accountId the
+    // attester binds the identity to), then collect engine personhood attestation(s).
+    const keys = await generateAccountKeys();
+    const engineKeys = engineKeysFromAppPrivate(keys.priv);
+    const accountId = engineKeys.pub; // on-chain identity = the engine pubkey
+
+    let attestations: TypedAttestation[] = [];
+    let nullifier: string | undefined;
     let faceLimitError: string | undefined;
     if (pendingChallenges.length > 0) {
-      statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Verifying with relay nodes...</span>';
-      const result = await collectRelayCredentials(
-        pendingChallenges, faceMap.canonical, faceMap.hash,
+      statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Verifying identity with attester(s)...</span>';
+      const result = await collectAttestation(
+        pendingChallenges, faceMap.canonical, faceMap.hash, accountId,
         (msg) => { statusEl.innerHTML = `<span style="color:var(--accent)"><span class="spinner"></span> ${msg}</span>`; },
       );
-      relayCredentials = result.credentials;
+      attestations = result.attestations;
+      nullifier = result.nullifier;
       faceLimitError = result.faceLimitError;
     }
-    if (relayCredentials.length === 0) {
-      // Distinguish a deliberate face-limit refusal (relay is up, this face is maxed out)
-      // from an actual relay outage — otherwise hitting the per-face cap looks like a crash.
+    if (attestations.length === 0 || !nullifier) {
       if (faceLimitError) {
         addLog(`FaceID: ${faceLimitError}`, 'error');
         toast('Face limit reached for this face', 'error');
         statusEl.innerHTML = `<span style="color:var(--danger)">${escHtml(faceLimitError)} You cannot create more accounts with this face on ${escHtml(node.ledger.network)}.</span>`;
         restoreCreateBtn(); return;
       }
-      const isMainnet = node.ledger.network === 'mainnet';
-      addLog('FaceID: No relay endorsements obtained', 'error');
-      toast('Relay face verification failed. Is the relay server running?', 'error');
-      statusEl.innerHTML = `<span style="color:var(--danger)">Relay verification failed — ${isMainnet ? 'mainnet requires 3' : 'at least 1 relay endorsement required'}. Ensure the relay is running and try again.</span>`;
+      addLog('FaceID: No identity attestation obtained', 'error');
+      toast('Identity attestation failed. Is the attester running?', 'error');
+      statusEl.innerHTML = `<span style="color:var(--danger)">Identity attestation failed — at least one personhood attestation is required. Ensure the attester is running and try again.</span>`;
       restoreCreateBtn(); return;
     }
-    addLog(`FaceID: ${relayCredentials.length} relay endorsement(s) collected`, 'success');
-
-    // Local face-limit check using localStorage accounts (reliable across restarts)
-    const max = node.ledger.getMaxAccountsPerFace();
-    const localFaceCount = localAccounts.filter(a => a.faceMapHash === faceMap.hash).length;
-    const ledgerFaceCount = node.ledger.getFaceAccountCount(faceMap.hash);
-    const faceCount = Math.max(localFaceCount, ledgerFaceCount);
-    if (faceCount >= max) {
-      addLog(`FaceID: Face limit reached (${faceCount}/${max})`, 'error');
-      statusEl.innerHTML = `<span style="color:var(--danger)">Face already used for ${faceCount} account(s). Limit is ${max} on ${node.ledger.network}.</span>`;
-      restoreCreateBtn(); return;
-    }
+    addLog(`FaceID: ${attestations.length} attestation(s) collected`, 'success');
 
     // PIN setup
     statusEl.innerHTML = '<span style="color:var(--accent)">Face enrolled. Now set your account PIN...</span>';
@@ -1692,11 +1693,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       restoreCreateBtn(); return;
     }
 
-    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Generating keys and encrypting with face + PIN...</span>';
-
-    // Generate ECDSA + PQ key pair
-    const keys = await generateAccountKeys();
-
+    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Encrypting keys with face + PIN...</span>';
     const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin);
 
     // Encrypt face descriptor with PIN key for local privacy
@@ -1706,9 +1703,9 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     const pinKey = await crypto.subtle.importKey('raw', pinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
     const encryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
 
-    // Register account
+    // Register account — identity is the engine accountId (username is the alias mapped to it)
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Creating account on-chain...</span>';
-    const account = buildAccount(username, keys.pub, faceMap.hash, {
+    const account = buildAccount(username, accountId, faceMap.hash, {
       encryptedFaceDescriptor,
       pinSalt,
       pinVerifier: keyBlob.pinVerifier,
@@ -1719,37 +1716,37 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     node.ledger.registerAccount(account);
     partialPub = account.pub;
 
-    // Create open block (mints 1M UNIT) — embed relay endorsements
-    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys, faceMap.canonical, relayCredentials.length > 0 ? relayCredentials : undefined);
+    // Open the account on the engine (mints the genesis balance), attested + deduped by nullifier
+    const openBlock = await node.ledger.openAccount(accountId, engineKeys, { nullifier, attestations });
 
-    // Submit through node (publishes to libp2p network, triggers auto-vote)
+    // Submit through node (publishes to libp2p network)
     await node.submitBlock(openBlock);
-    const accPayload = `account:${keys.pub}:${username}:${account.createdAt}:${faceMap.hash}`;
+    const accPayload = `account:${accountId}:${username}:${account.createdAt}:${faceMap.hash}`;
     const accSig = await signData(accPayload, keys);
-    node.net.saveAccount(keys.pub, {
-      username, pub: keys.pub, balance: 1000000, nonce: 0,
+    node.net.saveAccount(accountId, {
+      username, pub: accountId, balance: 1000000, nonce: 0,
       createdAt: account.createdAt, faceMapHash: faceMap.hash,
       encryptedFaceDescriptor, pinSalt, pinVerifier: keyBlob.pinVerifier,
       linkedAnchor: keyBlob.linkedAnchor, pqPub: keys.pqPub, pqKemPub: keys.pqKemPub,
       _sig: accSig,
     });
-    await node.net.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
+    await node.net.saveKeyBlob(accountId, keyBlob as unknown as Record<string, unknown>);
 
     // Cache PIN for this session (rawBits needed for combined-key face update later)
-    cachePinKey(keys.pub, pinKey, pinRawBits);
+    cachePinKey(accountId, pinKey, pinRawBits);
 
     // Store locally — keep the signed open block so it can be replayed verbatim on restart.
     const fullAcc: AccountWithKeys & { openBlock?: AccountBlock } = { ...account, keys, balance: 1000000, openBlock };
     partialPub = null; // fully committed — no rollback needed
     localAccounts.push(fullAcc);
-    node.addLocalKey(keys.pub, keys);
+    node.addLocalKey(accountId, keys);
     saveWallet();
 
     const backupCode = encodeBackupKey(keys);
     statusEl.innerHTML = `<div style="margin-top:12px;">
       <span style="color:var(--success);font-weight:600;">Account created! +${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT minted.</span><br>
       <div class="stat-item" style="margin-top:8px;"><div class="stat-label">Username</div><div class="stat-value small" style="user-select:all;">${escHtml(username)}</div></div>
-      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(keys.pub)}" onclick="this.select()"/></div>
+      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(accountId)}" onclick="this.select()"/></div>
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(faceMap.hash)}" onclick="this.select()"/></div>
       <div class="secret-box" style="margin-top:12px;">
         <div class="warn-text">&#9888; BACKUP KEY - save this secret key as a secondary recovery method.</div>
@@ -2331,7 +2328,7 @@ $('#btnSendTx').addEventListener('click', async () => {
   if (assetId === '__unit__') {
     const amount = parseUNIT(amountInput);
     if (amount <= 0) { toast('Invalid amount', 'error'); return; }
-    const result = await node.ledger.createSend(sender.pub, to.toLowerCase(), amount, sender.keys);
+    const result = await node.ledger.createSend(sender.pub, to.toLowerCase(), amount, engineSigner(sender));
     if (result.error) { toast(result.error, 'error'); return; }
     const sub = await node.submitBlock(result.block!);
     if (sub.success) {
