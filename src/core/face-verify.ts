@@ -1,4 +1,6 @@
-import * as tf from '@tensorflow/tfjs';
+// face-api bundles its own @tensorflow/tfjs; use it via `faceapi.tf` so there is a
+// SINGLE tfjs instance. Importing @tensorflow/tfjs separately created a second copy
+// that re-registered every kernel and spammed the console with "already registered".
 import * as faceapi from '@vladmandic/face-api';
 import { bytesToHex } from './dag-block';
 
@@ -27,7 +29,7 @@ export interface FaceMap {
 
 export async function loadModels(): Promise<void> {
   if (modelsLoaded) return;
-  await tf.ready();
+  await faceapi.tf.ready();
   await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
   await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
   await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
