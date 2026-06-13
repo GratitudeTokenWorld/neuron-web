@@ -665,7 +665,10 @@ export class NeuronNode extends EventEmitter {
     const blocks = full
       ? Array.from(this.ledger.allBlocks.values())
       : this.ledger.getBlocksSince(this.lastPublishedAt - 5_000);
-    for (const block of blocks) this.net.publishBlock(block);
+    // Best-effort: engine-block gossip is deferred (new format); never throw here.
+    try {
+      for (const block of blocks) this.net.publishBlock(block);
+    } catch { /* network sync wired in a later phase */ }
     this.lastPublishedAt = Date.now();
   }
 
@@ -755,17 +758,14 @@ export class NeuronNode extends EventEmitter {
   async submitBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
     const result = await this.ledger.addBlock(block);
     if (result.success) {
-      this.net.publishBlock(block);
-      this.voteIfConflict(block);
-      if (block.type === 'send' && block.recipient) {
-        const keys = this.localKeys.get(block.accountPub);
-        let inboxSig: string | undefined;
-        if (keys) {
-          const payload = `inbox:${block.hash}:${block.accountPub}:${block.recipient}:${block.amount ?? 0}`;
-          inboxSig = await signData(payload, keys);
-        }
-        this.net.publishInboxSignal(block.recipient, block.accountPub, block.hash, block.amount ?? 0, inboxSig);
-      }
+      // Cross-node gossip is deferred during the engine migration: engine blocks use
+      // a new format (bigint fields, accountId not accountPub) the old AccountBlock
+      // gossip/serialize path can't encode. Keep it best-effort so a publish failure
+      // never breaks the local (single-instance) commit.
+      try {
+        this.net.publishBlock(block);
+        this.voteIfConflict(block);
+      } catch { /* network sync wired in a later phase */ }
     }
     return result;
   }

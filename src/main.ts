@@ -10,6 +10,8 @@ import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAt
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
 import type { TypedAttestation } from './engine/core/attestation';
+import { encodeBlock, decodeBlock } from './engine/core/block';
+import { bytesToHex, hexToBytes } from './engine/core/hash';
 import { initStreamSW, registerStreamURL, unregisterStreamURL } from './network/stream-sw';
 import {
   derivePinRawBits, encryptWithPinKey, decryptWithPinKey,
@@ -738,9 +740,10 @@ async function saveWallet() {
         username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash,
         pinSalt: acc.pinSalt, pinVerifier: acc.pinVerifier, linkedAnchor: acc.linkedAnchor,
         pqPub: acc.pqPub, pqKemPub: acc.pqKemPub, encryptedFaceDescriptor: acc.encryptedFaceDescriptor,
-        // Persist the signed open block (with its relay credentials) so it can be replayed
-        // verbatim on restart — re-creating it would mint a new timestamp/hash and fork the chain.
-        openBlock: acc.openBlock,
+        // Persist the signed engine open block so it can be replayed verbatim on
+        // restart. Encoded bigint-safely (engine blocks have bigint balances that
+        // plain JSON.stringify can't serialize).
+        openBlock: acc.openBlock ? bytesToHex(encodeBlock(acc.openBlock as unknown as Parameters<typeof encodeBlock>[0])) : undefined,
       };
     })
   );
@@ -776,11 +779,11 @@ async function loadWallet() {
       // Fallback: try parsing as plain JSON (migration from unencrypted format)
       parsed = raw;
     }
-    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string; pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string; openBlock?: AccountBlock }[])
+    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string; pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string; openBlock?: string }[])
       .map((d) => Object.assign({ username: d.username, pub: d.pub, keys: d.keys, balance: 0, nonce: 0, createdAt: d.createdAt, faceMapHash: d.faceMapHash || '' }, {
         pinSalt: d.pinSalt, pinVerifier: d.pinVerifier, linkedAnchor: d.linkedAnchor,
         pqPub: d.pqPub, pqKemPub: d.pqKemPub, encryptedFaceDescriptor: d.encryptedFaceDescriptor,
-        openBlock: d.openBlock,
+        openBlock: d.openBlock ? decodeBlock(hexToBytes(d.openBlock)) : undefined,
       }));
   } catch { /* corrupt */ }
 }
@@ -1990,16 +1993,18 @@ $('#btnRecoverKeys').addEventListener('click', async () => {
       keys = JSON.parse(keysRaw) as KeyPair;
     }
     if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) { toast('Invalid key format', 'error'); return; }
+    // On-chain identity = engine pubkey derived from the recovered keys.
+    const accountId = engineAccountId(keys.priv);
 
     const existing = node.ledger.getAccountByUsername(username);
-    if (existing && existing.pub !== keys.pub) { toast('Key does not match this username', 'error'); return; }
+    if (existing && existing.pub !== accountId) { toast('Key does not match this username', 'error'); return; }
 
     // Fetch the key blob to reliably get pinSalt/pinVerifier - don't rely on sync timing
     const blobData = await node.net.findKeyBlobByUsername(username);
     const blobPinSalt = blobData?.pinSalt ? String(blobData.pinSalt) : (existing as Account & { pinSalt?: string } | undefined)?.pinSalt;
     const blobPinVerifier = blobData?.pinVerifier ? String(blobData.pinVerifier) : (existing as Account & { pinVerifier?: string } | undefined)?.pinVerifier;
 
-    const account = buildAccount(username, keys.pub, existing?.faceMapHash || blobData?.faceMapHash as string || '', {
+    const account = buildAccount(username, accountId, existing?.faceMapHash || blobData?.faceMapHash as string || '', {
       pinSalt: blobPinSalt,
       pinVerifier: blobPinVerifier,
       linkedAnchor: blobData?.linkedAnchor ? String(blobData.linkedAnchor) : existing?.linkedAnchor,
@@ -2008,10 +2013,10 @@ $('#btnRecoverKeys').addEventListener('click', async () => {
     });
     if (!existing) node.ledger.registerAccount(account);
 
-    if (!localAccounts.find((a) => a.pub === keys.pub)) {
+    if (!localAccounts.find((a) => a.pub === accountId)) {
       const fullAcc: AccountWithKeys = { ...account, keys, balance: existing?.balance || 0 };
       localAccounts.push(fullAcc);
-      node.addLocalKey(keys.pub, keys);
+      node.addLocalKey(accountId, keys);
       saveWallet();
     }
 

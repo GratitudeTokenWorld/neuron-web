@@ -282,6 +282,10 @@ export class EngineLedger extends EventEmitter {
 
   /** All blocks by hash, maintained as blocks are added/applied. */
   readonly allBlocks = new Map<string, Block>();
+  /** Accounts by pub (DAGLedger-compatible view; iterated by publishLocalData/UI). */
+  get accounts(): Map<string, LedgerAccount> {
+    return this.accountsByPub;
+  }
   /** Deferred: storage-provider economy. */
   readonly storageProviders = new Map<string, unknown>();
   /** Deferred: smart contracts. */

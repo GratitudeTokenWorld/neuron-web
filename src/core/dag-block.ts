@@ -36,7 +36,9 @@ export const HEARTBEAT_INTERVAL_MS = 4 * 60 * 60 * 1000;
 /** Reward epoch duration in ms (24 hours) */
 export const REWARD_EPOCH_MS = 24 * 60 * 60 * 1000;
 
-export function formatUNIT(milliUnits: number): string {
+export function formatUNIT(milliUnits: number | bigint): string {
+  // Engine blocks carry bigint amounts; coerce so the same formatter works for both.
+  if (typeof milliUnits === 'bigint') milliUnits = Number(milliUnits);
   const whole = Math.floor(milliUnits / UNIT_FACTOR);
   const frac = milliUnits % UNIT_FACTOR;
   if (frac === 0) return whole.toLocaleString();
