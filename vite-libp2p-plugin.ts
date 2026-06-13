@@ -17,7 +17,9 @@ export function libp2pRelay(): Plugin {
 
   function startRelay(relayPath: string) {
     if (stopping) return;
-    relayProcess = spawn(process.execPath, [relayPath], {
+    // Run the (TypeScript) relay/attester through the tsx loader so it can import
+    // the engine's attestation code directly.
+    relayProcess = spawn(process.execPath, ['--import', 'tsx', relayPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
@@ -44,7 +46,7 @@ export function libp2pRelay(): Plugin {
     name: 'libp2p-relay',
 
     configureServer(server: ViteDevServer) {
-      const relayPath = join(process.cwd(), 'relay-server.js');
+      const relayPath = join(process.cwd(), 'relay-server.ts');
       stopping = false;
       startRelay(relayPath);
 

@@ -37,6 +37,13 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { AbstractMessageStream } from '@libp2p/utils';
 import { GossipSub } from '@chainsafe/libp2p-gossipsub';
+import { randomBytes, randomUUID } from 'crypto';
+// Engine identity: this server is the ATTESTER — it signs engine attestations
+// (imported directly, run via tsx) instead of old face-hash credentials.
+import { createAttestation } from './src/engine/core/attestation.js';
+import { deriveCommitment } from './src/engine/core/identity.js';
+import { publicKeyFromPrivate as enginePublicKeyFromPrivate } from './src/engine/core/keys.js';
+import { bytesToHex } from './src/engine/core/hash.js';
 
 // ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
 // New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
@@ -104,6 +111,7 @@ const PEER_ID_FILE = process.env.PEER_ID_FILE || '.relay-peer-id.json';
 const PEER_RELAYS = (process.env.PEER_RELAYS || '').split(',').filter(Boolean);
 const SIGNING_KEY_FILE = process.env.SIGNING_KEY_FILE || '.relay-signing-key.json';
 const FACE_DB_FILE = process.env.FACE_DB_FILE || '.relay-face-db.json';
+const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || '.relay-attester-key.json';
 
 // Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
 const PROTOCOL_VERSION = 'v1';
@@ -220,6 +228,22 @@ async function computeFaceMapHash(descriptor) {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** The attester's engine keypair (hex). Used to sign engine personhood attestations. */
+async function loadOrCreateAttesterKey() {
+  try {
+    const saved = JSON.parse(await fs.readFile(ATTESTER_KEY_FILE, 'utf8'));
+    if (saved.priv) {
+      console.log('[Attester] Loaded existing attester key');
+      return { priv: saved.priv, pub: enginePublicKeyFromPrivate(saved.priv) };
+    }
+  } catch { /* generate below */ }
+  const priv = bytesToHex(randomBytes(32));
+  const pub = enginePublicKeyFromPrivate(priv);
+  await fs.writeFile(ATTESTER_KEY_FILE, JSON.stringify({ priv })).catch(() => {});
+  console.log('[Attester] Generated new attester key');
+  return { priv, pub };
+}
+
 async function loadOrCreateSigningKey() {
   try {
     const saved = JSON.parse(await fs.readFile(SIGNING_KEY_FILE, 'utf8'));
@@ -282,6 +306,8 @@ async function main() {
   const privKey = await loadOrCreatePrivKey();
   const peerId = peerIdFromPrivateKey(privKey);
   const signingKey = await loadOrCreateSigningKey();
+  const attester = await loadOrCreateAttesterKey();
+  console.log(`[Attester] personhood attester pub: ${attester.pub.slice(0, 16)}…`);
   await loadFaceDB();
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
@@ -344,7 +370,11 @@ async function main() {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message })); return;
         }
-        const { descriptor, faceMapHash, challengeId } = body;
+        const { descriptor, faceMapHash, accountId, challengeId } = body;
+        if (!accountId || typeof accountId !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'accountId (engine pubkey) required' })); return;
+        }
 
         // Derive the Map key once and use it for every lookup/delete so they can't diverge
         // (set/get/delete must agree, else a used or expired session leaks and survives).
@@ -392,22 +422,32 @@ async function main() {
         session.used = true;
         recordIpVerification(ip);
 
+        // Each face entry has a STABLE nullifier id (assigned once). The per-account
+        // nullifier is `<nid>#<index>`, so up to faceMax accounts per face get distinct,
+        // globally-unique nullifiers (testnet=3 for dev; mainnet=1 → true one-human-one-account).
+        let nid;
         if (matchedFace) {
+          if (!matchedFace.nid) matchedFace.nid = randomUUID();
+          nid = matchedFace.nid;
           matchedFace.count++;
-          // Update centroid so future sessions are compared against a current reference,
-          // preventing descriptor drift from creating a false "new face" entry.
+          // Update centroid so future sessions compare against a current reference.
           for (let i = 0; i < 128; i++) {
             matchedFace.descriptor[i] = (matchedFace.descriptor[i] + descriptor[i]) / 2;
           }
         } else {
-          faceDescriptorDB.push({ descriptor: Array.from(descriptor), count: 1, network });
+          nid = randomUUID();
+          faceDescriptorDB.push({ descriptor: Array.from(descriptor), count: 1, network, nid });
         }
         await saveFaceDB();
 
-        const sig = await signFaceMapHash(faceMapHash, signingKey.privKey);
-        console.log(`[FaceVerify] Signed for ip=${ip} face=${faceCount + 1}/${faceMax} (${matchedFace ? `matched dist<${FACE_MATCH_THRESHOLD}` : 'new face'})`);
+        // Issue an ENGINE attestation: sign a personhood claim over the identity
+        // commitment that binds this human (nullifier) to this account (accountId).
+        const nullifier = `${nid}#${faceCount}`;
+        const commitment = deriveCommitment(nullifier, accountId);
+        const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
+        console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sig, signingPub: signingKey.pubKeyStr }));
+        res.end(JSON.stringify({ nullifier, attestation, attesterPub: attester.pub }));
 
       } else {
         res.writeHead(404);

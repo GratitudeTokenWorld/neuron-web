@@ -11,6 +11,7 @@ coverage/
 
 # Relay runtime state — secrets/biometrics, never commit
 .relay-signing-key.json
+.relay-attester-key.json
 .relay-face-db.json
 .relay-face-counts.json
 .relay-peer-id.json
