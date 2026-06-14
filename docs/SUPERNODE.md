@@ -38,6 +38,7 @@ or attester key changes the node's identity and breaks the baked bootstrap addre
 | `.relay-face-db.json` | enrolled face descriptors + per-face account counts | face Sybil limit resets |
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
 | `.relay-keyblobs.json` | archived face+PIN-encrypted key-blobs (for peer-independent recovery) | recovery needs a live peer holding the blob until it re-fills |
+| `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
 
 ---
 
@@ -154,7 +155,8 @@ behind a `DEBUG`-style flag once traffic grows.
 Cron a copy of the identity + archive off-box:
 ```bash
 tar czf relay-backup-$(date +%F).tgz .relay-peer-id.json .relay-attester-key.json \
-  .relay-signing-key.json .relay-face-db.json .relay-engine-blocks.json .relay-keyblobs.json
+  .relay-signing-key.json .relay-face-db.json .relay-engine-blocks.json \
+  .relay-keyblobs.json .relay-usernames.json
 ```
 The first two are the ones you cannot regenerate.
 

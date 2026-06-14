@@ -1571,23 +1571,26 @@ async function collectAttestation(
   descriptor: number[],
   faceMapHash: string,
   accountId: string,
+  username: string,
   onStatus: (msg: string) => void,
-): Promise<{ nullifier?: string; attestations: TypedAttestation[]; faceLimitError?: string }> {
+): Promise<{ nullifier?: string; attestations: TypedAttestation[]; faceLimitError?: string; usernameTakenError?: string }> {
   const attestations: TypedAttestation[] = [];
   const seen = new Set<string>();
   let nullifier: string | undefined;
   let faceLimitError: string | undefined;
+  let usernameTakenError: string | undefined;
   for (const ch of challenges) {
     try {
       const res = await fetch(faceVerifyEndpoint(ch.faceVerifyBase, 'verify'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network },
-        body: JSON.stringify({ descriptor, faceMapHash, accountId, challengeId: ch.challengeId }),
+        body: JSON.stringify({ descriptor, faceMapHash, accountId, username, challengeId: ch.challengeId }),
         signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
         if (res.status === 429 && /face limit/i.test(String(err.error))) faceLimitError = String(err.error);
+        if (res.status === 409 || /username taken/i.test(String(err.error))) usernameTakenError = String(err.error);
         onStatus(`Attester ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
         continue;
       }
@@ -1601,7 +1604,7 @@ async function collectAttestation(
       onStatus(`Attester ${ch.peerId.slice(0, 8)}: ${(e as Error).message}`);
     }
   }
-  return { nullifier, attestations, faceLimitError };
+  return { nullifier, attestations, faceLimitError, usernameTakenError };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1690,17 +1693,25 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     let attestations: TypedAttestation[] = [];
     let nullifier: string | undefined;
     let faceLimitError: string | undefined;
+    let usernameTakenError: string | undefined;
     if (pendingChallenges.length > 0) {
       statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Verifying identity with attester(s)...</span>';
       const result = await collectAttestation(
-        pendingChallenges, faceMap.canonical, faceMap.hash, accountId,
+        pendingChallenges, faceMap.canonical, faceMap.hash, accountId, username,
         (msg) => { statusEl.innerHTML = `<span style="color:var(--accent)"><span class="spinner"></span> ${msg}</span>`; },
       );
       attestations = result.attestations;
       nullifier = result.nullifier;
       faceLimitError = result.faceLimitError;
+      usernameTakenError = result.usernameTakenError;
     }
     if (attestations.length === 0 || !nullifier) {
+      if (usernameTakenError) {
+        addLog(`Username taken: ${username}`, 'error');
+        toast('Username already taken', 'error');
+        statusEl.innerHTML = `<span style="color:var(--danger)">The username "${escHtml(username)}" is already registered to another account. Choose a different one.</span>`;
+        restoreCreateBtn(); return;
+      }
       if (faceLimitError) {
         addLog(`FaceID: ${faceLimitError}`, 'error');
         toast('Face limit reached for this face', 'error');

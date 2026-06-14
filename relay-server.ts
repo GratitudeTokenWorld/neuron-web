@@ -123,6 +123,9 @@ const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || '.relay-engine-bloc
 // Key-blob archive: lets a fully-wiped device recover without any peer online
 // (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
 const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || '.relay-keyblobs.json';
+// Username uniqueness registry (attester-enforced, Phase 3): the first account
+// attested for a username owns it; a later different-account claim is rejected.
+const USERNAMES_FILE = process.env.USERNAMES_FILE || '.relay-usernames.json';
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 // Per-block/per-request archive logs are verbose; gate them behind DEBUG_ARCHIVE=1.
 // Startup ("Loaded N") and reset lines stay unconditional.
@@ -236,6 +239,23 @@ async function saveKeyBlobs() {
   await fs.writeFile(KEYBLOBS_FILE, JSON.stringify([...keyBlobStore.values()])).catch(() => {});
 }
 setInterval(() => { saveKeyBlobs().catch(() => {}); }, 5_000);
+
+// ── Username uniqueness (Phase 3, attester-enforced) ──────────────────────────
+const usernameRegistry = new Map(); // username (lowercased) → accountId
+let usernameDirty = false;
+
+async function loadUsernames() {
+  try {
+    for (const [u, a] of JSON.parse(await fs.readFile(USERNAMES_FILE, 'utf8'))) usernameRegistry.set(u, a);
+    console.log(`[Attester] Loaded ${usernameRegistry.size} username(s)`);
+  } catch { /* none yet */ }
+}
+async function saveUsernames() {
+  if (!usernameDirty) return;
+  usernameDirty = false;
+  await fs.writeFile(USERNAMES_FILE, JSON.stringify([...usernameRegistry.entries()])).catch(() => {});
+}
+setInterval(() => { saveUsernames().catch(() => {}); }, 5_000);
 
 /** Archive a key-blob seen on the keyblobs topic (keep the newest per account). */
 function archiveKeyBlob(blob, network) {
@@ -419,6 +439,7 @@ async function main() {
   const attester = await loadOrCreateAttesterKey();
   console.log(`[Attester] personhood attester pub: ${attester.pub.slice(0, 16)}…`);
   await loadFaceDB();
+  await loadUsernames();
   if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
@@ -486,6 +507,15 @@ async function main() {
         if (!accountId || typeof accountId !== 'string') {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'accountId (engine pubkey) required' })); return;
+        }
+        // Username uniqueness (fail fast, before consuming the challenge/face).
+        const username = String(body.username || '').trim().toLowerCase();
+        if (username) {
+          const owner = usernameRegistry.get(username);
+          if (owner && owner !== accountId) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'username taken' })); return;
+          }
         }
 
         // Derive the Map key once and use it for every lookup/delete so they can't diverge
@@ -558,6 +588,7 @@ async function main() {
         const commitment = deriveCommitment(nullifier, accountId);
         const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
         console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})`);
+        if (username) { usernameRegistry.set(username, accountId); usernameDirty = true; } // claim the username
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ nullifier, attestation, attesterPub: attester.pub }));
 
