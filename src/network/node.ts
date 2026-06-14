@@ -241,7 +241,10 @@ export class NeuronNode extends EventEmitter {
     this.storage.on('storage:reward-issued',  (d: unknown) => this.emit('storage:reward-issued', d));
     this.storage.on('storage:cached',          (d: unknown) => this.emit('storage:cached', d));
 
-    for (const pub of this.localKeys.keys()) this.startInboxWatch(pub);
+    for (const pub of this.localKeys.keys()) {
+      this.startInboxWatch(pub);
+      this.net.subscribeEngineShard(this.ledger.getShardOf(pub)); // Slice 3: hold our own accounts' shards
+    }
   }
 
   private async dialPeer(peerId: string, addrs: string[]): Promise<void> {
@@ -530,12 +533,22 @@ export class NeuronNode extends EventEmitter {
    * shard-scoped in Slice 3, or after a fresh-device recovery).
    */
   private engineResyncAccount(accountId: string): void {
-    const head = this.ledger.getAccountHead(accountId);
-    this.net.requestEngineDelta(accountId, head ? head.index : -1);
+    const shard = this.ledger.getShardOf(accountId);
+    // Follow-on-demand: subscribe to the target shard so the holder's re-broadcast
+    // (delta response, and the 20s periodic re-broadcast backstop) reaches us.
+    this.net.subscribeEngineShard(shard);
+    const haveIndex = this.ledger.getAccountHead(accountId)?.index ?? -1;
+    this.net.requestEngineDelta(accountId, haveIndex, shard);
+    // Retry once after the gossipsub mesh for the freshly-subscribed shard forms.
+    setTimeout(() => {
+      const idx = this.ledger.getAccountHead(accountId)?.index ?? -1;
+      this.net.requestEngineDelta(accountId, idx, shard);
+    }, 1500);
   }
 
   addLocalKey(pub: string, keys: KeyPair): void {
     this.localKeys.set(pub, keys);
+    this.net.subscribeEngineShard(this.ledger.getShardOf(pub)); // Slice 3: hold this account's shard (queues if not running)
     if (this.status !== 'stopped') {
       this.startInboxWatch(pub);
       setTimeout(() => this.sweepUnclaimedReceives(), 1000);

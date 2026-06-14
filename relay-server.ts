@@ -640,6 +640,21 @@ async function main() {
     pubsub.subscribe(`${pfx}/snapshots`);
   }
 
+  // Dynamic topics can't be pre-listed: engine-blocks/{shard} and
+  // engine-delta-req/{shard} (4096 shards) and inbox/{pubShort} (per account).
+  // A gossipsub node only ROUTES topics it is subscribed to, so for peers that
+  // reach each other only via this relay (different NATs, no direct WebRTC), the
+  // relay must subscribe to whatever its peers subscribe to. Mirror every
+  // neuronchain topic a peer announces so the relay forwards it.
+  pubsub.addEventListener('subscription-change', (evt) => {
+    const subs = evt.detail?.subscriptions || [];
+    for (const s of subs) {
+      if (s?.subscribe && typeof s.topic === 'string' && s.topic.startsWith('neuronchain/')) {
+        try { pubsub.subscribe(s.topic); } catch { /* already subscribed */ }
+      }
+    }
+  });
+
   // ── Peer-addr cache and replay ────────────────────────────────────────────
   // Problem: when Browser A publishes peer-addrs, Browser B may not be in the
   // relay's GossipSub mesh yet (mesh formation takes 1–3 gossipsub heartbeats).

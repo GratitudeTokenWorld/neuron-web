@@ -238,14 +238,17 @@ function topicBlobRequests(network: string): string { return `neuronchain/${PROT
 function topicPeerAddrs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/peer-addrs`; }
 function topicRelays(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/relays`; }
 function topicSnapshots(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/snapshots`; }
-// Phase 1 Slice 1: a single engine-block topic (all nodes subscribe). Slice 3
-// replaces this with per-shard topics + selective subscription.
-function topicEngineBlocks(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-blocks`; }
-// Phase 1 Slice 2: per-account delta pull. A requester asks for an account's
-// chain tail; any holder re-broadcasts the missing blocks on the engine-blocks
-// topic (so they flow through the normal receive path). The pull primitive that
-// makes selective subscription (Slice 3) viable without a global firehose.
-function topicEngineDeltaReq(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req`; }
+// Phase 1 Slice 3: per-shard engine-block topics. A node subscribes only to the
+// shards it cares about (own accounts + followed), so it never ingests the global
+// write firehose — per-node bandwidth becomes O(own + followed), not O(network).
+function engineBlocksPrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-blocks/`; }
+function topicEngineBlocks(network: string, shard: number): string { return `${engineBlocksPrefix(network)}${shard}`; }
+// Per-account delta pull (Slice 2), now sharded (Slice 3): a requester asks
+// holders of a shard for an account's chain tail; a holder re-broadcasts the
+// missing blocks on that shard's engine-blocks topic. Subscribing to a shard
+// means subscribing to BOTH its blocks and its delta-req topic.
+function engineDeltaReqPrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req/`; }
+function topicEngineDeltaReq(network: string, shard: number): string { return `${engineDeltaReqPrefix(network)}${shard}`; }
 function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
@@ -407,6 +410,8 @@ export class Libp2pNetwork extends EventEmitter {
   private processedBlocks: Set<string> = new Set();
   /** Separate from processedBlocks — engine blocks use a different hash space + format. */
   private processedEngineBlocks: Set<string> = new Set();
+  /** Slice 3: shards this node subscribes to (own accounts + followed). */
+  private subscribedEngineShards: Set<number> = new Set();
   private processedVotes: Set<string> = new Set();
   private generation = 0;
   private watchedInboxes: Set<string> = new Set();
@@ -650,8 +655,12 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicRelays(this.network));
     pubsub.subscribe(topicSnapshots(this.network));
     pubsub.subscribe(topicFileAnnouncements(this.network));
-    pubsub.subscribe(topicEngineBlocks(this.network));
-    pubsub.subscribe(topicEngineDeltaReq(this.network));
+    // Engine-block + delta-req topics are per-shard (Slice 3) — the node
+    // subscribes to its interest shards via subscribeEngineShard() after start.
+    for (const shard of this.subscribedEngineShards) {
+      pubsub.subscribe(topicEngineBlocks(this.network, shard));
+      pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
+    }
 
     pubsub.addEventListener('message', (evt) => {
       const msg = evt.detail as { topic: string; data: Uint8Array; from?: { toString(): string } };
@@ -913,9 +922,10 @@ export class Libp2pNetwork extends EventEmitter {
       }
     }
 
-    // Phase 1: engine blocks travel as { blockHex, _gen }. Verify (content hash +
-    // signature) BEFORE trust/persist, dedup on the engine hash space, then emit.
-    if (topic === topicEngineBlocks(this.network)) {
+    // Phase 1: engine blocks travel as { blockHex, _gen } on a per-shard topic.
+    // Verify (content hash + signature) BEFORE trust/persist, dedup on the engine
+    // hash space, then emit.
+    if (topic.startsWith(engineBlocksPrefix(this.network))) {
       const raw = decode<{ blockHex?: string; _gen?: number }>(data);
       if (typeof raw._gen === 'number' && raw._gen < this.generation) return;
       if (!raw.blockHex) return;
@@ -930,12 +940,14 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
-    // Phase 1 Slice 2: a peer is requesting an account's chain tail. If we hold
-    // those blocks, re-broadcast them on the engine-blocks topic so they reach
-    // the requester (and anyone else) through the normal receive path.
-    if (topic === topicEngineDeltaReq(this.network)) {
-      const req = decode<{ accountId?: string; haveIndex?: number }>(data);
-      if (req.accountId) await this.serveEngineDelta(req.accountId, typeof req.haveIndex === 'number' ? req.haveIndex : -1);
+    // Phase 1 Slice 2/3: a peer is requesting an account's chain tail. If we hold
+    // those blocks, re-broadcast them on the shard's engine-blocks topic so they
+    // reach the requester (who has subscribed to that shard) via the receive path.
+    if (topic.startsWith(engineDeltaReqPrefix(this.network))) {
+      const req = decode<{ accountId?: string; haveIndex?: number; shard?: number }>(data);
+      if (req.accountId && typeof req.shard === 'number') {
+        await this.serveEngineDelta(req.accountId, typeof req.haveIndex === 'number' ? req.haveIndex : -1, req.shard);
+      }
       return;
     }
 
@@ -968,8 +980,11 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
-    // Inbox topics are dynamic: neuronchain/{network}/inbox/{pubShort}
-    if (topic.startsWith(`neuronchain/${this.network}/inbox/`)) {
+    // Inbox topics are dynamic: neuronchain/{PROTOCOL_VERSION}/{network}/inbox/{pubShort}
+    // (must include the version segment to match topicInbox(); the old prefix
+    // omitted it, so inbox signals were silently dropped — this path went unused
+    // until engine cross-shard delivery started relying on it).
+    if (topic.startsWith(`neuronchain/${PROTOCOL_VERSION}/${this.network}/inbox/`)) {
       const sig = decode<{ sender?: string; blockHash?: string; amount?: number; timestamp?: number; signature?: string }>(data);
       if (sig.sender && sig.blockHash) {
         this.emit('inbox:signal', sig);
@@ -1147,11 +1162,24 @@ export class Libp2pNetwork extends EventEmitter {
     this.db.put('blocks', { ...block, _blockVersion: this.blockVersionCounter } as NeuronDB['blocks']).catch(() => {});
   }
 
-  /** Phase 1: gossip an engine block (hex-encoded, bigint-safe) + persist it locally. */
+  /**
+   * Slice 3: subscribe to a shard's engine-block + delta-req topics (idempotent).
+   * Called for own accounts' shards and, on demand, for accounts we pull/follow.
+   */
+  subscribeEngineShard(shard: number): void {
+    if (this.subscribedEngineShards.has(shard)) return;
+    this.subscribedEngineShards.add(shard);
+    if (!this.running) return; // start() subscribes the accumulated set
+    const pubsub = this.libp2p.services.pubsub as unknown as GossipSub;
+    pubsub.subscribe(topicEngineBlocks(this.network, shard));
+    pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
+  }
+
+  /** Phase 1: gossip an engine block (hex-encoded, bigint-safe) on its shard topic + persist it. */
   publishEngineBlock(block: EngineBlock): void {
     if (!this.running) return;
     this.processedEngineBlocks.add(block.hash);
-    this.publish(topicEngineBlocks(this.network), { blockHex: bytesToHex(encodeBlock(block)), _gen: this.generation });
+    this.publish(topicEngineBlocks(this.network, block.shard), { blockHex: bytesToHex(encodeBlock(block)), _gen: this.generation });
     this.saveEngineBlock(block).catch(() => {});
   }
 
@@ -1522,15 +1550,15 @@ export class Libp2pNetwork extends EventEmitter {
     return blocks.sort((a, b) => a.accountId === b.accountId ? a.index - b.index : (a.accountId < b.accountId ? -1 : 1));
   }
 
-  /** Slice 2: ask peers for an account's blocks after `haveIndex` (the pull primitive). */
-  requestEngineDelta(accountId: string, haveIndex: number): void {
+  /** Slice 2/3: ask the shard's holders for an account's blocks after `haveIndex`. */
+  requestEngineDelta(accountId: string, haveIndex: number, shard: number): void {
     if (!this.running) return;
-    this.publish(topicEngineDeltaReq(this.network), { accountId, haveIndex });
+    this.publish(topicEngineDeltaReq(this.network, shard), { accountId, haveIndex, shard });
   }
 
-  /** Slice 2: serve a delta request — re-broadcast our held blocks for `accountId`
-   *  with index > haveIndex, in order, on the engine-blocks topic. */
-  async serveEngineDelta(accountId: string, haveIndex: number): Promise<void> {
+  /** Slice 2/3: serve a delta request — re-broadcast our held blocks for `accountId`
+   *  with index > haveIndex, in order, on the shard's engine-blocks topic. */
+  async serveEngineDelta(accountId: string, haveIndex: number, shard: number): Promise<void> {
     if (!this.running) return;
     try {
       const rows = await (this.db as IDBPDatabase<any>).getAllFromIndex( // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -1539,7 +1567,7 @@ export class Libp2pNetwork extends EventEmitter {
       rows
         .filter(r => r.index > haveIndex)
         .sort((a, b) => a.index - b.index)
-        .forEach(r => this.publish(topicEngineBlocks(this.network), { blockHex: r.blockHex, _gen: this.generation }));
+        .forEach(r => this.publish(topicEngineBlocks(this.network, shard), { blockHex: r.blockHex, _gen: this.generation }));
     } catch { /* nothing to serve */ }
   }
 
