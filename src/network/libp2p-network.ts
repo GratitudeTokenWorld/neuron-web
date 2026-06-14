@@ -112,7 +112,7 @@ import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
 // they round-trip via the bigint-safe codec below and travel as hex on gossip.
 import { encodeBlock, decodeBlock, verifyBlock, type Block as EngineBlock } from '../engine/core/block';
 import { bytesToHex, hexToBytes } from '../engine/core/hash';
-import { sign as engineSign } from '../engine/core/keys';
+import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
 
 export const NUM_SYNAPSES = 4;
 
@@ -137,6 +137,8 @@ interface RelayInfo {
   bootstrapAddr: string;
   signingPub?: string;
   faceVerifyUrl?: string;
+  operators?: string[];   // accountIds allowed to reset the network
+  generation?: number;    // relay's current reset epoch
 }
 
 /**
@@ -164,7 +166,7 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
     try {
       const res = await fetch('/relay-info', { signal: AbortSignal.timeout(4000) });
       if (!res.ok) throw new Error(`status ${res.status}`);
-      const json = await res.json() as { peerId?: string; signingPub?: string; faceVerifyUrl?: string; ready?: boolean };
+      const json = await res.json() as { peerId?: string; signingPub?: string; faceVerifyUrl?: string; ready?: boolean; operators?: string[]; generation?: number };
       if (!json.peerId) throw new Error('no peerId');
       // The relay's p2p layer isn't dialable until node.start() finishes (ready=true).
       // Keep retrying so the first dial targets a listening relay instead of failing and
@@ -180,7 +182,7 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
         ? `/dns4/localhost/tcp/9090/ws/p2p/${json.peerId}`
         : `/dns4/${host}/tcp/${port}/${wsProto}/http-path/relay-ws/p2p/${json.peerId}`;
 
-      return { peerId: json.peerId, bootstrapAddr, signingPub: json.signingPub, faceVerifyUrl: json.faceVerifyUrl };
+      return { peerId: json.peerId, bootstrapAddr, signingPub: json.signingPub, faceVerifyUrl: json.faceVerifyUrl, operators: json.operators, generation: json.generation };
     } catch {
       if (i < retries - 1) await new Promise(r => setTimeout(r, delayMs));
     }
@@ -418,6 +420,8 @@ export class Libp2pNetwork extends EventEmitter {
   private processedEngineBlocks: Set<string> = new Set();
   /** Slice 3: shards this node subscribes to (own accounts + followed). */
   private subscribedEngineShards: Set<number> = new Set();
+  /** Phase 3: accountIds allowed to reset the network (from the relay's /relay-info). */
+  private operators: string[] = [];
   private processedVotes: Set<string> = new Set();
   private generation = 0;
   private watchedInboxes: Set<string> = new Set();
@@ -434,6 +438,7 @@ export class Libp2pNetwork extends EventEmitter {
   private static readonly BUCKET_REFILL_PER_SEC = 10;
   private peerAddrTimer: ReturnType<typeof setInterval> | null = null;
   private relayPingTimer: ReturnType<typeof setInterval> | null = null;
+  private relayInfoTimer: ReturnType<typeof setInterval> | null = null;
   private peerAddrBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
   private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Tracks whether circuit-relay addresses have been successfully obtained at least once */
@@ -567,6 +572,12 @@ export class Libp2pNetwork extends EventEmitter {
 
     const relayInfo = await fetchRelayInfo();
     if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
+    if (relayInfo?.operators) this.operators = relayInfo.operators;
+    // Catch up to the relay's reset epoch (covers a device that missed a reset
+    // while offline): adopt + wipe if we're behind.
+    if (typeof relayInfo?.generation === 'number' && relayInfo.generation > this.generation) {
+      await this.applyReset(relayInfo.generation);
+    }
     const bootstrapList = buildBootstrapList(relayInfo);
 
     // Build directPeers for gossipsub - forces a gossipsub stream to the relay
@@ -710,6 +721,18 @@ export class Libp2pNetwork extends EventEmitter {
     // Heartbeat every 15s as a fallback for any missed events.
     this.peerAddrTimer = setInterval(() => this.broadcastPeerAddrs(), 15_000);
 
+    // Refresh operators + reset epoch from the relay every 2 min: picks up
+    // operators elected after we joined, and converges if we missed a reset
+    // gossip. Cheap (one tiny GET); could move to gossip at scale.
+    this.relayInfoTimer = setInterval(async () => {
+      const info = await fetchRelayInfo(1, 0);
+      if (info?.operators) this.operators = info.operators;
+      if (typeof info?.generation === 'number' && info.generation > this.generation) {
+        await this.applyReset(info.generation);
+        this.emit('generation:changed', true);
+      }
+    }, 120_000);
+
     // Ping relay (WebSocket) peers every 10s so the TCP connection stays alive through
     // NAT devices that drop idle connections after 20-30s. 10s gives a comfortable
     // margin. Direct browser↔browser WebRTC connections are excluded (/ws/ filter).
@@ -785,6 +808,7 @@ export class Libp2pNetwork extends EventEmitter {
     this.relayReconnectBackoff = 2_000;
     if (this.peerAddrTimer) { clearInterval(this.peerAddrTimer); this.peerAddrTimer = null; }
     if (this.relayPingTimer) { clearInterval(this.relayPingTimer); this.relayPingTimer = null; }
+    if (this.relayInfoTimer) { clearInterval(this.relayInfoTimer); this.relayInfoTimer = null; }
     if (this.peerAddrBroadcastDebounce) { clearTimeout(this.peerAddrBroadcastDebounce); this.peerAddrBroadcastDebounce = null; }
     if (this.relayReconnectTimer) { clearTimeout(this.relayReconnectTimer); this.relayReconnectTimer = null; }
     await this.libp2p?.stop();
@@ -867,35 +891,15 @@ export class Libp2pNetwork extends EventEmitter {
     if (topic === topicGeneration(this.network)) {
       const msg = decode<{ generation?: number; signature?: string; operatorPub?: string; resetAt?: number }>(data);
       if (typeof msg.generation !== 'number' || msg.generation <= this.generation) return;
-      if (this.network === 'mainnet') {
-        if (!msg.signature || !msg.operatorPub || !KNOWN_OPERATORS.includes(msg.operatorPub)) return;
-        const result = await verifySignature(msg.signature, msg.operatorPub);
-        if (result !== `generation:${msg.generation}`) return;
-      }
-      this.generation = msg.generation;
-      this.saveGeneration();
-      // isReset = true only when clearAll() triggered this - it stamps resetAt.
-      // publishLocalData() re-broadcasts without resetAt, so peers syncing their
-      // generation counter don't have their data wiped.
-      const isReset = typeof msg.resetAt === 'number' && (Date.now() - msg.resetAt < 10 * 60 * 1000);
-      if (isReset) {
-        // Real testnet reset: wipe all stored data so old-gen blocks don't re-enter
-        try {
-          await this.db.clear('blocks');
-          await this.db.clear('accounts');
-          await this.db.clear('votes');
-          await this.db.clear('contracts');
-          await this.db.clear('trackedCids');
-          await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
-          await (this.db as IDBPDatabase<any>).clear('engineblocks').catch(() => {}); // Phase 1: wipe engine ledger state
-        } catch { /* ignore */ }
-        this.processedBlocks.clear();
-        this.processedEngineBlocks.clear();
-        this.processedVotes.clear();
-        this.engineBlockVersionCounter = 0;
-        this.saveEngineBlockVersion();
-      }
-      this.emit('generation:changed', isReset);
+      // A reset is honored ONLY if signed by an operator (one of the relay's
+      // first-N accounts). Non-operator / unsigned generation messages are ignored
+      // — so only an operator can reset everyone's data, never a stray browser.
+      const fresh = typeof msg.resetAt === 'number' && (Date.now() - msg.resetAt < 10 * 60 * 1000);
+      const validReset = fresh && !!msg.operatorPub && this.operators.includes(msg.operatorPub)
+        && !!msg.signature && engineVerify(msg.signature, `reset:${msg.generation}:${msg.resetAt}`, msg.operatorPub);
+      if (!validReset) return;
+      await this.applyReset(msg.generation);
+      this.emit('generation:changed', true);
       return;
     }
 
@@ -1470,18 +1474,23 @@ export class Libp2pNetwork extends EventEmitter {
       payload.signature = engineSign(`reset:${this.generation}:${resetAt}`, engineOperator.priv);
     }
     this.publish(topicGeneration(this.network), payload);
+    await this.applyReset(this.generation);
+  }
 
+  /**
+   * Wipe ALL local state and adopt `generation` — the single reset path used by
+   * clearAll (this device), an operator-signed reset received over gossip, and the
+   * startup catch-up when the relay is ahead. A full reset, so key-blobs go too
+   * (recover via backup key / re-fetch after a fresh start).
+   */
+  private async applyReset(generation: number): Promise<void> {
+    this.generation = generation;
+    this.saveGeneration();
     try {
-      await this.db.clear('blocks');
-      await this.db.clear('accounts');
-      await this.db.clear('votes');
-      await this.db.clear('contracts');
-      await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
-      await (this.db as IDBPDatabase<any>).clear('trackedCids').catch(() => {});
-      await (this.db as IDBPDatabase<any>).clear('engineblocks').catch(() => {}); // Phase 1: wipe engine ledger state
-      // Keep keyblobs - user still needs to recover their account
+      for (const store of ['blocks', 'accounts', 'votes', 'contracts', 'trackedCids', 'fileIndex', 'engineblocks', 'keyblobs']) {
+        await (this.db as IDBPDatabase<any>).clear(store as keyof NeuronDB).catch(() => {}); // eslint-disable-line @typescript-eslint/no-explicit-any
+      }
     } catch { /* ignore */ }
-
     this.engineBlockVersionCounter = 0;
     this.saveEngineBlockVersion();
     this.processedEngineBlocks.clear();

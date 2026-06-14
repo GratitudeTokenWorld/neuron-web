@@ -165,11 +165,16 @@ The first two are the ones you cannot regenerate.
 
 ## Resets & operators
 
-The relay's data (engine blocks, key-blobs, usernames) is wiped **only** by a
-network reset **signed by an operator** — the first `OPERATOR_COUNT` (3) accounts
-this relay ever attests, recorded in `.relay-operators.json`. Any other account's
-"Reset Testnet" is **ignored** by the relay (it only clears that user's own
-device). This stops a stray browser from nuking the shared super-node.
+A network reset is honored **only** when **signed by an operator** — the first
+`OPERATOR_COUNT` (3) accounts this relay ever attests, recorded in
+`.relay-operators.json` and served (with the current `generation`) in `/relay-info`.
+An operator reset wipes **everything, everywhere**: the relay's stores (engine
+blocks, key-blobs, usernames) **and** every connected client's local data (clients
+verify the operator signature before wiping; late/offline clients converge via the
+`generation` in `/relay-info` on next start/refresh). Any **non-operator** "Reset
+Testnet" is **ignored** by the relay and by all other clients — it only clears
+that one user's own device (which then re-syncs). This stops a stray browser from
+nuking the shared network while letting a founder reset it.
 
 - **Establishing operators:** the first 3 accounts created after the relay starts
   (with an empty operators file) become the operators. Back up `.relay-operators.json`.

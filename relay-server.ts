@@ -264,6 +264,13 @@ setInterval(() => { saveUsernames().catch(() => {}); }, 5_000);
 
 // ── Operators (Phase 3): first OPERATOR_COUNT accounts attested ───────────────
 let operators = []; // ordered accountIds; only these can wipe the relay
+// Current reset epoch — bumped only by an operator-signed reset; served in
+// /relay-info so clients (incl. late/offline ones) converge + wipe when behind.
+const GENERATION_FILE = process.env.GENERATION_FILE || '.relay-generation.json';
+let currentGeneration = 0;
+async function loadGeneration() {
+  try { currentGeneration = Number(JSON.parse(await fs.readFile(GENERATION_FILE, 'utf8'))) || 0; } catch { currentGeneration = 0; }
+}
 async function loadOperators() {
   try { operators = JSON.parse(await fs.readFile(OPERATORS_FILE, 'utf8')); console.log(`[Attester] Loaded ${operators.length} operator(s)`); } catch { operators = []; }
 }
@@ -458,6 +465,7 @@ async function main() {
   await loadFaceDB();
   await loadUsernames();
   await loadOperators();
+  await loadGeneration();
   if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
@@ -489,6 +497,8 @@ async function main() {
           wsPort: PORT,
           signingPub: signingKey.pubKeyStr,
           faceVerifyUrl: '',
+          operators,                    // first-N accountIds allowed to reset
+          generation: currentGeneration, // current reset epoch (clients converge to it)
         }));
 
       } else if (req.method === 'POST' && req.url === '/log-reload') {
@@ -900,7 +910,9 @@ async function main() {
         engineBlockStore.clear(); engineStoreDirty = true;
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names; operators list is kept
-        console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}…`);
+        currentGeneration = Number(m.generation) || currentGeneration + 1;
+        fs.writeFile(GENERATION_FILE, JSON.stringify(currentGeneration)).catch(() => {});
+        console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}… → generation ${currentGeneration}`);
       } catch { /* malformed */ }
       return;
     }
