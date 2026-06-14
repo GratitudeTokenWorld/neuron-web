@@ -43,7 +43,11 @@ import { randomBytes, randomUUID } from 'crypto';
 import { createAttestation } from './src/engine/core/attestation.js';
 import { deriveCommitment } from './src/engine/core/identity.js';
 import { publicKeyFromPrivate as enginePublicKeyFromPrivate } from './src/engine/core/keys.js';
-import { bytesToHex } from './src/engine/core/hash.js';
+import { bytesToHex, hexToBytes } from './src/engine/core/hash.js';
+// Super-node archival (Slice 4a): the relay persists every engine block it sees
+// (via topic mirroring) and serves delta requests, so account chains are durably
+// held even when light clients holding a shard go offline.
+import { decodeBlock, verifyBlock } from './src/engine/core/block.js';
 
 // ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
 // New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
@@ -112,6 +116,11 @@ const PEER_RELAYS = (process.env.PEER_RELAYS || '').split(',').filter(Boolean);
 const SIGNING_KEY_FILE = process.env.SIGNING_KEY_FILE || '.relay-signing-key.json';
 const FACE_DB_FILE = process.env.FACE_DB_FILE || '.relay-face-db.json';
 const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || '.relay-attester-key.json';
+// Slice 4a: super-node archival store of engine blocks. ARCHIVE=0 disables it
+// (pure relay). NOTE: JSON file is fine for the first super-node / testing; swap
+// for LevelDB/SQLite when chains grow (see docs/SUPERNODE.md).
+const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || '.relay-engine-blocks.json';
+const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 
 // Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
 const PROTOCOL_VERSION = 'v1';
@@ -154,6 +163,50 @@ async function loadFaceDB() {
 
 async function saveFaceDB() {
   await fs.writeFile(FACE_DB_FILE, JSON.stringify(faceDescriptorDB)).catch(() => {});
+}
+
+// ── Engine-block archival (Slice 4a) ──────────────────────────────────────────
+// hash → { accountId, index, shard, network, blockHex }. The relay sees every
+// engine block via topic mirroring; persisting them makes it a durable shard
+// holder so accounts recover even if every light client holding a shard is gone.
+const engineBlockStore = new Map();
+let engineStoreDirty = false;
+
+async function loadEngineBlocks() {
+  try {
+    const rows = JSON.parse(await fs.readFile(ENGINE_BLOCKS_FILE, 'utf8'));
+    for (const r of rows) engineBlockStore.set(r.hash, r);
+    console.log(`[Archive] Loaded ${engineBlockStore.size} engine block(s)`);
+  } catch { /* no archive yet */ }
+}
+
+async function saveEngineBlocks() {
+  if (!engineStoreDirty) return;
+  engineStoreDirty = false;
+  await fs.writeFile(ENGINE_BLOCKS_FILE, JSON.stringify([...engineBlockStore.values()])).catch(() => {});
+}
+// Flush periodically rather than on every block (archival is append-heavy).
+setInterval(() => { saveEngineBlocks().catch(() => {}); }, 5_000);
+
+/** Parse the network segment from a topic: neuronchain/{version}/{network}/... */
+function networkFromTopic(topic) {
+  const parts = topic.split('/');
+  return parts.length > 2 ? parts[2] : 'testnet';
+}
+
+/** Archive an engine block seen on gossip (verify before storing). */
+function archiveEngineBlock(blockHex, network) {
+  if (!ARCHIVE_ENABLED || !blockHex) return;
+  let block;
+  try { block = decodeBlock(hexToBytes(blockHex)); } catch { return; }
+  if (!verifyBlock(block)) return;
+  if (engineBlockStore.has(block.hash)) return;
+  engineBlockStore.set(block.hash, {
+    hash: block.hash, accountId: block.accountId, index: block.index,
+    shard: block.shard, network, blockHex,
+  });
+  engineStoreDirty = true;
+  console.log(`[Archive] Stored ${block.type} acct=${block.accountId.slice(0, 12)}… idx=${block.index} shard=${block.shard}`);
 }
 
 function euclideanDistance(a, b) {
@@ -328,6 +381,7 @@ async function main() {
   const attester = await loadOrCreateAttesterKey();
   console.log(`[Attester] personhood attester pub: ${attester.pub.slice(0, 16)}…`);
   await loadFaceDB();
+  if (ARCHIVE_ENABLED) await loadEngineBlocks();
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
   let relayAddrs = [];
@@ -639,21 +693,9 @@ async function main() {
     pubsub.subscribe(`${pfx}/relays`);
     pubsub.subscribe(`${pfx}/snapshots`);
   }
-
-  // Dynamic topics can't be pre-listed: engine-blocks/{shard} and
-  // engine-delta-req/{shard} (4096 shards) and inbox/{pubShort} (per account).
-  // A gossipsub node only ROUTES topics it is subscribed to, so for peers that
-  // reach each other only via this relay (different NATs, no direct WebRTC), the
-  // relay must subscribe to whatever its peers subscribe to. Mirror every
-  // neuronchain topic a peer announces so the relay forwards it.
-  pubsub.addEventListener('subscription-change', (evt) => {
-    const subs = evt.detail?.subscriptions || [];
-    for (const s of subs) {
-      if (s?.subscribe && typeof s.topic === 'string' && s.topic.startsWith('neuronchain/')) {
-        try { pubsub.subscribe(s.topic); } catch { /* already subscribed */ }
-      }
-    }
-  });
+  // NOTE: dynamic topics (engine-blocks/{shard}, engine-delta-req/{shard},
+  // inbox/{pubShort}) are forwarded by the subscription-change mirror further
+  // below — the relay subscribes to whatever its peers subscribe to.
 
   // ── Peer-addr cache and replay ────────────────────────────────────────────
   // Problem: when Browser A publishes peer-addrs, Browser B may not be in the
@@ -696,9 +738,52 @@ async function main() {
     }, delayMs));
   }
 
+  // Slice 4a: serve an archived account's chain tail on a delta request.
+  function serveEngineDeltaFromArchive(accountId, haveIndex, shard, network) {
+    if (!ARCHIVE_ENABLED) return;
+    const topic = `neuronchain/${PROTOCOL_VERSION}/${network}/engine-blocks/${shard}`;
+    const matches = [...engineBlockStore.values()]
+      .filter(r => r.accountId === accountId && r.network === network && r.index > haveIndex)
+      .sort((a, b) => a.index - b.index);
+    for (const r of matches) {
+      pubsub.publish(topic, new TextEncoder().encode(JSON.stringify({ blockHex: r.blockHex }))).catch(() => {});
+    }
+    // Log every request (even 0) so we can tell "request never arrived" from
+    // "archive had nothing for this account".
+    console.log(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
+  }
+
   pubsub.addEventListener('message', (evt) => {
     const msg = evt.detail;
-    if (!msg.topic.endsWith('/peer-addrs')) return;
+    const topic = msg.topic;
+
+    // Super-node archival: store every engine block we see (Slice 4a).
+    if (topic.includes('/engine-blocks/')) {
+      try { archiveEngineBlock(JSON.parse(new TextDecoder().decode(msg.data)).blockHex, networkFromTopic(topic)); } catch { /* malformed */ }
+      return;
+    }
+    // Serve delta requests from the archive (durable shard holder).
+    if (topic.includes('/engine-delta-req/')) {
+      try {
+        const d = JSON.parse(new TextDecoder().decode(msg.data));
+        if (d.accountId && typeof d.shard === 'number') {
+          serveEngineDeltaFromArchive(d.accountId, typeof d.haveIndex === 'number' ? d.haveIndex : -1, d.shard, networkFromTopic(topic));
+        }
+      } catch { /* malformed */ }
+      return;
+    }
+    // Drop the engine archive on a testnet reset so old-gen blocks aren't re-served.
+    if (topic.endsWith('/generation')) {
+      try {
+        if (typeof JSON.parse(new TextDecoder().decode(msg.data)).resetAt === 'number') {
+          engineBlockStore.clear(); engineStoreDirty = true;
+          console.log('[Archive] Cleared on testnet reset');
+        }
+      } catch { /* malformed */ }
+      return;
+    }
+
+    if (!topic.endsWith('/peer-addrs')) return;
     try {
       const decoded = JSON.parse(new TextDecoder().decode(msg.data));
       if (decoded.peerId && Array.isArray(decoded.addrs) && decoded.addrs.length > 0) {

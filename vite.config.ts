@@ -49,8 +49,11 @@ export default defineConfig({
     //     '/dns4/relay2.example.com/tcp/443/wss/http-path/relay-ws/p2p/<peerId2>',
     //   ])
     // The localStorage key 'neuronchain_bootstrap' always takes priority over this list.
+    // LOCAL_ONLY=1 omits the neuronweb.org bootstrap so a local dev stack is fully
+    // isolated (no production/stale state leaks in). Clients still find the local
+    // relay via /relay-info.
     __BOOTSTRAP_ADDRS__: JSON.stringify([
-      '/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+      ...(process.env.LOCAL_ONLY ? [] : ['/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7']),
       ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
     ]),
   },

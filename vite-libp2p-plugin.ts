@@ -24,7 +24,8 @@ export function libp2pRelay(): Plugin {
       env: {
         ...process.env,
         PORT: '9090',
-        PEER_RELAYS: '/dns4/neuronweb.org/tcp/9090/ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+        // LOCAL_ONLY=1 → don't dial the neuronweb.org peer relay (isolated local stack).
+        PEER_RELAYS: process.env.LOCAL_ONLY ? '' : '/dns4/neuronweb.org/tcp/9090/ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
       },
     });
 

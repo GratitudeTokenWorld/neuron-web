@@ -534,6 +534,7 @@ export class NeuronNode extends EventEmitter {
    */
   private engineResyncAccount(accountId: string): void {
     const shard = this.ledger.getShardOf(accountId);
+    console.log(`[engine] pull acct=${accountId.slice(0, 12)}… shard=${shard} have=${this.ledger.getAccountHead(accountId)?.index ?? -1}`);
     // Follow-on-demand: subscribe to the target shard so the holder's re-broadcast
     // (delta response, and the 20s periodic re-broadcast backstop) reaches us.
     this.net.subscribeEngineShard(shard);
@@ -552,6 +553,9 @@ export class NeuronNode extends EventEmitter {
     if (this.status !== 'stopped') {
       this.startInboxWatch(pub);
       setTimeout(() => this.sweepUnclaimedReceives(), 1000);
+      // Slice 4c: an account added after start (recovery, new device) must pull its
+      // own chain — the start() bootstrap only covers accounts present at startup.
+      setTimeout(() => this.engineResyncAccount(pub), 1500);
     }
   }
 
@@ -650,6 +654,11 @@ export class NeuronNode extends EventEmitter {
     setTimeout(() => this.sweepUnclaimedReceives(), 4000);
     // P7: dial known peers that were discovered in previous sessions
     setTimeout(() => this.connectToKnownPeers(), 5000);
+    // Slice 4c: bootstrap — pull our own accounts' chains from holders (the
+    // super-node archive serves them), so a fresh/recovered device restores its
+    // balance without waiting for a periodic re-broadcast. Delayed so relay/peer
+    // connections + shard meshes form first.
+    setTimeout(() => { for (const pub of this.localKeys.keys()) this.engineResyncAccount(pub); }, 6000);
 
     this.status = 'running';
     this.startTime = Date.now();
