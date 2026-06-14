@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
-import { EngineLedger, type SignerKeys } from './engine-ledger.js';
+import { EngineLedger, CHALLENGE_WINDOW_MS, type SignerKeys } from './engine-ledger.js';
 import { generateKeyPair } from '../engine/core/keys.js';
 import { createAttestation } from '../engine/core/attestation.js';
 import { deriveCommitment } from '../engine/core/identity.js';
@@ -66,6 +66,23 @@ describe('fraud-proof conflict safety', () => {
     expect(ledger.addBlock(s).success).toBe(true);
     expect(ledger.isEquivocated(dave.pub)).toBe(false);
     expect(ledger.getBlockStatus(s.hash)).toBe('confirmed');
+  });
+
+  it('holds a foreign block as pending within the challenge window, then confirms it', async () => {
+    const ledger = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    const open = await openAcct(ledger, alice, 'human-win');
+    const s1 = craftSend(alice, open, 'bob', 100_000n, 1001);
+
+    vi.useFakeTimers();
+    try {
+      ledger.addBlock(s1); // foreign apply → enters the challenge window
+      expect(ledger.getBlockStatus(s1.hash)).toBe('pending');
+      vi.advanceTimersByTime(CHALLENGE_WINDOW_MS + 1);
+      expect(ledger.getBlockStatus(s1.hash)).toBe('confirmed');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('applies verified network evidence, and rejects a non-conflict as evidence', async () => {

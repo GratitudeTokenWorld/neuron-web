@@ -1,5 +1,5 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
-import { EngineLedger } from '../ledger/engine-ledger';
+import { EngineLedger, CHALLENGE_WINDOW_MS } from '../ledger/engine-ledger';
 import { Libp2pNetwork } from './libp2p-network';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
@@ -439,14 +439,17 @@ export class NeuronNode extends EventEmitter {
     const appKeys = this.localKeys.get(block.recipient); // localKeys is keyed by engine accountId
     if (!appKeys) return; // not addressed to a local account
     const signer = engineKeysFromAppPrivate(appKeys.priv);
+    // Recipient-witnessed finality: wait the challenge window, then finalize ONLY
+    // if the sender hasn't been proven to double-spend in the meantime.
     setTimeout(async () => {
+      if (this.ledger.isEquivocated(block.accountId)) return; // sender double-spent → don't honor
       const result = await this.ledger.createReceive(block.recipient!, block.hash, signer);
       if (result.block) {
         this.ledger.addBlock(result.block);
         this.net.publishEngineBlock(result.block);
         this.emit('auto:received', { from: block.accountId, amount: Number(block.amount ?? 0) });
       }
-    }, 500);
+    }, CHALLENGE_WINDOW_MS);
   }
 
   // Sweep ledger.unclaimedSends for any sends addressed to local keys and

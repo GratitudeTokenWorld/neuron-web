@@ -61,6 +61,14 @@ interface Held {
 
 const MINT = BigInt(VERIFICATION_MINT_AMOUNT);
 
+/**
+ * Recipient-witnessed finality (Phase 2.2): a block received from the network is
+ * `pending` for this long after we apply it, then `confirmed` — unless its account
+ * is frozen by a double-spend proof first (→ `rejected`). Auto-receive also waits
+ * this window before finalizing. Tunable; latency only, no bandwidth cost.
+ */
+export const CHALLENGE_WINDOW_MS = 5_000;
+
 export class EngineLedger extends EventEmitter {
   private readonly held = new Map<string, Held>();
   private readonly accountsByPub = new Map<string, LedgerAccount>();
@@ -75,6 +83,8 @@ export class EngineLedger extends EventEmitter {
    * account on every node that sees it, with no committee/vote.
    */
   private readonly equivocated = new Map<string, DoubleSpendEvidence>();
+  /** hash → local apply time, for foreign blocks within the challenge window. Pruned once settled. */
+  private readonly appliedAt = new Map<string, number>();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -270,6 +280,7 @@ export class EngineLedger extends EventEmitter {
       this.unclaimedSends.delete(block.sourceHash);
     }
     this.allBlocks.set(block.hash, block);
+    this.appliedAt.set(block.hash, Date.now());  // foreign block enters the challenge window
     this.emit('block:added', block);
     this.emit('block:confirmed', block);
     return { success: true };
@@ -370,7 +381,12 @@ export class EngineLedger extends EventEmitter {
     const b = this.allBlocks.get(hash);
     if (!b) return 'unknown';
     if (this.equivocated.has(b.accountId)) return 'rejected';  // frozen by fraud proof
-    return 'confirmed';  // Slice 2.2 adds 'pending' within the challenge window
+    const at = this.appliedAt.get(hash);
+    if (at !== undefined) {
+      if (Date.now() - at < CHALLENGE_WINDOW_MS) return 'pending';  // recipient-witnessed window
+      this.appliedAt.delete(hash);  // settled — free the entry (keeps the map bounded to in-window blocks)
+    }
+    return 'confirmed';
   }
   getStorageProviders(): unknown[] {
     return [];
