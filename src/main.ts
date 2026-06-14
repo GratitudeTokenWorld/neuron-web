@@ -1362,6 +1362,7 @@ $('#btnResetChain').addEventListener('click', () => {
 $('#btnResetCancel').addEventListener('click', () => $('#resetDialog').classList.remove('active'));
 $('#btnResetConfirm').addEventListener('click', async () => {
   $('#resetDialog').classList.remove('active');
+  if (node.ledger.network !== 'testnet') { toast('Reset is available on testnet only', 'error'); return; }
   // Sign the reset with a local account so the relay can authorize a shared wipe.
   // Only honored if this account is one of the relay's operators (first 3 created);
   // otherwise just this device is cleared and the shared relays are untouched.

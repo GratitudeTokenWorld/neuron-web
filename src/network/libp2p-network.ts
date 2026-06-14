@@ -574,8 +574,8 @@ export class Libp2pNetwork extends EventEmitter {
     if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
     if (relayInfo?.operators) this.operators = relayInfo.operators;
     // Catch up to the relay's reset epoch (covers a device that missed a reset
-    // while offline): adopt + wipe if we're behind.
-    if (typeof relayInfo?.generation === 'number' && relayInfo.generation > this.generation) {
+    // while offline): adopt + wipe if we're behind. Testnet-only.
+    if (this.network === 'testnet' && typeof relayInfo?.generation === 'number' && relayInfo.generation > this.generation) {
       await this.applyReset(relayInfo.generation);
     }
     const bootstrapList = buildBootstrapList(relayInfo);
@@ -727,7 +727,7 @@ export class Libp2pNetwork extends EventEmitter {
     this.relayInfoTimer = setInterval(async () => {
       const info = await fetchRelayInfo(1, 0);
       if (info?.operators) this.operators = info.operators;
-      if (typeof info?.generation === 'number' && info.generation > this.generation) {
+      if (this.network === 'testnet' && typeof info?.generation === 'number' && info.generation > this.generation) {
         await this.applyReset(info.generation);
         this.emit('generation:changed', true);
       }
@@ -895,7 +895,7 @@ export class Libp2pNetwork extends EventEmitter {
       // first-N accounts). Non-operator / unsigned generation messages are ignored
       // — so only an operator can reset everyone's data, never a stray browser.
       const fresh = typeof msg.resetAt === 'number' && (Date.now() - msg.resetAt < 10 * 60 * 1000);
-      const validReset = fresh && !!msg.operatorPub && this.operators.includes(msg.operatorPub)
+      const validReset = this.network === 'testnet' && fresh && !!msg.operatorPub && this.operators.includes(msg.operatorPub)
         && !!msg.signature && engineVerify(msg.signature, `reset:${msg.generation}:${msg.resetAt}`, msg.operatorPub);
       if (!validReset) return;
       await this.applyReset(msg.generation);
@@ -1464,6 +1464,7 @@ export class Libp2pNetwork extends EventEmitter {
    * relay is touched.
    */
   async clearAll(engineOperator?: { pub: string; priv: string }): Promise<void> {
+    if (this.network !== 'testnet') { console.warn('[Libp2p] Reset is testnet-only — ignored'); return; }
     this.generation++;
     this.saveGeneration();
 

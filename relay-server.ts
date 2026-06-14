@@ -902,6 +902,7 @@ async function main() {
     // stray browser can't nuke the shared super-node.
     if (topic.endsWith('/generation')) {
       try {
+        if (networkFromTopic(topic) !== 'testnet') return; // reset is testnet-only
         const m = JSON.parse(new TextDecoder().decode(msg.data));
         if (typeof m.resetAt !== 'number') return;
         const ok = m.operatorPub && operators.includes(m.operatorPub) &&
