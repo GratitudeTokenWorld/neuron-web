@@ -96,6 +96,38 @@ describe('committee finality in EngineLedger', () => {
     expect(ledger.getBlockStatus(send.hash)).toBe('final');
   });
 
+  it('verifies a late, cross-epoch vote against the epoch weight snapshot', async () => {
+    const ledger = new EngineLedger('testnet');
+    const validators = Array.from({ length: 8 }, (_, i) => keyFromScalar(i));
+    for (let i = 0; i < validators.length; i++) await openAcct(ledger, validators[i]!, `val-${i}`, true);
+
+    // Move to epoch 1 (freezes the epoch-1 weight snapshot), then cast votes there.
+    ledger.advanceEpoch([], validators.map((v) => v.pub));
+    expect(ledger.currentEpoch).toBe(1);
+
+    const payer = keyFromScalar(50);
+    await openAcct(ledger, payer, 'payer', false);
+    const recipient = generateKeyPair();
+    ledger.registerAccount({ username: 'rcpt', pub: recipient.pub });
+    const send = (await ledger.createSend(payer.pub, recipient.pub, 1000, payer)).block!;
+    const epoch1Votes = validators.map((v) => vote(ledger, v, send)).filter(Boolean) as NonNullable<ReturnType<typeof vote>>[];
+
+    // Time passes: advance two more epochs (weights drift via activity credit) before
+    // the epoch-1 votes are finally applied. They must still verify (snapshot, not live).
+    ledger.advanceEpoch([], validators.map((v) => v.pub));
+    ledger.advanceEpoch([], validators.map((v) => v.pub));
+    expect(ledger.currentEpoch).toBe(3);
+
+    let finalized = false;
+    for (const v of epoch1Votes) {
+      const r = ledger.applyCommitteeVote(v);
+      expect(r.reason).not.toBe('invalid sortition proof'); // snapshot weights still match
+      if (r.finalized === send.hash) finalized = true;
+    }
+    expect(finalized).toBe(true);
+    expect(ledger.getBlockStatus(send.hash)).toBe('final');
+  });
+
   it('slashes a committee member that equivocates across a fork', async () => {
     const ledger = new EngineLedger('testnet');
     // 8 bonded validators dilute the pool so no single member reaches quorum alone.

@@ -49,10 +49,15 @@ export interface CommitteeParams {
   threshold?: number;
 }
 
-/** Current age-weighted validator weights (the sortition denominator source). */
+/**
+ * Age-weighted validator weights AS OF a given epoch (the sortition denominator
+ * source). Epoch-scoped so a vote always verifies against the weights its sortition
+ * was computed under — late, cross-epoch votes verify correctly, and all nodes agree
+ * on the committee for an epoch regardless of later bonding/slashing drift.
+ */
 export interface WeightSource {
-  weightOf(id: Hex): number;
-  totalWeight(): number;
+  weightOf(id: Hex, epoch: number): number;
+  totalWeight(epoch: number): number;
 }
 
 export interface VoteResult {
@@ -147,8 +152,8 @@ export class CommitteeFinality {
     // 2. Verify VRF self-sortition (seat count is self-proving).
     const seed = this.seedFor(v.epoch);
     if (seed === undefined) return { accepted: false, reason: 'unknown epoch seed' };
-    const weight = this.weights.weightOf(v.accountId);
-    const total = this.weights.totalWeight();
+    const weight = this.weights.weightOf(v.accountId, v.epoch);
+    const total = this.weights.totalWeight(v.epoch);
     const seats = verifySortition(v.accountId, seed, v.epoch, v.shard, weight, total, this.params.committeeSize, v.pi);
     if (seats === null) return { accepted: false, reason: 'invalid sortition proof' };
     if (seats <= 0 || seats !== v.seats) return { accepted: false, reason: 'seat count mismatch' };

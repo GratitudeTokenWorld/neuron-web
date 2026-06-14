@@ -81,6 +81,9 @@ export const CHALLENGE_WINDOW_MS = 5_000;
  */
 export const DEFAULT_COMMITTEE_SIZE = 64;
 
+/** How many past epochs of validator-weight snapshots to retain (bounds late-vote verification). */
+export const EPOCH_WEIGHT_RETAIN = 4;
+
 export class EngineLedger extends EventEmitter {
   private readonly held = new Map<string, Held>();
   private readonly accountsByPub = new Map<string, LedgerAccount>();
@@ -113,6 +116,14 @@ export class EngineLedger extends EventEmitter {
   private epoch = 0;
   /** Committee finality (V5): fast `final` status above optimistic `confirmed`. */
   private committee = this.makeCommittee();
+  /**
+   * Per-epoch validator-weight snapshots (id→weight + total), captured at each
+   * epoch boundary so a vote verifies against the weights its sortition used —
+   * deterministic across nodes, and correct for late cross-epoch votes. Epoch 0
+   * (genesis/bootstrap, validators still bonding) falls back to live weights;
+   * snapshots older than the retention window are pruned.
+   */
+  private epochWeightSnapshots = new Map<number, { total: number; byId: Map<string, number> }>();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -400,16 +411,34 @@ export class EngineLedger extends EventEmitter {
 
   private makeCommittee(): CommitteeFinality {
     // Weight + seed are read live (closures) so the committee tracks the current
-    // validator set even after reset() swaps the registry.
+    // validator set even after reset() swaps the registry. Past epochs resolve
+    // against the frozen snapshot; the current/genesis epoch falls back to live.
     const weights: WeightSource = {
-      weightOf: (id) => this.validatorRegistry.weightOf(id),
-      totalWeight: () => this.validatorRegistry.totalWeight(),
+      weightOf: (id, epoch) => {
+        const snap = this.epochWeightSnapshots.get(epoch);
+        return snap ? (snap.byId.get(id) ?? 0) : this.validatorRegistry.weightOf(id);
+      },
+      totalWeight: (epoch) => {
+        const snap = this.epochWeightSnapshots.get(epoch);
+        return snap ? snap.total : this.validatorRegistry.totalWeight();
+      },
     };
     return new CommitteeFinality(
       { committeeSize: DEFAULT_COMMITTEE_SIZE },
       weights,
       (epoch) => this.seeds.seedFor(epoch),
     );
+  }
+
+  private snapshotWeights(): { total: number; byId: Map<string, number> } {
+    const byId = new Map<string, number>();
+    let total = 0;
+    for (const id of this.validatorRegistry.validators()) {
+      const w = this.validatorRegistry.weightOf(id);
+      byId.set(id, w);
+      total += w;
+    }
+    return { total, byId };
   }
 
   /**
@@ -451,6 +480,12 @@ export class EngineLedger extends EventEmitter {
     this.seeds.commit(this.epoch, betas);
     this.epoch += 1;
     for (const id of activeValidators) this.validatorRegistry.creditActivity(id, 1);
+    // Freeze the new epoch's weights so its committee is fixed (votes verify against
+    // these, not later drift); prune snapshots beyond the retention window.
+    this.epochWeightSnapshots.set(this.epoch, this.snapshotWeights());
+    for (const e of this.epochWeightSnapshots.keys()) {
+      if (e < this.epoch - EPOCH_WEIGHT_RETAIN) this.epochWeightSnapshots.delete(e);
+    }
     this.committee.pruneStale(this.epoch); // bound finality memory: drop stalled fork tallies
     this.emit('epoch:advanced', { epoch: this.epoch, seed: this.seeds.seedFor(this.epoch)! });
     return this.epoch;
@@ -567,6 +602,7 @@ export class EngineLedger extends EventEmitter {
     this.validatorRegistry = new ValidatorRegistry(MINT);
     this.seeds = new EpochSeeds();
     this.epoch = 0;
+    this.epochWeightSnapshots.clear();
     this.committee = this.makeCommittee();
   }
   private deferred(feature: string): { error: string } {
