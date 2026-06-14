@@ -12,6 +12,7 @@ import { AccountAccumulator } from '../engine/core/accumulator.js';
 import { checkQuorum, type TypedAttestation, type QuorumPolicy } from '../engine/core/attestation.js';
 import { InMemoryIdentityRegistry, deriveCommitment, type Nullifier } from '../engine/core/identity.js';
 import { getShard, DEFAULT_NUM_SHARDS } from '../engine/core/partition.js';
+import { proveDoubleSpend, verifyDoubleSpend, type DoubleSpendEvidence } from '../engine/consensus/fraud.js';
 
 /**
  * Minimal signer shape the engine block builders need (compressed P-256 pub +
@@ -67,6 +68,13 @@ export class EngineLedger extends EventEmitter {
   private readonly identity = new InMemoryIdentityRegistry();
   /** sendBlockHash → unclaimed send, mirroring DAGLedger.unclaimedSends. */
   readonly unclaimedSends = new Map<string, { fromPub: string; toPub: string; amount: number }>();
+  /**
+   * Phase 2 (fraud-proof safety): accounts proven to have equivocated
+   * (double-spent). Their chains are frozen — every block is `rejected` and the
+   * balance is void. Evidence is self-verifying (see fraud.ts), so it freezes the
+   * account on every node that sees it, with no committee/vote.
+   */
+  private readonly equivocated = new Map<string, DoubleSpendEvidence>();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -105,6 +113,7 @@ export class EngineLedger extends EventEmitter {
   }
 
   getAccountBalance(pub: string): number {
+    if (this.equivocated.has(pub)) return 0;  // frozen: balance void
     const head = this.getAccountHead(pub);
     return head ? Number(head.balance) : 0;
   }
@@ -226,17 +235,28 @@ export class EngineLedger extends EventEmitter {
   addBlock(block: Block): { success: boolean; error?: string } {
     if (computeContentHash(block) !== block.hash) return { success: false, error: 'content hash mismatch' };
     if (!verifyBlockSignature(block)) return { success: false, error: 'invalid signature' };
+    // Frozen: an equivocating account's chain is rejected outright.
+    if (this.equivocated.has(block.accountId)) return { success: false, error: 'account equivocated' };
 
     let h = this.held.get(block.accountId);
     if (block.index === 0) {
       if (block.type !== 'open' || block.previousHash !== GENESIS_PREV) return { success: false, error: 'bad genesis' };
-      if (h) return h.chain[0]?.hash === block.hash ? { success: true } : { success: false, error: 'conflicting open' };
+      if (h) {
+        if (h.chain[0]?.hash === block.hash) return { success: true };
+        this.flagEquivocation(h.chain[0], block);   // two different opens, same account
+        return { success: false, error: 'conflicting open' };
+      }
       h = { chain: [], acc: new AccountAccumulator() };
       this.held.set(block.accountId, h);
     } else {
       if (!h) return { success: false, error: 'missing prior chain' };
       const head = h.chain[h.chain.length - 1]!;
-      if (block.index <= head.index) return h.chain[block.index]?.hash === block.hash ? { success: true } : { success: false, error: 'stale/conflicting' };
+      if (block.index <= head.index) {
+        const existing = h.chain[block.index];
+        if (existing?.hash === block.hash) return { success: true };
+        if (existing) this.flagEquivocation(existing, block);   // fork at the same height = double-spend
+        return { success: false, error: 'stale/conflicting' };
+      }
       if (block.index !== head.index + 1) return { success: false, error: 'non-sequential' };
       if (block.previousHash !== head.hash) return { success: false, error: 'previousHash mismatch' };
     }
@@ -254,6 +274,42 @@ export class EngineLedger extends EventEmitter {
     this.emit('block:confirmed', block);
     return { success: true };
   }
+
+  // ── Fraud-proof conflict safety (Phase 2) ────────────────────────────────────
+
+  /** Locally-detected fork: build self-incriminating evidence and freeze the account. */
+  private flagEquivocation(a: Block, b: Block): void {
+    const ev = proveDoubleSpend(a, b);
+    if (ev) this.freezeEquivocator(ev);  // null if not a genuine same-height fork
+  }
+
+  /**
+   * Apply double-spend evidence received from the network. Verifies the evidence
+   * (both blocks valid + genuinely conflicting) before freezing — never trust a
+   * peer's claim. Idempotent; returns true if this newly froze the account.
+   */
+  applyEvidence(ev: DoubleSpendEvidence): boolean {
+    return verifyDoubleSpend(ev) && this.freezeEquivocator(ev);
+  }
+
+  /** Apply evidence from two received blocks (node receive path); verifies before freezing. */
+  applyEvidenceFromBlocks(a: Block, b: Block): boolean {
+    const ev = proveDoubleSpend(a, b);
+    return ev ? this.applyEvidence(ev) : false;
+  }
+
+  private freezeEquivocator(ev: DoubleSpendEvidence): boolean {
+    if (this.equivocated.has(ev.accountId)) return false;  // already frozen
+    this.equivocated.set(ev.accountId, ev);
+    // Void the account's unclaimed sends so no recipient can still claim them.
+    for (const [hash, s] of this.unclaimedSends) if (s.fromPub === ev.accountId) this.unclaimedSends.delete(hash);
+    this.emit('account:equivocated', ev);
+    return true;
+  }
+
+  isEquivocated(pub: string): boolean { return this.equivocated.has(pub); }
+  getEquivocationEvidence(pub: string): DoubleSpendEvidence | undefined { return this.equivocated.get(pub); }
+  allEquivocationEvidence(): DoubleSpendEvidence[] { return [...this.equivocated.values()]; }
 
   getUnclaimedForAccount(pub: string): { sendBlockHash: string; fromPub: string; amount: number }[] {
     const out: { sendBlockHash: string; fromPub: string; amount: number }[] = [];
@@ -310,8 +366,11 @@ export class EngineLedger extends EventEmitter {
   getBlock(hash: string): Block | undefined {
     return this.allBlocks.get(hash);
   }
-  getBlockStatus(hash: string): 'confirmed' | 'unknown' {
-    return this.allBlocks.has(hash) ? 'confirmed' : 'unknown';
+  getBlockStatus(hash: string): 'confirmed' | 'rejected' | 'pending' | 'unknown' {
+    const b = this.allBlocks.get(hash);
+    if (!b) return 'unknown';
+    if (this.equivocated.has(b.accountId)) return 'rejected';  // frozen by fraud proof
+    return 'confirmed';  // Slice 2.2 adds 'pending' within the challenge window
   }
   getStorageProviders(): unknown[] {
     return [];

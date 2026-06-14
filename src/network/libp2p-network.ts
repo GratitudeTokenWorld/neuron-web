@@ -249,6 +249,11 @@ function topicEngineBlocks(network: string, shard: number): string { return `${e
 // means subscribing to BOTH its blocks and its delta-req topic.
 function engineDeltaReqPrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req/`; }
 function topicEngineDeltaReq(network: string, shard: number): string { return `${engineDeltaReqPrefix(network)}${shard}`; }
+// Phase 2: per-shard double-spend (equivocation) evidence. Gossiped ONLY when an
+// account actually equivocates (rare/malicious) — zero common-path cost. Reaches
+// recipients because they follow the sender's shard (Slice 3 follow-on-demand).
+function engineConflictPrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-conflict/`; }
+function topicEngineConflict(network: string, shard: number): string { return `${engineConflictPrefix(network)}${shard}`; }
 function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
@@ -660,6 +665,7 @@ export class Libp2pNetwork extends EventEmitter {
     for (const shard of this.subscribedEngineShards) {
       pubsub.subscribe(topicEngineBlocks(this.network, shard));
       pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
+      pubsub.subscribe(topicEngineConflict(this.network, shard));
     }
 
     pubsub.addEventListener('message', (evt) => {
@@ -951,6 +957,19 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
+    // Phase 2: double-spend evidence. Decode both blocks; the ledger re-verifies
+    // (verifyDoubleSpend) before trusting — never freeze on an unverified claim.
+    if (topic.startsWith(engineConflictPrefix(this.network))) {
+      const raw = decode<{ a?: string; b?: string }>(data);
+      if (!raw.a || !raw.b) return;
+      try {
+        const a = decodeBlock(hexToBytes(raw.a));
+        const b = decodeBlock(hexToBytes(raw.b));
+        this.emit('engineconflict:received', { a, b });
+      } catch { /* malformed */ }
+      return;
+    }
+
     if (topic === topicVotes(this.network)) {
       const raw = decode<Record<string, unknown>>(data);
       if (raw.blockHash === null || raw.voterPub === null || raw.signature === null) return;
@@ -1173,6 +1192,7 @@ export class Libp2pNetwork extends EventEmitter {
     const pubsub = this.libp2p.services.pubsub as unknown as GossipSub;
     pubsub.subscribe(topicEngineBlocks(this.network, shard));
     pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
+    pubsub.subscribe(topicEngineConflict(this.network, shard));
   }
 
   /** Phase 1: gossip an engine block (hex-encoded, bigint-safe) on its shard topic + persist it. */
@@ -1181,6 +1201,12 @@ export class Libp2pNetwork extends EventEmitter {
     this.processedEngineBlocks.add(block.hash);
     this.publish(topicEngineBlocks(this.network, block.shard), { blockHex: bytesToHex(encodeBlock(block)), _gen: this.generation });
     this.saveEngineBlock(block).catch(() => {});
+  }
+
+  /** Phase 2: gossip double-spend evidence (two conflicting blocks, hex) on the equivocator's shard. */
+  publishEngineConflict(shard: number, a: EngineBlock, b: EngineBlock): void {
+    if (!this.running) return;
+    this.publish(topicEngineConflict(this.network, shard), { a: bytesToHex(encodeBlock(a)), b: bytesToHex(encodeBlock(b)) });
   }
 
   publishVote(vote: Vote): void {

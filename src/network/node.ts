@@ -167,6 +167,18 @@ export class NeuronNode extends EventEmitter {
       await this.handleIncomingEngineBlock(block as EngineBlock);
     });
 
+    // Phase 2: a locally-detected double-spend → gossip the evidence on the
+    // equivocator's shard so all holders (and the recipients who follow it) freeze.
+    this.ledger.on('account:equivocated', (ev: unknown) => {
+      const e = ev as { accountId: string; a: EngineBlock; b: EngineBlock };
+      try { this.net.publishEngineConflict(this.ledger.getShardOf(e.accountId), e.a, e.b); } catch { /* best-effort */ }
+    });
+    // Inbound double-spend evidence → verify + freeze the account (idempotent).
+    this.net.on('engineconflict:received', (d: unknown) => {
+      const { a, b } = d as { a: EngineBlock; b: EngineBlock };
+      this.ledger.applyEvidenceFromBlocks(a, b);
+    });
+
     this.net.on('vote:received', async (vote: unknown) => {
       const v = vote as Vote;
       const valid = await VoteManager.verifyVote(v);
