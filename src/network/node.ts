@@ -534,7 +534,8 @@ export class NeuronNode extends EventEmitter {
    */
   private engineResyncAccount(accountId: string): void {
     const shard = this.ledger.getShardOf(accountId);
-    console.log(`[engine] pull acct=${accountId.slice(0, 12)}… shard=${shard} have=${this.ledger.getAccountHead(accountId)?.index ?? -1}`);
+    // Verbose; enable in the browser console with localStorage.neuron_debug = '1'.
+    try { if (localStorage.getItem('neuron_debug') === '1') console.log(`[engine] pull acct=${accountId.slice(0, 12)}… shard=${shard} have=${this.ledger.getAccountHead(accountId)?.index ?? -1}`); } catch { /* no localStorage */ }
     // Follow-on-demand: subscribe to the target shard so the holder's re-broadcast
     // (delta response, and the 20s periodic re-broadcast backstop) reaches us.
     this.net.subscribeEngineShard(shard);

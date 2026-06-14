@@ -124,6 +124,10 @@ const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || '.relay-engine-bloc
 // (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
 const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || '.relay-keyblobs.json';
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
+// Per-block/per-request archive logs are verbose; gate them behind DEBUG_ARCHIVE=1.
+// Startup ("Loaded N") and reset lines stay unconditional.
+const DEBUG_ARCHIVE = process.env.DEBUG_ARCHIVE === '1';
+const dlog = (...args: unknown[]) => { if (DEBUG_ARCHIVE) console.log(...args); };
 
 // Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
 const PROTOCOL_VERSION = 'v1';
@@ -209,7 +213,7 @@ function archiveEngineBlock(blockHex, network) {
     shard: block.shard, network, blockHex,
   });
   engineStoreDirty = true;
-  console.log(`[Archive] Stored ${block.type} acct=${block.accountId.slice(0, 12)}… idx=${block.index} shard=${block.shard}`);
+  dlog(`[Archive] Stored ${block.type} acct=${block.accountId.slice(0, 12)}… idx=${block.index} shard=${block.shard}`);
 }
 
 // ── Key-blob archival ─────────────────────────────────────────────────────────
@@ -240,7 +244,7 @@ function archiveKeyBlob(blob, network) {
   if (existing && blobTs(existing) >= blobTs(blob)) return;
   keyBlobStore.set(blob.pub, { ...blob, network });
   keyBlobDirty = true;
-  console.log(`[Archive] Stored key-blob user=${blob.username} acct=${String(blob.pub).slice(0, 12)}…`);
+  dlog(`[Archive] Stored key-blob user=${blob.username} acct=${String(blob.pub).slice(0, 12)}…`);
 }
 
 function euclideanDistance(a, b) {
@@ -784,7 +788,7 @@ async function main() {
     }
     // Log every request (even 0) so we can tell "request never arrived" from
     // "archive had nothing for this account".
-    console.log(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
+    dlog(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
   }
 
   // Serve a recovery blob-request from the key-blob archive (newest per username).
@@ -798,7 +802,7 @@ async function main() {
     const { network: _n, ...blob } = best;
     pubsub.publish(`neuronchain/${PROTOCOL_VERSION}/${network}/keyblobs`,
       new TextEncoder().encode(JSON.stringify(blob))).catch(() => {});
-    console.log(`[Archive] Served key-blob user=${username}`);
+    dlog(`[Archive] Served key-blob user=${username}`);
   }
 
   pubsub.addEventListener('message', (evt) => {
