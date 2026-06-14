@@ -54,6 +54,95 @@ not by forcing every participant to hold everything.
 
 ---
 
+## Participation model & lifecycle (DECIDED — 2026-06)
+
+This supersedes the earlier "runs entirely in the browser" framing. That goal is
+**explicitly dropped**: a browser physically cannot accept inbound connections
+(NAT), stay online past tab-close, or escape its storage quota, so a durable,
+reachable network *always* needs some always-on component (the relay was already
+that). The real goal is **decentralization, achieved through diversity of
+hardware/software**, not browser-purity.
+
+> **Decision:** Decentralization = **open membership + redundancy + no required
+> party in any single role** — *not* the absence of servers. A dedicated VPS, a
+> Raspberry Pi, and a browser tab are all first-class as long as (a) anyone may
+> run that role, (b) several do, and (c) none is load-bearing alone.
+
+### Security keystone — trust the math, not the machine
+
+The invariant that makes arbitrary hardware safe to mix: **clients verify
+everything cryptographically** (signatures, Merkle proofs, fraud-proof safety +
+VRF committee finality). A fast server may *serve* data and a Pi may *store* it,
+but neither is an *authority*: a node can be slow or withhold, it can **never
+forge or override**. "Fast/reliable server tier" therefore buys *performance and
+durability only* — never trust. Every new node type must preserve this.
+
+### Capability-based roles (one machine may wear several hats)
+
+| Role | Typical host | Holds / does | Bound by |
+|------|--------------|--------------|----------|
+| **Light client** | browser / mobile | own + followed data; signs/verifies; serves + caches its own content | nothing (every user) |
+| **Relay** | VPS / home w/ public addr | NAT traversal + connectivity brokering; **no global state** | reachability |
+| **Validator / shard node** | mini-PC / VPS / Pi | ledger shard(s); bonded; runs committee finality | RAM working-set, reliability |
+| **Storage node** | Pi+SSD / server | CID blob replicas + serving; earns storage rewards | disk capacity (cheap), I/O |
+| **Archival / super-node** | VPS / server + on-disk DB | many shards' history + snapshots + state-sync | DB, bandwidth |
+| **Gateway** | VPS / serverless | HTTP rendering of content for plain-URL/open-web access | bandwidth, cache |
+
+Capacity is **heterogeneous and self-advertised**: a node declares how many
+shards/replicas it can serve *hot* (RAM-bound) vs. *archive cold* (disk-bound).
+The 2 TB-SD Pi reality means **storage capacity is cheap and abundant; the binding
+constraints are RAM working-set and SD random-I/O** — which forces an **on-disk
+LSM store (LevelDB/RocksDB), never in-RAM JSON**, a small hot index, and
+append-structured writes (USB-SSD for write-heavy roles).
+
+### NFTs = native ownership keys (no general VM)
+
+An NFT is a **small native object** on the block-lattice: `{ tokenId, owner,
+contentRef (CID), metadata }`. Mint / transfer / burn are signed block types,
+verified exactly like a payment; the actual content (a post, a page, media) is
+**loaded/rendered from the storage network on demand**, not stored on-chain.
+"Content-as-NFT" and "page-as-NFT" need only these native operations + an
+ownership index — **not** a Turing-complete contract VM (every node executing
+untrusted code is the scaling enemy and a security minefield). A constrained,
+sandboxed rules layer (royalties/allowlists/editions) MAY be added later if a
+concrete need forces it; a general VM is explicitly out of scope until then.
+
+### Shareability — the gateway tier uses open web standards
+
+Social content reachable *only* inside the P2P dApp can't be shared as a normal
+link, previewed, or indexed. The **open, redundant gateway tier** renders content
+(profiles, posts, page-NFTs) as standard HTML so any plain URL works on the open
+web, via established standards — **not** a bespoke format:
+
+- **Open Graph (OG)** meta tags → rich link previews on every platform.
+- **oEmbed** → inline embeds in other sites/apps.
+- **Schema.org / JSON-LD** → SEO + structured data.
+- standard **HTTP caching** + content-addressing → CDN-friendly, immutable URLs.
+- (optional, later) **ActivityPub / RSS** for fediverse + feed interop.
+
+Gateways are accelerators, not authorities (same keystone: they serve verifiable,
+content-addressed data anyone else can re-serve). Plural + open-membership so no
+gateway is a chokepoint.
+
+### Lifecycle — the "right mix" from early adoption to maturity
+
+Every chain bootstraps centralized and decentralizes; state it honestly:
+
+1. **Genesis:** the team runs a few super-nodes + relays (neuronweb.org today) to
+   guarantee reachability + durability while load is tiny. Centralized *by
+   necessity*, openly so.
+2. **Growth:** per-role incentives pull in volunteer storage/relay/validator nodes;
+   the team's share shrinks; redundancy targets rise.
+3. **Maturity:** thousands of heterogeneous nodes; the team's are non-special and
+   can vanish without impact.
+
+To keep this honest rather than aspirational: publish **decentralization metrics**
+(replicas per CID, distinct reachable relays, committee size + operator diversity
+per shard) and run a **per-role incentive ramp** — an under-incentivized role is
+where redundancy silently fails first.
+
+---
+
 ## Design principles (apply everywhere)
 
 1. **Partition, don't replicate.** Shard global state by a partition key; a node
