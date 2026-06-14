@@ -120,6 +120,9 @@ const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || '.relay-attester-key.
 // (pure relay). NOTE: JSON file is fine for the first super-node / testing; swap
 // for LevelDB/SQLite when chains grow (see docs/SUPERNODE.md).
 const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || '.relay-engine-blocks.json';
+// Key-blob archive: lets a fully-wiped device recover without any peer online
+// (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
+const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || '.relay-keyblobs.json';
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 
 // Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
@@ -207,6 +210,37 @@ function archiveEngineBlock(blockHex, network) {
   });
   engineStoreDirty = true;
   console.log(`[Archive] Stored ${block.type} acct=${block.accountId.slice(0, 12)}… idx=${block.index} shard=${block.shard}`);
+}
+
+// ── Key-blob archival ─────────────────────────────────────────────────────────
+// pub → { ...blob, network }. The blob is face+PIN-encrypted; persisting it makes
+// recovery peer-independent (a wiped device fetches it from the super-node).
+const keyBlobStore = new Map();
+let keyBlobDirty = false;
+const blobTs = (b) => Number(b?.updatedAt ?? b?.createdAt ?? 0);
+
+async function loadKeyBlobs() {
+  try {
+    for (const b of JSON.parse(await fs.readFile(KEYBLOBS_FILE, 'utf8'))) keyBlobStore.set(b.pub, b);
+    console.log(`[Archive] Loaded ${keyBlobStore.size} key-blob(s)`);
+  } catch { /* none yet */ }
+}
+
+async function saveKeyBlobs() {
+  if (!keyBlobDirty) return;
+  keyBlobDirty = false;
+  await fs.writeFile(KEYBLOBS_FILE, JSON.stringify([...keyBlobStore.values()])).catch(() => {});
+}
+setInterval(() => { saveKeyBlobs().catch(() => {}); }, 5_000);
+
+/** Archive a key-blob seen on the keyblobs topic (keep the newest per account). */
+function archiveKeyBlob(blob, network) {
+  if (!ARCHIVE_ENABLED || !blob || !blob.pub || !blob.username || !blob.encryptedKeys) return;
+  const existing = keyBlobStore.get(blob.pub);
+  if (existing && blobTs(existing) >= blobTs(blob)) return;
+  keyBlobStore.set(blob.pub, { ...blob, network });
+  keyBlobDirty = true;
+  console.log(`[Archive] Stored key-blob user=${blob.username} acct=${String(blob.pub).slice(0, 12)}…`);
 }
 
 function euclideanDistance(a, b) {
@@ -381,7 +415,7 @@ async function main() {
   const attester = await loadOrCreateAttesterKey();
   console.log(`[Attester] personhood attester pub: ${attester.pub.slice(0, 16)}…`);
   await loadFaceDB();
-  if (ARCHIVE_ENABLED) await loadEngineBlocks();
+  if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
   let relayAddrs = [];
@@ -753,6 +787,20 @@ async function main() {
     console.log(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
   }
 
+  // Serve a recovery blob-request from the key-blob archive (newest per username).
+  function serveKeyBlobFromArchive(username, network) {
+    if (!ARCHIVE_ENABLED) return;
+    let best = null;
+    for (const b of keyBlobStore.values()) {
+      if (b.username === username && b.network === network && (!best || blobTs(b) > blobTs(best))) best = b;
+    }
+    if (!best) return;
+    const { network: _n, ...blob } = best;
+    pubsub.publish(`neuronchain/${PROTOCOL_VERSION}/${network}/keyblobs`,
+      new TextEncoder().encode(JSON.stringify(blob))).catch(() => {});
+    console.log(`[Archive] Served key-blob user=${username}`);
+  }
+
   pubsub.addEventListener('message', (evt) => {
     const msg = evt.detail;
     const topic = msg.topic;
@@ -760,6 +808,19 @@ async function main() {
     // Super-node archival: store every engine block we see (Slice 4a).
     if (topic.includes('/engine-blocks/')) {
       try { archiveEngineBlock(JSON.parse(new TextDecoder().decode(msg.data)).blockHex, networkFromTopic(topic)); } catch { /* malformed */ }
+      return;
+    }
+    // Archive key-blobs so recovery works with no peer online (face+PIN-encrypted).
+    if (topic.endsWith('/keyblobs')) {
+      try { archiveKeyBlob(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
+      return;
+    }
+    // Serve a recovery blob-request from the archive.
+    if (topic.endsWith('/blob-requests')) {
+      try {
+        const d = JSON.parse(new TextDecoder().decode(msg.data));
+        if (d.username) serveKeyBlobFromArchive(String(d.username), networkFromTopic(topic));
+      } catch { /* malformed */ }
       return;
     }
     // Serve delta requests from the archive (durable shard holder).

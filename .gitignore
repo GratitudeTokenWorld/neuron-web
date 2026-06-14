@@ -16,4 +16,5 @@ coverage/
 .relay-face-counts.json
 .relay-peer-id.json
 .relay-engine-blocks.json
+.relay-keyblobs.json
 reload.log

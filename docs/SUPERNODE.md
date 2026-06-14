@@ -37,6 +37,7 @@ or attester key changes the node's identity and breaks the baked bootstrap addre
 | `.relay-signing-key.json` | relay signing key | re-announce needed |
 | `.relay-face-db.json` | enrolled face descriptors + per-face account counts | face Sybil limit resets |
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
+| `.relay-keyblobs.json` | archived face+PIN-encrypted key-blobs (for peer-independent recovery) | recovery needs a live peer holding the blob until it re-fills |
 
 ---
 
@@ -153,7 +154,7 @@ behind a `DEBUG`-style flag once traffic grows.
 Cron a copy of the identity + archive off-box:
 ```bash
 tar czf relay-backup-$(date +%F).tgz .relay-peer-id.json .relay-attester-key.json \
-  .relay-signing-key.json .relay-face-db.json .relay-engine-blocks.json
+  .relay-signing-key.json .relay-face-db.json .relay-engine-blocks.json .relay-keyblobs.json
 ```
 The first two are the ones you cannot regenerate.
 
@@ -188,7 +189,3 @@ verify so nothing is trusted.**
   `applyShardSnapshot` over the content CDN, to bootstrap a shard without replaying the
   full chain. Current recovery uses account-scoped **delta pull**, which suffices until
   chains get long.
-- **Key-blob archival:** the super-node archives engine *blocks* (balances/history) but
-  not the face+PIN **key-blobs** yet, so recovery still needs a *peer* holding the blob
-  online. Persisting key-blobs on the super-node (they're face+PIN-encrypted, safe to
-  store) would make recovery fully peer-independent — a recommended next addition.
