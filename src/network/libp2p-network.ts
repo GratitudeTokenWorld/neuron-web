@@ -241,6 +241,11 @@ function topicSnapshots(network: string): string { return `neuronchain/${PROTOCO
 // Phase 1 Slice 1: a single engine-block topic (all nodes subscribe). Slice 3
 // replaces this with per-shard topics + selective subscription.
 function topicEngineBlocks(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-blocks`; }
+// Phase 1 Slice 2: per-account delta pull. A requester asks for an account's
+// chain tail; any holder re-broadcasts the missing blocks on the engine-blocks
+// topic (so they flow through the normal receive path). The pull primitive that
+// makes selective subscription (Slice 3) viable without a global firehose.
+function topicEngineDeltaReq(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req`; }
 function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
@@ -646,6 +651,7 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicSnapshots(this.network));
     pubsub.subscribe(topicFileAnnouncements(this.network));
     pubsub.subscribe(topicEngineBlocks(this.network));
+    pubsub.subscribe(topicEngineDeltaReq(this.network));
 
     pubsub.addEventListener('message', (evt) => {
       const msg = evt.detail as { topic: string; data: Uint8Array; from?: { toString(): string } };
@@ -921,6 +927,15 @@ export class Libp2pNetwork extends EventEmitter {
       this.capSet(this.processedEngineBlocks);
       await this.saveEngineBlock(block);
       this.emit('engineblock:received', block);
+      return;
+    }
+
+    // Phase 1 Slice 2: a peer is requesting an account's chain tail. If we hold
+    // those blocks, re-broadcast them on the engine-blocks topic so they reach
+    // the requester (and anyone else) through the normal receive path.
+    if (topic === topicEngineDeltaReq(this.network)) {
+      const req = decode<{ accountId?: string; haveIndex?: number }>(data);
+      if (req.accountId) await this.serveEngineDelta(req.accountId, typeof req.haveIndex === 'number' ? req.haveIndex : -1);
       return;
     }
 
@@ -1505,6 +1520,27 @@ export class Libp2pNetwork extends EventEmitter {
 
   private sortEngineBlocks(blocks: EngineBlock[]): EngineBlock[] {
     return blocks.sort((a, b) => a.accountId === b.accountId ? a.index - b.index : (a.accountId < b.accountId ? -1 : 1));
+  }
+
+  /** Slice 2: ask peers for an account's blocks after `haveIndex` (the pull primitive). */
+  requestEngineDelta(accountId: string, haveIndex: number): void {
+    if (!this.running) return;
+    this.publish(topicEngineDeltaReq(this.network), { accountId, haveIndex });
+  }
+
+  /** Slice 2: serve a delta request — re-broadcast our held blocks for `accountId`
+   *  with index > haveIndex, in order, on the engine-blocks topic. */
+  async serveEngineDelta(accountId: string, haveIndex: number): Promise<void> {
+    if (!this.running) return;
+    try {
+      const rows = await (this.db as IDBPDatabase<any>).getAllFromIndex( // eslint-disable-line @typescript-eslint/no-explicit-any
+        'engineblocks', 'byAccount', accountId,
+      ) as NeuronDB['engineblocks'][];
+      rows
+        .filter(r => r.index > haveIndex)
+        .sort((a, b) => a.index - b.index)
+        .forEach(r => this.publish(topicEngineBlocks(this.network), { blockHex: r.blockHex, _gen: this.generation }));
+    } catch { /* nothing to serve */ }
   }
 
   private serializeBlock(block: AccountBlock): Record<string, unknown> {

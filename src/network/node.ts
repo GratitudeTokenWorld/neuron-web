@@ -473,9 +473,9 @@ export class NeuronNode extends EventEmitter {
       const key = `${signal.blockHash}:${signal.sender}`;
       if (this.processedInbox.has(key)) return;
       if (signal.signature) {
+        // Engine identity: the sender signs with its engine key over accountId.
         const payload = `inbox:${signal.blockHash}:${signal.sender}:${pub}:${signal.amount}`;
-        const result = await verifySignature(signal.signature, signal.sender);
-        if (result !== payload) { console.warn(`[Inbox] Rejected signal - invalid signature`); return; }
+        if (!engineVerify(signal.signature, payload, signal.sender)) { console.warn(`[Inbox] Rejected signal - invalid signature`); return; }
       }
       this.processedInbox.add(key);
       if (this.processedInbox.size > NeuronNode.MAX_INBOX) {
@@ -483,7 +483,9 @@ export class NeuronNode extends EventEmitter {
         this.processedInbox.delete(first);
       }
       this.emit('inbox:signal', signal);
-      if (!this.ledger.allBlocks.has(signal.blockHash)) this.resyncAccount(signal.sender);
+      // Slice 2: pull the sender's chain tail so the send block (and our
+      // auto-receive) arrive even if we don't hold the sender's shard.
+      if (!this.ledger.allBlocks.has(signal.blockHash)) this.engineResyncAccount(signal.sender);
     });
   }
 
@@ -518,6 +520,18 @@ export class NeuronNode extends EventEmitter {
       }
       if (newBlocks > 0) { this.emit('resync', { newAccounts: 0, newBlocks }); }
     } catch (err) { console.error('[Resync] error:', err); }
+  }
+
+  /**
+   * Slice 2: pull an engine account's chain tail from peers. The missing blocks
+   * arrive on the engine-blocks topic → handleIncomingEngineBlock (apply +
+   * autoReceiveEngine), so this just fires the request. This is how a recipient
+   * obtains a send it didn't receive via gossip (e.g. once subscription is
+   * shard-scoped in Slice 3, or after a fresh-device recovery).
+   */
+  private engineResyncAccount(accountId: string): void {
+    const head = this.ledger.getAccountHead(accountId);
+    this.net.requestEngineDelta(accountId, head ? head.index : -1);
   }
 
   addLocalKey(pub: string, keys: KeyPair): void {
@@ -828,14 +842,30 @@ export class NeuronNode extends EventEmitter {
   // ── Public API ────────────────────────────────────────────────────────────
 
   async submitBlock(block: AccountBlock | EngineBlock): Promise<{ success: boolean; error?: string }> {
-    const result = this.ledger.addBlock(block as unknown as EngineBlock);
+    const eb = block as unknown as EngineBlock;
+    const result = this.ledger.addBlock(eb);
     if (result.success) {
       // Phase 1: gossip the engine block to peers (hex-encoded). Best-effort so a
       // publish failure never breaks the local commit. Engine blocks never route
       // through the legacy serializeBlock/voteIfConflict path.
-      try { this.net.publishEngineBlock(block as unknown as EngineBlock); } catch { /* best-effort */ }
+      try { this.net.publishEngineBlock(eb); } catch { /* best-effort */ }
+      // Slice 2: notify the recipient's inbox so it can pull this send even when
+      // it does not subscribe to the sender's shard (Slice 3). Best-effort.
+      if (eb.type === 'send' && eb.recipient) {
+        try { await this.sendEngineInboxSignal(eb); } catch { /* best-effort */ }
+      }
     }
     return result;
+  }
+
+  /** Slice 2: publish an engine-signed inbox signal to a send's recipient. */
+  private async sendEngineInboxSignal(block: EngineBlock): Promise<void> {
+    const appKeys = this.localKeys.get(block.accountId);
+    if (!appKeys || !block.recipient) return;
+    const amount = Number(block.amount ?? 0);
+    const payload = `inbox:${block.hash}:${block.accountId}:${block.recipient}:${amount}`;
+    const signature = engineSign(payload, engineKeysFromAppPrivate(appKeys.priv).priv);
+    this.net.publishInboxSignal(block.recipient, block.accountId, block.hash, amount, signature);
   }
 
   /** Register as a storage provider. capacityGB = 0 deregisters. */
