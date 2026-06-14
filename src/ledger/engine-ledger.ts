@@ -15,6 +15,7 @@ import { getShard, DEFAULT_NUM_SHARDS } from '../engine/core/partition.js';
 import { proveDoubleSpend, verifyDoubleSpend, type DoubleSpendEvidence } from '../engine/consensus/fraud.js';
 import { ValidatorRegistry } from '../engine/consensus/validators.js';
 import { EpochSeeds } from '../engine/consensus/seed.js';
+import { CommitteeFinality, type CommitteeVote, type WeightSource } from '../engine/consensus/finality.js';
 import type { Hex } from '../engine/core/hash.js';
 
 /**
@@ -72,6 +73,14 @@ const MINT = BigInt(VERIFICATION_MINT_AMOUNT);
  */
 export const CHALLENGE_WINDOW_MS = 5_000;
 
+/**
+ * Target per-shard committee size for VRF self-sortition (Phase 2 step 2). A block
+ * is `final` once votes covering ⌈2/3 × this⌉ committee seats back it. Tunable;
+ * larger = stronger finality, more votes per shard (still O(committee), not
+ * O(network)).
+ */
+export const DEFAULT_COMMITTEE_SIZE = 64;
+
 export class EngineLedger extends EventEmitter {
   private readonly held = new Map<string, Held>();
   private readonly accountsByPub = new Map<string, LedgerAccount>();
@@ -102,6 +111,8 @@ export class EngineLedger extends EventEmitter {
   private validatorRegistry = new ValidatorRegistry(MINT);
   private seeds = new EpochSeeds();
   private epoch = 0;
+  /** Committee finality (V5): fast `final` status above optimistic `confirmed`. */
+  private committee = this.makeCommittee();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -276,6 +287,7 @@ export class EngineLedger extends EventEmitter {
       if (h) {
         if (h.chain[0]?.hash === block.hash) return { success: true };
         this.flagEquivocation(h.chain[0], block);   // two different opens, same account
+        this.allBlocks.set(block.hash, block);       // retain the sibling so committees can tally the fork
         return { success: false, error: 'conflicting open' };
       }
       h = { chain: [], acc: new AccountAccumulator() };
@@ -286,7 +298,10 @@ export class EngineLedger extends EventEmitter {
       if (block.index <= head.index) {
         const existing = h.chain[block.index];
         if (existing?.hash === block.hash) return { success: true };
-        if (existing) this.flagEquivocation(existing, block);   // fork at the same height = double-spend
+        if (existing) {
+          this.flagEquivocation(existing, block);   // fork at the same height = double-spend
+          this.allBlocks.set(block.hash, block);     // retain the sibling so committees can tally the fork
+        }
         return { success: false, error: 'stale/conflicting' };
       }
       if (block.index !== head.index + 1) return { success: false, error: 'non-sequential' };
@@ -381,6 +396,50 @@ export class EngineLedger extends EventEmitter {
   /** The seed driving sortition for the current epoch. */
   currentSeed(): Hex { return this.seeds.seedFor(this.epoch)!; }
   seedFor(epoch: number): Hex | undefined { return this.seeds.seedFor(epoch); }
+  get committeeSize(): number { return DEFAULT_COMMITTEE_SIZE; }
+
+  private makeCommittee(): CommitteeFinality {
+    // Weight + seed are read live (closures) so the committee tracks the current
+    // validator set even after reset() swaps the registry.
+    const weights: WeightSource = {
+      weightOf: (id) => this.validatorRegistry.weightOf(id),
+      totalWeight: () => this.validatorRegistry.totalWeight(),
+    };
+    return new CommitteeFinality(
+      { committeeSize: DEFAULT_COMMITTEE_SIZE },
+      weights,
+      (epoch) => this.seeds.seedFor(epoch),
+    );
+  }
+
+  /**
+   * Apply a committee member's vote toward finalizing a block (V5). Verifies the
+   * VRF sortition proof + signature, tallies seats, and on an absolute 2/3-seat
+   * quorum marks the block `final` (rejecting fork siblings). A voter that
+   * equivocates (votes two siblings) is slashed via the fraud path. Idempotent;
+   * returns whether the vote was counted and any finalization.
+   */
+  applyCommitteeVote(vote: CommitteeVote): { accepted: boolean; finalized?: string; reason?: string } {
+    // Self-register the voted block on demand (bounded by committee activity, not
+    // total blocks) so finality memory stays O(blocks under active voting).
+    const block = this.allBlocks.get(vote.blockHash);
+    if (block) this.committee.registerBlock(block);
+
+    const r = this.committee.applyVote(vote);
+    if (r.equivocation) {
+      // A committee member double-voting is slashable evidence (no bond ⇒ no-op).
+      const burned = this.validatorRegistry.slash(r.equivocation.voterId);
+      if (burned > 0n) this.emit('validator:slashed', { id: r.equivocation.voterId, burned, reason: 'vote-equivocation' });
+    }
+    if (r.finalized) {
+      this.emit('block:final', { hash: r.finalized });
+      for (const h of r.rejected ?? []) this.emit('block:rejected', { hash: h });
+    }
+    return { accepted: r.accepted, finalized: r.finalized, reason: r.reason };
+  }
+
+  /** Is this block committee-finalized (the strongest status)? */
+  isFinal(hash: string): boolean { return this.committee.isFinal(hash); }
 
   /**
    * Close the current epoch: fold this epoch's committee VRF `betas` into the seed
@@ -451,10 +510,11 @@ export class EngineLedger extends EventEmitter {
   getBlock(hash: string): Block | undefined {
     return this.allBlocks.get(hash);
   }
-  getBlockStatus(hash: string): 'confirmed' | 'rejected' | 'pending' | 'unknown' {
+  getBlockStatus(hash: string): 'final' | 'confirmed' | 'rejected' | 'pending' | 'unknown' {
     const b = this.allBlocks.get(hash);
     if (!b) return 'unknown';
     if (this.equivocated.has(b.accountId)) return 'rejected';  // frozen by fraud proof
+    if (this.committee.isFinal(hash)) return 'final';          // committee-finalized (V5)
     const at = this.appliedAt.get(hash);
     if (at !== undefined) {
       if (Date.now() - at < CHALLENGE_WINDOW_MS) return 'pending';  // recipient-witnessed window
@@ -506,6 +566,7 @@ export class EngineLedger extends EventEmitter {
     this.validatorRegistry = new ValidatorRegistry(MINT);
     this.seeds = new EpochSeeds();
     this.epoch = 0;
+    this.committee = this.makeCommittee();
   }
   private deferred(feature: string): { error: string } {
     return { error: `${feature} is not available in the engine slice (dApp phase)` };

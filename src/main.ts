@@ -654,7 +654,7 @@ function showAccountDetail(pub: string) {
   // Block history
   const blockRows = chain.map(b => {
     const status = node.ledger.getBlockStatus(b.hash);
-    const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
+    const statusColor = (status === 'final' || status === 'confirmed') ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
     const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
     let detail2 = '-';
     const eb = b as unknown as AnyBlock;
@@ -924,7 +924,7 @@ function refreshChain() {
     ? '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">No blocks yet</td></tr>'
     : blocks.map((b) => {
         const status = node.ledger.getBlockStatus(b.hash);
-        const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
+        const statusColor = (status === 'final' || status === 'confirmed') ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
         return `<tr>
           <td>${copyBtn(b.hash)}</td>
           <td><span class="badge badge-${b.type === 'send' ? 'transfer' : b.type === 'receive' ? 'create' : b.type === 'deploy' ? 'deploy' : b.type === 'call' ? 'call' : 'verify'}">${b.type}</span></td>
@@ -1198,7 +1198,7 @@ let blockCountStableSince = 0;
 
 function renderExplorerRow(b: AccountBlock): string {
   const status = node.ledger.getBlockStatus(b.hash);
-  const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
+  const statusColor = (status === 'final' || status === 'confirmed') ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
   const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
 
   let counterparty = '-';
