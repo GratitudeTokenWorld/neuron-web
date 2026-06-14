@@ -30,7 +30,7 @@ function craftSend(keys: SignerKeys, open: Block, recipient: string, amount: big
   acc.append(open.hash);
   return createBlock(
     { accountId: keys.pub, index: 1, type: 'send', previousHash: open.hash, shard: open.shard,
-      timestamp: ts, balance: 1_000_000n - amount, recipient, amount },
+      timestamp: ts, balance: 1_000_000_000n - amount, recipient, amount },
     keys.priv,
     acc,
   );

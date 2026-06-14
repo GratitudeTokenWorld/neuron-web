@@ -341,6 +341,8 @@ export class EngineLedger extends EventEmitter {
     let h = this.held.get(block.accountId);
     if (block.index === 0) {
       if (block.type !== 'open' || block.previousHash !== GENESIS_PREV) return { success: false, error: 'bad genesis' };
+      // Balance conservation: an open mints EXACTLY the genesis amount, no more.
+      if (block.balance !== MINT) return { success: false, error: 'open must mint exactly the genesis amount' };
       if (h) {
         if (h.chain[0]?.hash === block.hash) return { success: true };
         this.flagEquivocation(h.chain[0], block);   // two different opens, same account
@@ -363,8 +365,27 @@ export class EngineLedger extends EventEmitter {
       }
       if (block.index !== head.index + 1) return { success: false, error: 'non-sequential' };
       if (block.previousHash !== head.hash) return { success: false, error: 'previousHash mismatch' };
-      // An update carries only metadata — it must never move balance.
-      if (block.type === 'update' && block.balance !== head.balance) return { success: false, error: 'update must preserve balance' };
+      // Balance conservation — without this, a self-signed block could mint money
+      // (the signature/hash/linkage all pass; only the arithmetic catches it). The
+      // fraud-proof + committee layers do NOT cover this (it's a single valid chain).
+      if (block.type === 'update' && block.balance !== head.balance) {
+        return { success: false, error: 'update must preserve balance' };
+      }
+      if (block.type === 'send') {
+        if (block.amount === undefined || block.amount <= 0n) return { success: false, error: 'send amount must be positive' };
+        if (block.balance < 0n || block.balance !== head.balance - block.amount) return { success: false, error: 'send balance inconsistent' };
+      }
+      if (block.type === 'receive') {
+        if (block.amount === undefined || block.amount <= 0n) return { success: false, error: 'receive amount must be positive' };
+        if (block.balance !== head.balance + block.amount) return { success: false, error: 'receive balance inconsistent' };
+        // When we hold the source send, the claimed amount must match it (catches an
+        // over-claimed receive). If we don't hold it yet, the self-consistent delta
+        // above still bounds the damage; full cross-account proof is the source send.
+        const src = block.sourceHash ? this.allBlocks.get(block.sourceHash) : undefined;
+        if (src && (src.type !== 'send' || src.recipient !== block.accountId || src.amount !== block.amount)) {
+          return { success: false, error: 'receive does not match source send' };
+        }
+      }
     }
     if (h.acc.rootWithHex(block.hash) !== block.accumulatorRoot) return { success: false, error: 'accumulator root mismatch' };
     h.acc.append(block.hash);
