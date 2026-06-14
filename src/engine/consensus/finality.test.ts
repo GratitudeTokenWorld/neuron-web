@@ -124,6 +124,37 @@ describe('committee finality', () => {
     expect(f.seatsFor(block.hash)).toBe(seatsAfterFirst);
   });
 
+  it('prunes a stalled undecided group past the retention window', () => {
+    const f = newFinality();
+    f.registerBlock(block);
+    const v = committeeVotesFor(block)[0]!; // one vote, below quorum ⇒ stays pending
+    f.applyVote(v);
+    expect(f.status(block.hash)).toBe('pending');
+
+    // Still within the window: kept.
+    expect(f.pruneStale(EPOCH + 2)).toBe(0);
+    expect(f.status(block.hash)).toBe('pending');
+
+    // Past the window: the stalled group is dropped (governance falls to the
+    // optimistic/challenge-window path, not committee finality).
+    expect(f.pruneStale(EPOCH + 3)).toBe(1);
+    expect(f.status(block.hash)).toBe('unknown');
+    expect(f.applyVote(v).reason).toBe('unknown block');
+  });
+
+  it('keeps a finalized group decided after pruning, and frees its vote detail', () => {
+    const f = newFinality();
+    f.registerBlock(block);
+    let finalized = false;
+    for (const v of committeeVotesFor(block)) {
+      if (f.applyVote(v).finalized) { finalized = true; break; }
+    }
+    expect(finalized).toBe(true);
+    expect(f.seatsFor(block.hash)).toBe(0); // per-voter tally detail freed on finalize
+    expect(f.pruneStale(EPOCH + 100)).toBe(0); // decided groups are not pruned
+    expect(f.status(block.hash)).toBe('final'); // status survives
+  });
+
   it('on a fork, the block that reaches quorum wins and its sibling is rejected', () => {
     const f = newFinality();
     const a = { ...block, hash: 'a'.repeat(64) };

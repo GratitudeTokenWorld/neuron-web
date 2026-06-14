@@ -108,6 +108,7 @@ interface Group {
 export class CommitteeFinality {
   private readonly groupOf = new Map<Hex, string>(); // blockHash → group key
   private readonly groups = new Map<string, Group>();
+  private readonly groupEpoch = new Map<string, number>(); // group key → latest vote epoch (for stale pruning)
   private readonly finalBlocks = new Set<Hex>();
   private readonly rejectedBlocks = new Set<Hex>();
   private readonly equivocs: { voterId: Hex; blockA: Hex; blockB: Hex }[] = [];
@@ -164,6 +165,7 @@ export class CommitteeFinality {
     // 4. Tally.
     g.voterChoice.set(v.accountId, v.blockHash);
     g.seatsByBlock.set(v.blockHash, (g.seatsByBlock.get(v.blockHash) ?? 0) + seats);
+    this.groupEpoch.set(key, Math.max(this.groupEpoch.get(key) ?? v.epoch, v.epoch));
 
     // 5. Finalize on absolute quorum.
     if ((g.seatsByBlock.get(v.blockHash) ?? 0) >= seatQuorum(this.params)) {
@@ -176,9 +178,37 @@ export class CommitteeFinality {
           rejected.push(h);
         }
       }
+      // Free the per-voter tally detail (scales with vote volume); keep a tiny
+      // tombstone (g.final + g.blocks) so late votes still short-circuit and
+      // status() stays correct.
+      g.voterChoice.clear();
+      g.seatsByBlock.clear();
+      this.groupEpoch.delete(key);
       return { accepted: true, finalized: v.blockHash, rejected };
     }
     return { accepted: true };
+  }
+
+  /**
+   * Drop UNDECIDED groups whose latest vote predates the retention window — a stalled
+   * fork that never reached quorum is governed by optimistic confirmation + the
+   * recipient challenge window, not committee finality, so its vote detail is dead
+   * weight. Decided groups keep their tiny tombstone. Returns the count dropped.
+   * Call once per epoch (the ledger drives this from `advanceEpoch`).
+   */
+  pruneStale(currentEpoch: number, retainEpochs = 2): number {
+    let dropped = 0;
+    for (const [key, g] of this.groups) {
+      if (g.final) continue; // decided: keep the tombstone (cost is O(1) per group)
+      const epoch = this.groupEpoch.get(key) ?? currentEpoch;
+      if (epoch < currentEpoch - retainEpochs) {
+        for (const h of g.blocks) this.groupOf.delete(h);
+        this.groups.delete(key);
+        this.groupEpoch.delete(key);
+        dropped++;
+      }
+    }
+    return dropped;
   }
 
   status(blockHash: Hex): FinalityStatus {

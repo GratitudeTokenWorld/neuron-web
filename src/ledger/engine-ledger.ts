@@ -451,6 +451,7 @@ export class EngineLedger extends EventEmitter {
     this.seeds.commit(this.epoch, betas);
     this.epoch += 1;
     for (const id of activeValidators) this.validatorRegistry.creditActivity(id, 1);
+    this.committee.pruneStale(this.epoch); // bound finality memory: drop stalled fork tallies
     this.emit('epoch:advanced', { epoch: this.epoch, seed: this.seeds.seedFor(this.epoch)! });
     return this.epoch;
   }
