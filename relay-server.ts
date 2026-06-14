@@ -120,7 +120,11 @@ const PROTOCOL_VERSION = 'v1';
 const CHALLENGE_TYPES = ['look-left', 'look-right', 'smile'];
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const IP_WINDOW_MS = 24 * 60 * 60 * 1000;
-const IP_MAX_PER_DAY = 3;
+// Per-IP verification cap per 24h, by network. Local/loopback IPs are exempt
+// entirely (see checkIpLimit), so local dev testing is never throttled.
+// NOTE: the counter is in-memory on the RELAY (per IP) — a browser reload does
+// NOT reset it; restarting the relay does.
+const IP_MAX_PER_DAY = { testnet: 24, mainnet: 12 };
 /** Max accounts per face: testnet=3, mainnet=1 */
 const FACE_MAX = { testnet: 3, mainnet: 1 };
 /**
@@ -196,11 +200,26 @@ function issueChallenge(ip) {
   return { challengeId, type, expiresAt: now + CHALLENGE_TTL_MS };
 }
 
-function checkIpLimit(ip) {
+/**
+ * Loopback / private-range clients are local development (browser → Vite proxy →
+ * relay, all on 127.0.0.1), not public abuse. Exempt them from the per-IP rate
+ * limit so local multi-account testing isn't throttled. Public clients on a
+ * deployed relay still get the limit (real anti-bot signal).
+ */
+function isLocalIp(ip) {
+  const a = ip.replace(/^::ffff:/, '');
+  return ip === 'unknown' || ip === '::1' || a === '127.0.0.1'
+    || a.startsWith('127.') || a.startsWith('10.') || a.startsWith('192.168.')
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(a);
+}
+
+function checkIpLimit(ip, network) {
+  if (isLocalIp(ip)) return true; // local dev never limited
+  const max = IP_MAX_PER_DAY[network] ?? IP_MAX_PER_DAY.testnet;
   const now = Date.now();
   const entry = ipVerifyLog.get(ip);
   if (!entry || now - entry.windowStart > IP_WINDOW_MS) return true;
-  return entry.count < IP_MAX_PER_DAY;
+  return entry.count < max;
 }
 
 function recordIpVerification(ip) {
@@ -353,9 +372,10 @@ async function main() {
 
       } else if (req.method === 'POST' && req.url === '/face-verify/challenge') {
         const ip = getClientIp(req);
-        if (!checkIpLimit(ip)) {
+        const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        if (!checkIpLimit(ip, network)) {
           res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Rate limit: max 3 verifications per IP per 24h' }));
+          res.end(JSON.stringify({ error: `Rate limit: max ${IP_MAX_PER_DAY[network]} verifications per IP per 24h` }));
           return;
         }
         const challenge = issueChallenge(ip);
@@ -402,11 +422,11 @@ async function main() {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'faceMapHash does not match descriptor' })); return;
         }
-        if (!checkIpLimit(ip)) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Rate limit exceeded' })); return;
-        }
         const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        if (!checkIpLimit(ip, network)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Rate limit: max ${IP_MAX_PER_DAY[network]} verifications per IP per 24h` })); return;
+        }
         const faceMax = FACE_MAX[network];
 
         // Fuzzy face match: find the closest stored descriptor within FACE_MATCH_THRESHOLD.

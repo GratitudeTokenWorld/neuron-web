@@ -269,10 +269,21 @@ export class EngineLedger extends EventEmitter {
     return all.sort((a, b) => a.timestamp - b.timestamp);
   }
 
-  getStats(): { accounts: number; blocks: number; network: string } {
+  getStats(): {
+    network: string; totalAccounts: number; totalBlocks: number; confirmedBlocks: number;
+    pendingBlocks: number; tps: number; accounts: number; blocks: number;
+  } {
     let blocks = 0;
     for (const h of this.held.values()) blocks += h.chain.length;
-    return { accounts: this.accountsByPub.size, blocks, network: this.network };
+    // Accounts we have any state for: registered records ∪ held chains (a remote
+    // account synced via its open block lives in `held` before its record arrives).
+    const totalAccounts = new Set<string>([...this.accountsByPub.keys(), ...this.held.keys()]).size;
+    // Optimistic confirmation: every applied block is confirmed; no fork voting in this slice.
+    return {
+      network: this.network,
+      totalAccounts, totalBlocks: blocks, confirmedBlocks: blocks, pendingBlocks: 0, tps: 0,
+      accounts: totalAccounts, blocks,
+    };
   }
 
   // ── Drop-in surface for the app (DAGLedger compatibility) ─────────────────────

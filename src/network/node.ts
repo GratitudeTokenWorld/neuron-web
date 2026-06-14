@@ -9,6 +9,9 @@ import { KeyPair, signData, verifySignature } from '../core/crypto';
 import { EventEmitter } from '../core/events';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createSnapshot, parseSnapshot, SNAPSHOT_TRIGGER_BYTES } from '../core/snapshot';
+import { type Block as EngineBlock } from '../engine/core/block';
+import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
+import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
 
 /**
  * Returns a stable per-device ID persisted in localStorage.
@@ -88,6 +91,8 @@ export class NeuronNode extends EventEmitter {
   private publishDebounce: ReturnType<typeof setTimeout> | null = null;
   /** P2/C3: blocks waiting for their parent to arrive, keyed by previousHash. Entries older than 5 min are evicted. */
   private pendingBlocks: Map<string, { blocks: AccountBlock[]; addedAt: number }> = new Map();
+  /** Phase 1: engine blocks waiting for their parent, keyed by previousHash (same TTL/eviction). */
+  private pendingEngineBlocks: Map<string, { blocks: EngineBlock[]; addedAt: number }> = new Map();
   private static readonly PENDING_BLOCK_TTL_MS = 5 * 60 * 1000;
   /** P7: accounts dirtied by incoming blocks since last resync - gate for skipping idle resync passes */
   private dirtyAccounts: Set<string> = new Set();
@@ -97,6 +102,8 @@ export class NeuronNode extends EventEmitter {
   private lastSyncedAccountVersion = 0;
   /** A5: highest block _blockVersion seen in IDB at the last resync; drives incremental loadBlocksSince */
   private lastSyncedBlockVersion = 0;
+  /** Phase 1: highest engine-block _engVersion seen at the last resync; drives loadEngineBlocksSince */
+  private lastSyncedEngineBlockVersion = 0;
 
   localKeys: Map<string, KeyPair> = new Map();
   private processedInbox: Set<string> = new Set();
@@ -154,6 +161,10 @@ export class NeuronNode extends EventEmitter {
 
     this.net.on('block:received', async (block: unknown) => {
       await this.handleIncomingBlock(block as AccountBlock);
+    });
+
+    this.net.on('engineblock:received', async (block: unknown) => {
+      await this.handleIncomingEngineBlock(block as EngineBlock);
     });
 
     this.net.on('vote:received', async (vote: unknown) => {
@@ -375,6 +386,54 @@ export class NeuronNode extends EventEmitter {
     }, 500);
   }
 
+  // ── Engine-block ingest (Phase 1 multi-node sync) ─────────────────────────
+  // Parallel to the legacy AccountBlock path above; engine blocks never route
+  // through voteIfConflict/serializeBlock. addBlock is synchronous.
+
+  private async handleIncomingEngineBlock(block: EngineBlock): Promise<void> {
+    const result = this.ledger.addBlock(block);
+    if (result.success) {
+      this.dirtyAccounts.add(block.accountId);
+      this.emit('engineblock:received', block);
+      await this.autoReceiveEngine(block);
+      // Flush any children that were waiting for this block as their parent.
+      const entry = this.pendingEngineBlocks.get(block.hash);
+      if (entry) {
+        this.pendingEngineBlocks.delete(block.hash);
+        for (const child of entry.blocks) await this.handleIncomingEngineBlock(child);
+      }
+    } else if (result.error === 'missing prior chain' || result.error === 'non-sequential') {
+      // Parent (or an intermediate block) not yet applied. Queue under previousHash
+      // and clear gossip dedup so it retries when the parent arrives / re-broadcasts.
+      this.net.forgetEngineBlock(block.hash);
+      const now = Date.now();
+      for (const [k, v] of this.pendingEngineBlocks) {
+        if (now - v.addedAt > NeuronNode.PENDING_BLOCK_TTL_MS) this.pendingEngineBlocks.delete(k);
+      }
+      const existing = this.pendingEngineBlocks.get(block.previousHash);
+      if (existing) existing.blocks.push(block);
+      else this.pendingEngineBlocks.set(block.previousHash, { blocks: [block], addedAt: now });
+    } else {
+      // bad hash/sig/genesis/conflict — allow re-broadcast retry, otherwise drop.
+      this.net.forgetEngineBlock(block.hash);
+    }
+  }
+
+  private async autoReceiveEngine(block: EngineBlock): Promise<void> {
+    if (block.type !== 'send' || !block.recipient) return;
+    const appKeys = this.localKeys.get(block.recipient); // localKeys is keyed by engine accountId
+    if (!appKeys) return; // not addressed to a local account
+    const signer = engineKeysFromAppPrivate(appKeys.priv);
+    setTimeout(async () => {
+      const result = await this.ledger.createReceive(block.recipient!, block.hash, signer);
+      if (result.block) {
+        this.ledger.addBlock(result.block);
+        this.net.publishEngineBlock(result.block);
+        this.emit('auto:received', { from: block.accountId, amount: Number(block.amount ?? 0) });
+      }
+    }, 500);
+  }
+
   // Sweep ledger.unclaimedSends for any sends addressed to local keys and
   // auto-receive them. This is the fallback path for missed auto-receives.
   //
@@ -521,6 +580,9 @@ export class NeuronNode extends EventEmitter {
     for (const [, chain] of chains) {
       for (const block of chain) await this.ledger.addBlock(block);
     }
+    // Phase 1: replay persisted engine blocks (sorted open→dependent) so received
+    // cross-node state survives reload. Idempotent vs main.ts's per-wallet open replay.
+    for (const block of await this.net.loadAllEngineBlocks()) this.ledger.addBlock(block);
     // A7: faceAccountCount is maintained incrementally by addBlock - no rebuild needed
     // Sync heartbeat counts to the current rolling window (uses Date.now() as reference).
     this.ledger.refreshHeartbeatCounts();
@@ -543,6 +605,7 @@ export class NeuronNode extends EventEmitter {
     // P4/A5: record watermarks after startup load so resyncFromNet only reads new writes
     this.lastSyncedAccountVersion = this.net.getAccountVersionCounter();
     this.lastSyncedBlockVersion = this.net.getBlockVersionCounter();
+    this.lastSyncedEngineBlockVersion = this.net.getEngineBlockVersionCounter();
 
     this.voteProcessInterval = setInterval(() => this.ledger.processConflicts(), 3000);
     this.resyncInterval = setInterval(() => this.resyncFromNet(), 60_000);
@@ -606,9 +669,16 @@ export class NeuronNode extends EventEmitter {
           if (result.success) { newBlocks++; this.voteIfConflict(block); this.autoReceive(block); }
         }
       }
+      // Phase 1: apply engine blocks persisted since the last resync (safety net
+      // for gossip the live mesh missed). Orphans are handled inside the handler.
+      for (const block of await this.net.loadEngineBlocksSince(this.lastSyncedEngineBlockVersion)) {
+        if (!this.ledger.allBlocks.has(block.hash)) await this.handleIncomingEngineBlock(block);
+      }
+
       // P4/A5: advance watermarks so the next resync only reads newer writes
       this.lastSyncedAccountVersion = this.net.getAccountVersionCounter();
       this.lastSyncedBlockVersion = this.net.getBlockVersionCounter();
+      this.lastSyncedEngineBlockVersion = this.net.getEngineBlockVersionCounter();
 
       // A7: faceAccountCount is maintained incrementally in addBlock - no rebuild needed
       if (newAccounts > 0 || newBlocks > 0) {
@@ -623,17 +693,21 @@ export class NeuronNode extends EventEmitter {
     this.resyncDebounce = setTimeout(() => { this.resyncDebounce = null; this.resyncFromNet(); }, 500);
   }
 
+  // Account records are identified by the engine accountId (acc.pub = compressed-hex
+  // engine pubkey), so they MUST be signed/verified with the engine keys over that
+  // identity — not the app JWK (signData/verifySignature verify against the JWK pub,
+  // which diverged from accountId in the engine migration, so cross-node verification
+  // silently failed and dropped every remote account record → usernames showed as hex).
   private async signAccountData(acc: Record<string, unknown>, keys: KeyPair): Promise<Record<string, unknown>> {
     const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${acc.faceMapHash}`;
-    const signature = await signData(payload, keys);
-    return { ...acc, _sig: signature };
+    const signer = engineKeysFromAppPrivate(keys.priv);
+    return { ...acc, _sig: engineSign(payload, signer.priv) };
   }
 
-  private static async verifyAccountData(acc: Record<string, unknown>): Promise<boolean> {
+  private static verifyAccountData(acc: Record<string, unknown>): boolean {
     if (!acc._sig || !acc.pub) return false;
     const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${acc.faceMapHash}`;
-    const result = await verifySignature(String(acc._sig), String(acc.pub));
-    return result === payload;
+    return engineVerify(String(acc._sig), payload, String(acc.pub));
   }
 
   /**
@@ -661,14 +735,12 @@ export class NeuronNode extends EventEmitter {
       this.net.saveAccount(pub, keys ? await this.signAccountData(accData, keys) : accData);
     }
 
-    // P1/A3: incremental publish - only iterate blocks since the last publish
-    const blocks = full
-      ? Array.from(this.ledger.allBlocks.values())
-      : this.ledger.getBlocksSince(this.lastPublishedAt - 5_000);
-    // Best-effort: engine-block gossip is deferred (new format); never throw here.
-    try {
-      for (const block of blocks) this.net.publishBlock(block);
-    } catch { /* network sync wired in a later phase */ }
+    // Phase 1: re-broadcast engine blocks (hex-encoded). Receivers dedup on hash,
+    // so re-publishing the full set is safe; per-node cost is bounded by the
+    // accounts a node actually holds (own + followed). Slice 3 makes this per-shard.
+    for (const block of this.ledger.allBlocks.values()) {
+      this.net.publishEngineBlock(block);
+    }
     this.lastPublishedAt = Date.now();
   }
 
@@ -755,17 +827,13 @@ export class NeuronNode extends EventEmitter {
 
   // ── Public API ────────────────────────────────────────────────────────────
 
-  async submitBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.addBlock(block);
+  async submitBlock(block: AccountBlock | EngineBlock): Promise<{ success: boolean; error?: string }> {
+    const result = this.ledger.addBlock(block as unknown as EngineBlock);
     if (result.success) {
-      // Cross-node gossip is deferred during the engine migration: engine blocks use
-      // a new format (bigint fields, accountId not accountPub) the old AccountBlock
-      // gossip/serialize path can't encode. Keep it best-effort so a publish failure
-      // never breaks the local (single-instance) commit.
-      try {
-        this.net.publishBlock(block);
-        this.voteIfConflict(block);
-      } catch { /* network sync wired in a later phase */ }
+      // Phase 1: gossip the engine block to peers (hex-encoded). Best-effort so a
+      // publish failure never breaks the local commit. Engine blocks never route
+      // through the legacy serializeBlock/voteIfConflict path.
+      try { this.net.publishEngineBlock(block as unknown as EngineBlock); } catch { /* best-effort */ }
     }
     return result;
   }

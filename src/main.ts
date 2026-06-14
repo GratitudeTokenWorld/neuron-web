@@ -1547,7 +1547,7 @@ async function getRelayChallenges(
     const base = relay.faceVerifyUrl || '';
     try {
       const res = await fetch(faceVerifyEndpoint(base, 'challenge'), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network }, body: '{}',
         signal: AbortSignal.timeout(6000),
       });
       if (!res.ok) {

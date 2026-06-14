@@ -107,6 +107,11 @@ import { Vote } from '../core/vote';
 import { writeReloadLog } from '../core/reload-monitor';
 import { verifySignature } from '../core/crypto';
 import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
+// Engine-block transport (Phase 1 multi-node sync). Engine blocks carry bigint
+// fields + accountId, so they CANNOT use the legacy serializeBlock/JSON path;
+// they round-trip via the bigint-safe codec below and travel as hex on gossip.
+import { encodeBlock, decodeBlock, verifyBlock, type Block as EngineBlock } from '../engine/core/block';
+import { bytesToHex, hexToBytes } from '../engine/core/hash';
 
 export const NUM_SYNAPSES = 4;
 
@@ -233,6 +238,9 @@ function topicBlobRequests(network: string): string { return `neuronchain/${PROT
 function topicPeerAddrs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/peer-addrs`; }
 function topicRelays(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/relays`; }
 function topicSnapshots(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/snapshots`; }
+// Phase 1 Slice 1: a single engine-block topic (all nodes subscribe). Slice 3
+// replaces this with per-shard topics + selective subscription.
+function topicEngineBlocks(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-blocks`; }
 function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
@@ -293,10 +301,12 @@ interface NeuronDB {
   trackedCids: TrackedCidRecord;
   knownRelays: KnownRelayRecord;
   fileIndex: FileIndexRecord;
+  // Phase 1: engine blocks (hex-encoded, bigint-safe) keyed by content hash.
+  engineblocks: { hash: string; accountId: string; index: number; blockHex: string; _engVersion?: number };
 }
 
 async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
-  return openDB<NeuronDB>(`neuronchain-${network}`, 8, {
+  return openDB<NeuronDB>(`neuronchain-${network}`, 9, {
     // Another tab has a newer DB version open — close this connection so the
     // upgrade can proceed instead of blocking indefinitely.
     blocking() { writeReloadLog('idb blocking (another tab has newer DB version)'); location.reload(); },
@@ -362,6 +372,14 @@ async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
           db.createObjectStore('fileIndex', { keyPath: 'cid' });
         }
       }
+      // v9: engineblocks — engine account-chain blocks (Phase 1 multi-node sync)
+      if (oldVersion < 9) {
+        if (!db.objectStoreNames.contains('engineblocks')) {
+          const es = db.createObjectStore('engineblocks', { keyPath: 'hash' });
+          es.createIndex('byAccount', 'accountId');      // per-account chain lookup
+          es.createIndex('byEngVersion', '_engVersion'); // incremental engine-block resync
+        }
+      }
     },
   });
 }
@@ -382,6 +400,8 @@ export class Libp2pNetwork extends EventEmitter {
   private peerId = '';
   private trackedPeers: Set<string> = new Set();
   private processedBlocks: Set<string> = new Set();
+  /** Separate from processedBlocks — engine blocks use a different hash space + format. */
+  private processedEngineBlocks: Set<string> = new Set();
   private processedVotes: Set<string> = new Set();
   private generation = 0;
   private watchedInboxes: Set<string> = new Set();
@@ -414,6 +434,8 @@ export class Libp2pNetwork extends EventEmitter {
   private accountVersionCounter = 0;
   /** A5: monotonic counter stamped on every IDB block write; enables range-query incremental block resync */
   private blockVersionCounter = 0;
+  /** Phase 1: monotonic counter stamped on every IDB engine-block write; enables incremental engine-block resync */
+  private engineBlockVersionCounter = 0;
   /** Community relay registry — addr → record (mirrors IDB knownRelays store) */
   private knownRelayMap: Map<string, KnownRelayRecord> = new Map();
 
@@ -423,6 +445,7 @@ export class Libp2pNetwork extends EventEmitter {
     this.loadGeneration();
     this.loadAccountVersion();
     this.loadBlockVersion();
+    this.loadEngineBlockVersion();
   }
 
   private get genKey(): string { return `neuronchain_generation_${this.network}`; }
@@ -440,6 +463,12 @@ export class Libp2pNetwork extends EventEmitter {
   private saveBlockVersion(): void { try { localStorage.setItem(this.blkVerKey, String(this.blockVersionCounter)); } catch {} }
   /** Returns the current monotonic block version (highest version written to IDB this session). */
   getBlockVersionCounter(): number { return this.blockVersionCounter; }
+
+  private get engBlkVerKey(): string { return `neuronchain_eng_blk_ver_${this.network}`; }
+  private loadEngineBlockVersion(): void { try { this.engineBlockVersionCounter = parseInt(localStorage.getItem(this.engBlkVerKey) || '0', 10) || 0; } catch { this.engineBlockVersionCounter = 0; } }
+  private saveEngineBlockVersion(): void { try { localStorage.setItem(this.engBlkVerKey, String(this.engineBlockVersionCounter)); } catch {} }
+  /** Returns the current monotonic engine-block version (highest written to IDB this session). */
+  getEngineBlockVersionCounter(): number { return this.engineBlockVersionCounter; }
 
   // ── Community relay registry ──────────────────────────────────────────────
 
@@ -616,6 +645,7 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicRelays(this.network));
     pubsub.subscribe(topicSnapshots(this.network));
     pubsub.subscribe(topicFileAnnouncements(this.network));
+    pubsub.subscribe(topicEngineBlocks(this.network));
 
     pubsub.addEventListener('message', (evt) => {
       const msg = evt.detail as { topic: string; data: Uint8Array; from?: { toString(): string } };
@@ -835,9 +865,13 @@ export class Libp2pNetwork extends EventEmitter {
           await this.db.clear('contracts');
           await this.db.clear('trackedCids');
           await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
+          await (this.db as IDBPDatabase<any>).clear('engineblocks').catch(() => {}); // Phase 1: wipe engine ledger state
         } catch { /* ignore */ }
         this.processedBlocks.clear();
+        this.processedEngineBlocks.clear();
         this.processedVotes.clear();
+        this.engineBlockVersionCounter = 0;
+        this.saveEngineBlockVersion();
       }
       this.emit('generation:changed', isReset);
       return;
@@ -871,6 +905,23 @@ export class Libp2pNetwork extends EventEmitter {
         }
         return;
       }
+    }
+
+    // Phase 1: engine blocks travel as { blockHex, _gen }. Verify (content hash +
+    // signature) BEFORE trust/persist, dedup on the engine hash space, then emit.
+    if (topic === topicEngineBlocks(this.network)) {
+      const raw = decode<{ blockHex?: string; _gen?: number }>(data);
+      if (typeof raw._gen === 'number' && raw._gen < this.generation) return;
+      if (!raw.blockHex) return;
+      let block: EngineBlock;
+      try { block = decodeBlock(hexToBytes(raw.blockHex)); } catch { return; }
+      if (!verifyBlock(block)) return;
+      if (this.processedEngineBlocks.has(block.hash)) return;
+      this.processedEngineBlocks.add(block.hash);
+      this.capSet(this.processedEngineBlocks);
+      await this.saveEngineBlock(block);
+      this.emit('engineblock:received', block);
+      return;
     }
 
     if (topic === topicVotes(this.network)) {
@@ -1079,6 +1130,14 @@ export class Libp2pNetwork extends EventEmitter {
     this.blockVersionCounter++;
     this.saveBlockVersion();
     this.db.put('blocks', { ...block, _blockVersion: this.blockVersionCounter } as NeuronDB['blocks']).catch(() => {});
+  }
+
+  /** Phase 1: gossip an engine block (hex-encoded, bigint-safe) + persist it locally. */
+  publishEngineBlock(block: EngineBlock): void {
+    if (!this.running) return;
+    this.processedEngineBlocks.add(block.hash);
+    this.publish(topicEngineBlocks(this.network), { blockHex: bytesToHex(encodeBlock(block)), _gen: this.generation });
+    this.saveEngineBlock(block).catch(() => {});
   }
 
   publishVote(vote: Vote): void {
@@ -1348,9 +1407,13 @@ export class Libp2pNetwork extends EventEmitter {
       await this.db.clear('contracts');
       await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
       await (this.db as IDBPDatabase<any>).clear('trackedCids').catch(() => {});
+      await (this.db as IDBPDatabase<any>).clear('engineblocks').catch(() => {}); // Phase 1: wipe engine ledger state
       // Keep keyblobs - user still needs to recover their account
     } catch { /* ignore */ }
 
+    this.engineBlockVersionCounter = 0;
+    this.saveEngineBlockVersion();
+    this.processedEngineBlocks.clear();
     this.processedBlocks.clear();
     this.processedVotes.clear();
   }
@@ -1397,6 +1460,51 @@ export class Libp2pNetwork extends EventEmitter {
    *  Called by node.ts when addBlock fails so re-broadcast cycles can retry. */
   forgetBlock(hash: string): void {
     this.processedBlocks.delete(hash);
+  }
+
+  /** Engine-block equivalent of forgetBlock — re-allow an orphaned block to be reprocessed. */
+  forgetEngineBlock(hash: string): void {
+    this.processedEngineBlocks.delete(hash);
+  }
+
+  // ── Engine-block persistence (Phase 1) ────────────────────────────────────
+
+  /**
+   * Persist an engine block (hex-encoded) to IDB. SOLE writer of the
+   * _engVersion watermark — bump+save here only so loadEngineBlocksSince never
+   * skips a block (a second writer would create version gaps).
+   */
+  async saveEngineBlock(block: EngineBlock): Promise<void> {
+    try {
+      this.engineBlockVersionCounter++;
+      this.saveEngineBlockVersion();
+      await this.db.put('engineblocks', {
+        hash: block.hash, accountId: block.accountId, index: block.index,
+        blockHex: bytesToHex(encodeBlock(block)), _engVersion: this.engineBlockVersionCounter,
+      });
+    } catch { /* best-effort local persistence */ }
+  }
+
+  /** All persisted engine blocks, decoded, sorted by (accountId, index) so opens precede dependents. */
+  async loadAllEngineBlocks(): Promise<EngineBlock[]> {
+    try {
+      const rows = await this.db.getAll('engineblocks');
+      return this.sortEngineBlocks(rows.map(r => decodeBlock(hexToBytes(r.blockHex))));
+    } catch { return []; }
+  }
+
+  /** Engine blocks written after `sinceVersion` (exclusive) — O(new), via byEngVersion index. */
+  async loadEngineBlocksSince(sinceVersion: number): Promise<EngineBlock[]> {
+    try {
+      const rows = await (this.db as IDBPDatabase<any>).getAllFromIndex( // eslint-disable-line @typescript-eslint/no-explicit-any
+        'engineblocks', 'byEngVersion', IDBKeyRange.lowerBound(sinceVersion, true),
+      );
+      return this.sortEngineBlocks((rows as NeuronDB['engineblocks'][]).map(r => decodeBlock(hexToBytes(r.blockHex))));
+    } catch { return []; }
+  }
+
+  private sortEngineBlocks(blocks: EngineBlock[]): EngineBlock[] {
+    return blocks.sort((a, b) => a.accountId === b.accountId ? a.index - b.index : (a.accountId < b.accountId ? -1 : 1));
   }
 
   private serializeBlock(block: AccountBlock): Record<string, unknown> {
