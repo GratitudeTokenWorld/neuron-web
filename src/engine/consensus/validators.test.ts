@@ -37,4 +37,13 @@ describe('ValidatorRegistry', () => {
     expect(r.weightOf('a')).toBe(0);
     expect(r.bond('a', 100n).ok).toBe(false); // cannot rebond after slashing
   });
+
+  it('totalWeight sums eligible validators and excludes slashed ones', () => {
+    const r = new ValidatorRegistry();
+    r.bond('a', STAKE_CAP);
+    r.bond('b', STAKE_CAP);
+    expect(r.totalWeight()).toBeCloseTo(r.weightOf('a') + r.weightOf('b'));
+    r.slash('b');
+    expect(r.totalWeight()).toBeCloseTo(r.weightOf('a'));
+  });
 });

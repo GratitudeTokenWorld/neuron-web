@@ -13,6 +13,9 @@ import { checkQuorum, type TypedAttestation, type QuorumPolicy } from '../engine
 import { InMemoryIdentityRegistry, deriveCommitment, type Nullifier } from '../engine/core/identity.js';
 import { getShard, DEFAULT_NUM_SHARDS } from '../engine/core/partition.js';
 import { proveDoubleSpend, verifyDoubleSpend, type DoubleSpendEvidence } from '../engine/consensus/fraud.js';
+import { ValidatorRegistry } from '../engine/consensus/validators.js';
+import { EpochSeeds } from '../engine/consensus/seed.js';
+import type { Hex } from '../engine/core/hash.js';
 
 /**
  * Minimal signer shape the engine block builders need (compressed P-256 pub +
@@ -85,6 +88,20 @@ export class EngineLedger extends EventEmitter {
   private readonly equivocated = new Map<string, DoubleSpendEvidence>();
   /** hash → local apply time, for foreign blocks within the challenge window. Pruned once settled. */
   private readonly appliedAt = new Map<string, number>();
+  /**
+   * Phase 2 step 2 (committee voting): validator set + epoch randomness. Bonding
+   * the free mint (opt-in, locked while bonded) makes an account a shard validator;
+   * its age-weighted weight feeds VRF self-sortition. The epoch seed accumulates
+   * from committee VRF betas — no beacon. Both are recreated on `reset()`.
+   */
+  // Cap bonding at the ledger's actual mint (milli-UNIT scale). The engine's
+  // votingWeight still saturates its √-stake term at the engine-native STAKE_CAP,
+  // so every full-mint validator lands in the flat region with equal stake weight
+  // and AGE is the differentiator — exactly the intended "one human, one
+  // age-weighted vote" shape.
+  private validatorRegistry = new ValidatorRegistry(MINT);
+  private seeds = new EpochSeeds();
+  private epoch = 0;
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -142,7 +159,7 @@ export class EngineLedger extends EventEmitter {
    * Open an account on the engine. Enforces global one-human-one-account dedup via
    * the nullifier and an attestation quorum, then mints the genesis open block.
    */
-  async openAccount(pub: string, keys: SignerKeys, identity: OpenIdentity): Promise<Block> {
+  async openAccount(pub: string, keys: SignerKeys, identity: OpenIdentity, opts?: { bond?: boolean }): Promise<Block> {
     if (this.held.has(pub)) throw new Error('Account already opened');
 
     const commitment = deriveCommitment(identity.nullifier, pub);
@@ -169,6 +186,9 @@ export class EngineLedger extends EventEmitter {
     this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block); // optimistic
+    // Opt-in: bond the free mint to become a shard validator (capped at the mint,
+    // locked while bonded — secures the network instead of being spendable).
+    if (opts?.bond) this.bondStake(pub, MINT);
     return block;
   }
 
@@ -179,7 +199,9 @@ export class EngineLedger extends EventEmitter {
     if (!head) return { error: 'Account not opened' };
     if (amount <= 0) return { error: 'Amount must be positive' };
     const amt = BigInt(Math.round(amount));
-    if (head.balance < amt) return { error: 'Insufficient balance' };
+    // Bonded stake is locked: only the free (un-bonded) balance is spendable.
+    const available = head.balance - this.validatorRegistry.bondedOf(senderPub);
+    if (available < amt) return { error: 'Insufficient balance' };
 
     const h = this.held.get(senderPub)!;
     const block = createBlock(
@@ -314,6 +336,9 @@ export class EngineLedger extends EventEmitter {
     this.equivocated.set(ev.accountId, ev);
     // Void the account's unclaimed sends so no recipient can still claim them.
     for (const [hash, s] of this.unclaimedSends) if (s.fromPub === ev.accountId) this.unclaimedSends.delete(hash);
+    // Slashing: a double-spending validator forfeits its bond (skin in the game).
+    const burned = this.validatorRegistry.slash(ev.accountId);
+    if (burned > 0n) this.emit('validator:slashed', { id: ev.accountId, burned, reason: 'double-spend' });
     this.emit('account:equivocated', ev);
     return true;
   }
@@ -321,6 +346,55 @@ export class EngineLedger extends EventEmitter {
   isEquivocated(pub: string): boolean { return this.equivocated.has(pub); }
   getEquivocationEvidence(pub: string): DoubleSpendEvidence | undefined { return this.equivocated.get(pub); }
   allEquivocationEvidence(): DoubleSpendEvidence[] { return [...this.equivocated.values()]; }
+
+  // ── Validator state + epochs (Phase 2 step 2: committee voting) ───────────────
+
+  /**
+   * Bond stake to become / strengthen a shard validator. Bonded amount is locked
+   * (not spendable via {@link createSend}) and capped at the free mint. Default
+   * amount bonds all currently-free balance up to the cap.
+   */
+  bondStake(pub: string, amount?: bigint): { ok: boolean; reason?: string } {
+    const head = this.getAccountHead(pub);
+    if (!head) return { ok: false, reason: 'account not opened' };
+    if (this.equivocated.has(pub)) return { ok: false, reason: 'account frozen' };
+    const free = head.balance - this.validatorRegistry.bondedOf(pub);
+    const amt = amount ?? free;
+    if (amt <= 0n) return { ok: false, reason: 'nothing to bond' };
+    if (amt > free) return { ok: false, reason: 'amount exceeds free balance' };
+    const r = this.validatorRegistry.bond(pub, amt);
+    if (r.ok) this.emit('validator:bonded', { id: pub, amount: amt, bonded: this.validatorRegistry.bondedOf(pub) });
+    return r;
+  }
+
+  isValidator(pub: string): boolean { return this.validatorRegistry.isValidator(pub); }
+  isSlashed(pub: string): boolean { return this.validatorRegistry.isSlashed(pub); }
+  bondedOf(pub: string): bigint { return this.validatorRegistry.bondedOf(pub); }
+  /** This account's current age-weighted voting weight (0 if not a validator). */
+  validatorWeight(pub: string): number { return this.validatorRegistry.weightOf(pub); }
+  /** Summed validator weight — the sortition denominator (`totalWeight`). */
+  totalValidatorWeight(): number { return this.validatorRegistry.totalWeight(); }
+  /** All currently-eligible validators (for committee sortition over the global pool). */
+  validatorSet(): Hex[] { return this.validatorRegistry.validators(); }
+
+  get currentEpoch(): number { return this.epoch; }
+  /** The seed driving sortition for the current epoch. */
+  currentSeed(): Hex { return this.seeds.seedFor(this.epoch)!; }
+  seedFor(epoch: number): Hex | undefined { return this.seeds.seedFor(epoch); }
+
+  /**
+   * Close the current epoch: fold this epoch's committee VRF `betas` into the seed
+   * chain (→ next epoch's seed) and credit one activity-epoch to each validator that
+   * participated. `activeValidators` defaults to the whole set; the vote layer (V5)
+   * passes only the validators that actually voted so age stays participation-based.
+   */
+  advanceEpoch(betas: readonly Hex[] = [], activeValidators: Iterable<string> = this.validatorRegistry.validators()): number {
+    this.seeds.commit(this.epoch, betas);
+    this.epoch += 1;
+    for (const id of activeValidators) this.validatorRegistry.creditActivity(id, 1);
+    this.emit('epoch:advanced', { epoch: this.epoch, seed: this.seeds.seedFor(this.epoch)! });
+    return this.epoch;
+  }
 
   getUnclaimedForAccount(pub: string): { sendBlockHash: string; fromPub: string; amount: number }[] {
     const out: { sendBlockHash: string; fromPub: string; amount: number }[] = [];
@@ -427,6 +501,11 @@ export class EngineLedger extends EventEmitter {
     this.usernameToPub.clear();
     this.unclaimedSends.clear();
     this.allBlocks.clear();
+    this.equivocated.clear();
+    this.appliedAt.clear();
+    this.validatorRegistry = new ValidatorRegistry(MINT);
+    this.seeds = new EpochSeeds();
+    this.epoch = 0;
   }
   private deferred(feature: string): { error: string } {
     return { error: `${feature} is not available in the engine slice (dApp phase)` };

@@ -106,4 +106,13 @@ export class ValidatorRegistry {
     }
     return out;
   }
+
+  /** Summed voting weight of all eligible validators — the sortition denominator. */
+  totalWeight(): number {
+    let total = 0;
+    for (const [, s] of this.state) {
+      if (!s.slashed && s.bonded >= this.minBond) total += votingWeight(s.bonded, s.activityEpochs);
+    }
+    return total;
+  }
 }
