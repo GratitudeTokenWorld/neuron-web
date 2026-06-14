@@ -18,4 +18,5 @@ coverage/
 .relay-engine-blocks.json
 .relay-keyblobs.json
 .relay-usernames.json
+.relay-operators.json
 reload.log

@@ -112,6 +112,7 @@ import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
 // they round-trip via the bigint-safe codec below and travel as hex on gossip.
 import { encodeBlock, decodeBlock, verifyBlock, type Block as EngineBlock } from '../engine/core/block';
 import { bytesToHex, hexToBytes } from '../engine/core/hash';
+import { sign as engineSign } from '../engine/core/keys';
 
 export const NUM_SYNAPSES = 4;
 
@@ -1451,23 +1452,24 @@ export class Libp2pNetwork extends EventEmitter {
     }
   }
 
-  async clearAll(operatorKeys?: { pub: string; priv: string; epub: string; epriv: string }): Promise<void> {
-    if (this.network === 'mainnet' && !operatorKeys) {
-      console.error('[Libp2p] Mainnet clearAll requires operator keys');
-      return;
-    }
-
+  /**
+   * Reset: always wipes THIS device's local state, and publishes a network reset.
+   * Pass an engine operator signer to authorize wiping the shared relays — the
+   * relay honors the wipe only if `operator.pub` is one of its first-N operators
+   * (others are ignored). Without a signer, the local wipe still happens but no
+   * relay is touched.
+   */
+  async clearAll(engineOperator?: { pub: string; priv: string }): Promise<void> {
     this.generation++;
     this.saveGeneration();
 
-    if (operatorKeys) {
-      const { signData } = await import('../core/crypto');
-      const payload = `generation:${this.generation}`;
-      const signature = await signData(payload, operatorKeys);
-      this.publish(topicGeneration(this.network), { generation: this.generation, signature, operatorPub: operatorKeys.pub });
-    } else {
-      this.publish(topicGeneration(this.network), { generation: this.generation, resetAt: Date.now() });
+    const resetAt = Date.now();
+    const payload: Record<string, unknown> = { generation: this.generation, resetAt };
+    if (engineOperator) {
+      payload.operatorPub = engineOperator.pub;
+      payload.signature = engineSign(`reset:${this.generation}:${resetAt}`, engineOperator.priv);
     }
+    this.publish(topicGeneration(this.network), payload);
 
     try {
       await this.db.clear('blocks');

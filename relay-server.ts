@@ -42,7 +42,7 @@ import { randomBytes, randomUUID } from 'crypto';
 // (imported directly, run via tsx) instead of old face-hash credentials.
 import { createAttestation } from './src/engine/core/attestation.js';
 import { deriveCommitment } from './src/engine/core/identity.js';
-import { publicKeyFromPrivate as enginePublicKeyFromPrivate } from './src/engine/core/keys.js';
+import { publicKeyFromPrivate as enginePublicKeyFromPrivate, verify as engineVerify } from './src/engine/core/keys.js';
 import { bytesToHex, hexToBytes } from './src/engine/core/hash.js';
 // Super-node archival (Slice 4a): the relay persists every engine block it sees
 // (via topic mirroring) and serves delta requests, so account chains are durably
@@ -126,6 +126,11 @@ const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || '.relay-keyblobs.json';
 // Username uniqueness registry (attester-enforced, Phase 3): the first account
 // attested for a username owns it; a later different-account claim is rejected.
 const USERNAMES_FILE = process.env.USERNAMES_FILE || '.relay-usernames.json';
+// The first OPERATOR_COUNT accounts attested become "operators" — the only
+// accounts allowed to wipe this relay's archive (a signed network reset). All
+// other accounts' resets are ignored. Survives wipes (kept like identity keys).
+const OPERATORS_FILE = process.env.OPERATORS_FILE || '.relay-operators.json';
+const OPERATOR_COUNT = 3;
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 // Per-block/per-request archive logs are verbose; gate them behind DEBUG_ARCHIVE=1.
 // Startup ("Loaded N") and reset lines stay unconditional.
@@ -256,6 +261,18 @@ async function saveUsernames() {
   await fs.writeFile(USERNAMES_FILE, JSON.stringify([...usernameRegistry.entries()])).catch(() => {});
 }
 setInterval(() => { saveUsernames().catch(() => {}); }, 5_000);
+
+// ── Operators (Phase 3): first OPERATOR_COUNT accounts attested ───────────────
+let operators = []; // ordered accountIds; only these can wipe the relay
+async function loadOperators() {
+  try { operators = JSON.parse(await fs.readFile(OPERATORS_FILE, 'utf8')); console.log(`[Attester] Loaded ${operators.length} operator(s)`); } catch { operators = []; }
+}
+function recordOperator(accountId) {
+  if (operators.length >= OPERATOR_COUNT || operators.includes(accountId)) return;
+  operators.push(accountId);
+  fs.writeFile(OPERATORS_FILE, JSON.stringify(operators)).catch(() => {});
+  console.log(`[Attester] operator #${operators.length}: ${accountId.slice(0, 12)}…`);
+}
 
 /** Archive a key-blob seen on the keyblobs topic (keep the newest per account). */
 function archiveKeyBlob(blob, network) {
@@ -440,6 +457,7 @@ async function main() {
   console.log(`[Attester] personhood attester pub: ${attester.pub.slice(0, 16)}…`);
   await loadFaceDB();
   await loadUsernames();
+  await loadOperators();
   if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
@@ -589,6 +607,7 @@ async function main() {
         const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
         console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})`);
         if (username) { usernameRegistry.set(username, accountId); usernameDirty = true; } // claim the username
+        recordOperator(accountId); // first OPERATOR_COUNT attested accounts become operators
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ nullifier, attestation, attesterPub: attester.pub }));
 
@@ -868,13 +887,20 @@ async function main() {
       } catch { /* malformed */ }
       return;
     }
-    // Drop the engine archive on a testnet reset so old-gen blocks aren't re-served.
+    // Wipe the relay's data ONLY on a reset signed by an operator (one of the
+    // first OPERATOR_COUNT accounts). Any other account's reset is ignored — a
+    // stray browser can't nuke the shared super-node.
     if (topic.endsWith('/generation')) {
       try {
-        if (typeof JSON.parse(new TextDecoder().decode(msg.data)).resetAt === 'number') {
-          engineBlockStore.clear(); engineStoreDirty = true;
-          console.log('[Archive] Cleared on testnet reset');
-        }
+        const m = JSON.parse(new TextDecoder().decode(msg.data));
+        if (typeof m.resetAt !== 'number') return;
+        const ok = m.operatorPub && operators.includes(m.operatorPub) &&
+          engineVerify(String(m.signature || ''), `reset:${m.generation}:${m.resetAt}`, m.operatorPub);
+        if (!ok) { console.log('[Archive] Ignored reset — not an authorized operator'); return; }
+        engineBlockStore.clear(); engineStoreDirty = true;
+        keyBlobStore.clear(); keyBlobDirty = true;
+        usernameRegistry.clear(); usernameDirty = true;       // free the names; operators list is kept
+        console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}…`);
       } catch { /* malformed */ }
       return;
     }

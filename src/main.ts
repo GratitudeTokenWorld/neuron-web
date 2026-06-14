@@ -1362,7 +1362,11 @@ $('#btnResetChain').addEventListener('click', () => {
 $('#btnResetCancel').addEventListener('click', () => $('#resetDialog').classList.remove('active'));
 $('#btnResetConfirm').addEventListener('click', async () => {
   $('#resetDialog').classList.remove('active');
-  await node.net.clearAll();
+  // Sign the reset with a local account so the relay can authorize a shared wipe.
+  // Only honored if this account is one of the relay's operators (first 3 created);
+  // otherwise just this device is cleared and the shared relays are untouched.
+  const op = localAccounts[0];
+  await node.net.clearAll(op ? engineKeysFromAppPrivate(op.keys.priv) : undefined);
   node.ledger.reset();
   node.storage.resetState();
   if (node.store.isStarted()) await node.store.clearAllContent().catch(() => {});

@@ -39,6 +39,7 @@ or attester key changes the node's identity and breaks the baked bootstrap addre
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
 | `.relay-keyblobs.json` | archived face+PIN-encrypted key-blobs (for peer-independent recovery) | recovery needs a live peer holding the blob until it re-fills |
 | `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
+| `.relay-operators.json` | the first 3 accountIds attested — the only accounts allowed to wipe this relay | anyone could re-claim an operator slot; **kept across wipes** |
 
 ---
 
@@ -159,6 +160,30 @@ tar czf relay-backup-$(date +%F).tgz .relay-peer-id.json .relay-attester-key.jso
   .relay-keyblobs.json .relay-usernames.json
 ```
 The first two are the ones you cannot regenerate.
+
+---
+
+## Resets & operators
+
+The relay's data (engine blocks, key-blobs, usernames) is wiped **only** by a
+network reset **signed by an operator** — the first `OPERATOR_COUNT` (3) accounts
+this relay ever attests, recorded in `.relay-operators.json`. Any other account's
+"Reset Testnet" is **ignored** by the relay (it only clears that user's own
+device). This stops a stray browser from nuking the shared super-node.
+
+- **Establishing operators:** the first 3 accounts created after the relay starts
+  (with an empty operators file) become the operators. Back up `.relay-operators.json`.
+- **Authorized reset:** an operator clicks Reset Testnet from a browser whose
+  *first* local account is that operator account; the client signs the reset and
+  the relay wipes (`[Archive] WIPED by operator …`). The operators list itself is
+  kept across the wipe (so founders stay founders; they recover via their keys).
+- **Bootstrap / manual wipe** (no operators yet, or you want to force one):
+  ```bash
+  pm2 stop neuron-relay
+  rm -f .relay-engine-blocks.json .relay-keyblobs.json .relay-usernames.json
+  # also rm .relay-operators.json to re-elect operators from the next 3 accounts
+  pm2 start neuron-relay
+  ```
 
 ---
 
