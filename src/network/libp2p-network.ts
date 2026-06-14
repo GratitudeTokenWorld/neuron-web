@@ -113,6 +113,7 @@ import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
 import { encodeBlock, decodeBlock, verifyBlock, type Block as EngineBlock } from '../engine/core/block';
 import { bytesToHex, hexToBytes } from '../engine/core/hash';
 import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
+import type { CommitteeVote } from '../engine/consensus/finality';
 
 export const NUM_SYNAPSES = 4;
 
@@ -257,6 +258,11 @@ function topicEngineDeltaReq(network: string, shard: number): string { return `$
 // recipients because they follow the sender's shard (Slice 3 follow-on-demand).
 function engineConflictPrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-conflict/`; }
 function topicEngineConflict(network: string, shard: number): string { return `${engineConflictPrefix(network)}${shard}`; }
+// Phase 2 step 2: committee finality votes, per-shard so traffic is O(committee),
+// never O(network). A vote is a small JSON object (no bigint) carrying its VRF
+// sortition proof — anyone on the shard verifies membership without a coordinator.
+function engineVotePrefix(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/engine-vote/`; }
+function topicEngineVote(network: string, shard: number): string { return `${engineVotePrefix(network)}${shard}`; }
 function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
@@ -678,6 +684,7 @@ export class Libp2pNetwork extends EventEmitter {
       pubsub.subscribe(topicEngineBlocks(this.network, shard));
       pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
       pubsub.subscribe(topicEngineConflict(this.network, shard));
+      pubsub.subscribe(topicEngineVote(this.network, shard));
     }
 
     pubsub.addEventListener('message', (evt) => {
@@ -975,6 +982,16 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
+    // Phase 2 step 2: a committee finality vote. Plain JSON (no bigint); the ledger
+    // re-verifies the VRF sortition proof + signature before counting it.
+    if (topic.startsWith(engineVotePrefix(this.network))) {
+      const vote = decode<Partial<CommitteeVote>>(data);
+      if (vote && vote.blockHash && vote.accountId && vote.pi && vote.sig && typeof vote.seats === 'number') {
+        this.emit('enginevote:received', vote as CommitteeVote);
+      }
+      return;
+    }
+
     if (topic === topicVotes(this.network)) {
       const raw = decode<Record<string, unknown>>(data);
       if (raw.blockHash === null || raw.voterPub === null || raw.signature === null) return;
@@ -1198,6 +1215,7 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicEngineBlocks(this.network, shard));
     pubsub.subscribe(topicEngineDeltaReq(this.network, shard));
     pubsub.subscribe(topicEngineConflict(this.network, shard));
+    pubsub.subscribe(topicEngineVote(this.network, shard));
   }
 
   /** Phase 1: gossip an engine block (hex-encoded, bigint-safe) on its shard topic + persist it. */
@@ -1212,6 +1230,12 @@ export class Libp2pNetwork extends EventEmitter {
   publishEngineConflict(shard: number, a: EngineBlock, b: EngineBlock): void {
     if (!this.running) return;
     this.publish(topicEngineConflict(this.network, shard), { a: bytesToHex(encodeBlock(a)), b: bytesToHex(encodeBlock(b)) });
+  }
+
+  /** Phase 2 step 2: gossip a committee finality vote on its block's shard (O(committee)). */
+  publishEngineVote(vote: CommitteeVote): void {
+    if (!this.running) return;
+    this.publish(topicEngineVote(this.network, vote.shard), vote as unknown as Record<string, unknown>);
   }
 
   publishVote(vote: Vote): void {

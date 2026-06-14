@@ -12,6 +12,7 @@ import { createSnapshot, parseSnapshot, SNAPSHOT_TRIGGER_BYTES } from '../core/s
 import { type Block as EngineBlock } from '../engine/core/block';
 import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
 import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
+import { castCommitteeVote, type CommitteeVote } from '../engine/consensus/finality';
 
 /**
  * Returns a stable per-device ID persisted in localStorage.
@@ -178,6 +179,16 @@ export class NeuronNode extends EventEmitter {
       const { a, b } = d as { a: EngineBlock; b: EngineBlock };
       this.ledger.applyEvidenceFromBlocks(a, b);
     });
+
+    // Phase 2 step 2: committee finality. When a block is added (local or foreign),
+    // any local bonded validator that the VRF sorts onto that block's shard committee
+    // this epoch casts + gossips a vote. Inbound votes are verified + tallied by the
+    // ledger; a 2/3-seat quorum marks the block `final`.
+    this.ledger.on('block:added', (b: unknown) => this.maybeCastCommitteeVotes(b as EngineBlock));
+    this.net.on('enginevote:received', (v: unknown) => {
+      try { this.ledger.applyCommitteeVote(v as CommitteeVote); } catch { /* malformed vote */ }
+    });
+    this.ledger.on('block:final', (d: unknown) => this.emit('block:final', d));
 
     this.net.on('vote:received', async (vote: unknown) => {
       const v = vote as Vote;
@@ -450,6 +461,35 @@ export class NeuronNode extends EventEmitter {
         this.emit('auto:received', { from: block.accountId, amount: Number(block.amount ?? 0) });
       }
     }, CHALLENGE_WINDOW_MS);
+  }
+
+  /**
+   * Phase 2 step 2: for each local bonded validator, run VRF self-sortition for
+   * `block`'s shard this epoch; if it wins any committee seats, cast a signed vote,
+   * count it locally, and gossip it on the shard's vote topic. A non-validator (the
+   * common case) does nothing — zero common-path cost. Per-shard ⇒ O(committee).
+   */
+  private maybeCastCommitteeVotes(block: EngineBlock): void {
+    if (block.shard === undefined) return;
+    const seed = this.ledger.currentSeed();
+    if (!seed) return;
+    const epoch = this.ledger.currentEpoch;
+    const total = this.ledger.totalValidatorWeight();
+    const committeeSize = this.ledger.committeeSize;
+    for (const [pub, keys] of this.localKeys) {
+      if (!this.ledger.isValidator(pub)) continue;
+      let vote: CommitteeVote | null;
+      try {
+        const enginePriv = engineKeysFromAppPrivate(keys.priv).priv;
+        vote = castCommitteeVote(
+          enginePriv, pub, { hash: block.hash, shard: block.shard },
+          seed, epoch, this.ledger.validatorWeight(pub), total, committeeSize,
+        );
+      } catch { continue; }
+      if (!vote) continue; // not sorted onto this committee this epoch
+      this.ledger.applyCommitteeVote(vote); // count our own vote
+      try { this.net.publishEngineVote(vote); } catch { /* best-effort */ }
+    }
   }
 
   // Sweep ledger.unclaimedSends for any sends addressed to local keys and
