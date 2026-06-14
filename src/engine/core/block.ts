@@ -24,7 +24,7 @@ export const GENESIS_PREV: Hex = '0'.repeat(64);
 /** Free mint granted to each verified human on account open (see roadmap economics). */
 export const MINT_AMOUNT = 1_000_000n;
 
-export type BlockType = 'open' | 'send' | 'receive';
+export type BlockType = 'open' | 'send' | 'receive' | 'update';
 
 /** The signed content of a block (everything except the derived root/hash/sig). */
 export interface BlockContent {
@@ -44,6 +44,10 @@ export interface BlockContent {
   sourceHash?: Hex;
   // send/receive
   amount?: bigint;
+  // update-only: a signed metadata patch (username, profile fields, linkedAnchor,
+  // pqPub, …) applied to the account record. String→string keeps the canonical
+  // encoding deterministic and balance-free.
+  updates?: Record<string, string>;
 }
 
 export interface Block extends BlockContent {
@@ -75,6 +79,8 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
   } else if (c.type === 'receive') {
     out.sourceHash = c.sourceHash;
     out.amount = c.amount?.toString();
+  } else if (c.type === 'update') {
+    out.updates = c.updates;
   }
   return out;
 }

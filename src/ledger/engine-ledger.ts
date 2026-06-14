@@ -280,6 +280,52 @@ export class EngineLedger extends EventEmitter {
     return { block };
   }
 
+  /**
+   * Append a signed account-update block: a metadata patch (username, profile,
+   * linkedAnchor, pqPub, …) committed on the account's own chain. Balance is
+   * unchanged, so the update is verifiable + ordered like any other block — this is
+   * the on-chain replacement for the off-chain `account:synced` record write.
+   */
+  async createUpdate(pub: string, updates: Record<string, string>, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    if (!updates || Object.keys(updates).length === 0) return { error: 'No updates provided' };
+
+    const h = this.held.get(pub)!;
+    const block = createBlock(
+      {
+        accountId: pub,
+        index: head.index + 1,
+        type: 'update',
+        previousHash: head.hash,
+        shard: head.shard,
+        timestamp: Date.now(),
+        balance: head.balance, // updates never move balance
+        updates,
+      },
+      keys.priv,
+      h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.applyAccountUpdate(pub, updates);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block };
+  }
+
+  /** Apply a metadata patch to the local account record (username re-indexed). */
+  private applyAccountUpdate(pub: string, updates: Record<string, string>): void {
+    const acc = this.accountsByPub.get(pub);
+    if (acc && typeof updates.username === 'string' && updates.username && updates.username !== acc.username) {
+      this.usernameToPub.delete(acc.username);
+      acc.username = updates.username;
+      this.usernameToPub.set(updates.username, pub);
+    }
+    this.emit('account:updated', { pub, updates });
+  }
+
   // ── Applying remote blocks (from the network) ────────────────────────────────
 
   /**
@@ -317,6 +363,8 @@ export class EngineLedger extends EventEmitter {
       }
       if (block.index !== head.index + 1) return { success: false, error: 'non-sequential' };
       if (block.previousHash !== head.hash) return { success: false, error: 'previousHash mismatch' };
+      // An update carries only metadata — it must never move balance.
+      if (block.type === 'update' && block.balance !== head.balance) return { success: false, error: 'update must preserve balance' };
     }
     if (h.acc.rootWithHex(block.hash) !== block.accumulatorRoot) return { success: false, error: 'accumulator root mismatch' };
     h.acc.append(block.hash);
@@ -326,6 +374,8 @@ export class EngineLedger extends EventEmitter {
       this.unclaimedSends.set(block.hash, { fromPub: block.accountId, toPub: block.recipient, amount: Number(block.amount) });
     } else if (block.type === 'receive' && block.sourceHash) {
       this.unclaimedSends.delete(block.sourceHash);
+    } else if (block.type === 'update' && block.updates) {
+      this.applyAccountUpdate(block.accountId, block.updates);
     }
     this.allBlocks.set(block.hash, block);
     this.appliedAt.set(block.hash, Date.now());  // foreign block enters the challenge window
@@ -613,9 +663,6 @@ export class EngineLedger extends EventEmitter {
   }
   createCall(): { error: string } {
     return this.deferred('Contracts');
-  }
-  createUpdate(): { error: string } {
-    return this.deferred('Account update');
   }
   createStorageRegister(): { error: string } {
     return this.deferred('Storage providers');
