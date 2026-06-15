@@ -22,6 +22,7 @@
 
 import { createLibp2p } from 'libp2p';
 import { webSockets } from '@libp2p/websockets';
+import { WebSockets as WsMatcher, WebSocketsSecure as WssMatcher } from '@multiformats/multiaddr-matcher';
 import { tcp } from '@libp2p/tcp';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@libp2p/yamux';
@@ -684,7 +685,21 @@ async function main() {
         ],
       },
       transports: [
-        webSockets(),
+        // Patch dialFilter so the relay can DIAL another relay's nginx-fronted
+        // address (`/dns4/host/tcp/443/wss/http-path/relay-ws/...`). The default
+        // webSockets dialFilter uses exactMatch and rejects `http-path` multiaddrs,
+        // which breaks relay-to-relay federation across separate boxes (each peer is
+        // reached through nginx/TLS). Mirrors the browser transport patch.
+        (() => {
+          const factory = webSockets();
+          return (components: Parameters<typeof factory>[0]) => {
+            const t = factory(components);
+            (t as unknown as Record<string, unknown>).dialFilter =
+              (mas: import('@multiformats/multiaddr').Multiaddr[]) =>
+                mas.filter(ma => WsMatcher.matches(ma) || WssMatcher.matches(ma));
+            return t;
+          };
+        })(),
         tcp(),
       ],
       connectionEncrypters: [noise()],
