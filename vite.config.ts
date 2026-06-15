@@ -55,7 +55,7 @@ export default defineConfig({
     __BOOTSTRAP_ADDRS__: JSON.stringify([
       ...(process.env.LOCAL_ONLY ? [] : [
         '/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
-        '/dns4/akashicrecords.dev/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWAgfdTJ9v9eJbQXYZ5Uo6wxPWodZJxzFn3vqiCWAhyXJi',
+        '/dns4/akashicrecords.dev/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWGaTPZoVcAno7WVzDG87ywozCnZYm6gHfiH9dBPpuBxN2',
       ]),
       ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
     ]),
