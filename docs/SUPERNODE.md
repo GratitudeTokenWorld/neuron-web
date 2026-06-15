@@ -65,8 +65,6 @@ The current relay is **`relay-server.ts`, run via `tsx`**, and needs `src/engine
 `node_modules`.
 
 ```bash
-# 0. (local) push your commits first — the server pulls from GitHub
-git push origin main
 
 # 1. (server) make the domain folder track the repo, preserving identity/state
 cd /home/admin/domains/neuronweb.org
@@ -78,10 +76,8 @@ git checkout -b main origin/main      # .relay-*.json are gitignored → untouch
 rm -f relay-server.js                 # old runtime; replaced by relay-server.ts
 npm install                           # tsx + engine deps
 
-# 2. stop the old relay (find its PID: ps aux | grep relay-server.js)
-sudo kill <oldpid>
 
-# 3. start the new relay as a NON-ROOT user under pm2
+# 2. start the new relay as a NON-ROOT user under pm2
 pm2 start npm --name neuron-relay -- run relay
 pm2 save
 pm2 logs neuron-relay                 # expect: "Loaded N engine block(s)", "listening on port 9092"
@@ -213,11 +209,72 @@ verify so nothing is trusted.**
   committed, so light clients verify what a super-node serves (`light-verify`). A bad
   holder can only *withhold* (covered by K-redundancy), never forge.
 
-### Not yet implemented (deferred until there are multiple super-nodes)
+### Deferred to the sharded-storage phase (Bucket B)
+Super-node #2 (akashicrecords.dev) is live, but both relays are still **full
+replicas**, so these two only pay off once storage is actually **partitioned across
+many holders** — they are deferred to the Bucket B networking refactor:
 - **DHT discovery (Slice 4b):** `kadDHT` server-mode + `contentRouting.provide/findProviders`
-  to map `shard → holders` in O(log N). With a *single* super-node, clients reach it
-  directly via the baked bootstrap address, so this is unnecessary until node #2.
-- **Per-shard snapshot bootstrap (Slice 4c, optimization):** `createShardSnapshot`/
-  `applyShardSnapshot` over the content CDN, to bootstrap a shard without replaying the
-  full chain. Current recovery uses account-scoped **delta pull**, which suffices until
-  chains get long.
+  to map `shard → holders` in O(log N). With full-replica relays, `findProviders` just
+  returns the relays already in the baked bootstrap list — no new information yet.
+- **Per-shard snapshot bootstrap (Slice 4c):** `createShardSnapshot`/`applyShardSnapshot`
+  over the content CDN. Needs an `EngineLedger → AccountStore` head-proof bridge
+  (accumulator inclusion proofs) — itself B-shaped. A browser only holds own+followed
+  (tiny), so account-scoped **delta pull** already bootstraps it instantly; snapshots
+  matter for *super-node* backfill (see below), not light clients.
+
+---
+
+## Running two super-nodes: redundancy + the two-node test
+
+Two relays give **redundant reachability** (the app bootstraps to both — baked into
+`vite.config.ts` `__BOOTSTRAP_ADDRS__`) and **redundant durability** (each archives
+the network). To make them a true federation:
+
+**1. Reciprocal `PEER_RELAYS`.** Each relay must list the *other* so their GossipSub
+meshes merge (otherwise browsers on relay A can't see relay B's traffic):
+
+```bash
+# on neuronweb.org
+PEER_RELAYS=/dns4/akashicrecords.dev/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWAgfdTJ9v9eJbQXYZ5Uo6wxPWodZJxzFn3vqiCWAhyXJi
+# on akashicrecords.dev
+PEER_RELAYS=/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7
+```
+
+Set in the pm2 env and restart (`pm2 restart neuron-relay --update-env`). After this,
+both relays archive **new** gossip from each other.
+
+**2. One-time history backfill (only if the new relay missed past data).** A fresh
+relay (akashicrecords.dev reports `generation: 0`) only archives gossip seen *after* it
+joined — it does not pull pre-existing history. Until automated relay-to-relay backfill
+lands (Bucket B), copy the archive once:
+
+```bash
+# from neuronweb.org → akashicrecords.dev (relay stopped on the target)
+pm2 stop neuron-relay   # on akashicrecords.dev
+scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-engine-blocks.json  ./
+scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-keyblobs.json       ./
+scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-usernames.json      ./
+pm2 start neuron-relay  # archives merge on load
+```
+(If the network is still early/empty, skip this — there's nothing to backfill.)
+
+**3. Two-node browser validation.** Confirms cross-relay sync end-to-end:
+- Build + deploy the app with both relays in the bootstrap list (already baked).
+- **Browser A** (e.g. via neuronweb.org): create account *alice*, note balance.
+- **Browser B**, different profile/incognito (e.g. via akashicrecords.dev): create *bob*.
+- A sends UNIT → bob. **Expect:** bob's balance updates in Browser B (cross-relay
+  delivery), and on reload both persist. Recover bob on a third wiped browser → balance
+  restored from either relay (redundant durability).
+- *Committee finality* shows `final` only with a real per-shard validator population; a
+  1–2 account testnet stays optimistic `confirmed` (the fraud-proof challenge window is
+  the backstop) — that's expected, not a bug.
+
+### Attester #2 (multi-attester personhood)
+The engine enforces a **k-of-N distinct-attester** quorum on account open
+(`checkQuorum`; tested in `src/ledger/multi-attester.test.ts`). akashicrecords.dev
+already issues personhood attestations (it has a `signingPub`). To require **2-of-2**,
+the *client* must collect an attestation from **both** relays during account creation
+and include both in the open block, and the ledger's `identityPolicy` is set to
+`{ min: 2, requiredTypes: ['personhood'] }`. The client-side collection lands with the
+UI/API refactor (Bucket B); until then the policy stays `min: 1` and a single attester
+is the (known) SPOF.
