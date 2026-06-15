@@ -53,7 +53,10 @@ export default defineConfig({
     // isolated (no production/stale state leaks in). Clients still find the local
     // relay via /relay-info.
     __BOOTSTRAP_ADDRS__: JSON.stringify([
-      ...(process.env.LOCAL_ONLY ? [] : ['/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7']),
+      ...(process.env.LOCAL_ONLY ? [] : [
+        '/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+        '/dns4/akashicrecords.dev/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWAgfdTJ9v9eJbQXYZ5Uo6wxPWodZJxzFn3vqiCWAhyXJi',
+      ]),
       ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
     ]),
   },
