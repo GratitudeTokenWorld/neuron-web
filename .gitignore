@@ -9,14 +9,8 @@ coverage/
 .relay-data/
 *.local
 
-# Relay runtime state — secrets/biometrics, never commit
-.relay-signing-key.json
-.relay-attester-key.json
-.relay-face-db.json
-.relay-face-counts.json
-.relay-peer-id.json
-.relay-engine-blocks.json
-.relay-keyblobs.json
-.relay-usernames.json
-.relay-operators.json
+# Relay runtime state — secrets/biometrics + archives, never commit.
+# Broad glob covers every .relay-* file incl. .relay-generation.json and the
+# atomic-write .tmp/.bak sidecars.
+.relay-*
 reload.log

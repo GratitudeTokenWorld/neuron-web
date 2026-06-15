@@ -170,6 +170,31 @@ const ipVerifyLog = new Map();
  */
 let faceDescriptorDB = [];
 
+/**
+ * Crash-safe atomic file write (data hardening, Tier 1). Writes to a temp file,
+ * fsyncs it, snapshots the previous good copy to `.bak`, then `rename()`s over the
+ * target — rename is atomic, so a reader (or a crash) never sees a half-written
+ * file. `mode` defaults to 0o644; key material passes 0o600. Failures are logged
+ * loudly instead of being silently swallowed, so a full disk can't lose data quietly.
+ */
+async function atomicWrite(file, data, mode = 0o644) {
+  const tmp = `${file}.tmp`;
+  try {
+    const fh = await fs.open(tmp, 'w', mode);
+    try {
+      await fh.writeFile(data);
+      await fh.chmod(mode);   // enforce perms even if tmp pre-existed from a prior crash
+      await fh.sync();        // fsync: durably flush before the rename
+    } finally {
+      await fh.close();
+    }
+    await fs.copyFile(file, `${file}.bak`).catch(() => {}); // rollback point (best-effort; absent on first write)
+    await fs.rename(tmp, file);
+  } catch (e) {
+    console.error(`[Relay] FAILED to persist ${file}: ${e?.message ?? e}`);
+  }
+}
+
 async function loadFaceDB() {
   try {
     faceDescriptorDB = JSON.parse(await fs.readFile(FACE_DB_FILE, 'utf8'));
@@ -178,7 +203,7 @@ async function loadFaceDB() {
 }
 
 async function saveFaceDB() {
-  await fs.writeFile(FACE_DB_FILE, JSON.stringify(faceDescriptorDB)).catch(() => {});
+  await atomicWrite(FACE_DB_FILE, JSON.stringify(faceDescriptorDB));
 }
 
 // ── Engine-block archival (Slice 4a) ──────────────────────────────────────────
@@ -191,15 +216,24 @@ let engineStoreDirty = false;
 async function loadEngineBlocks() {
   try {
     const rows = JSON.parse(await fs.readFile(ENGINE_BLOCKS_FILE, 'utf8'));
-    for (const r of rows) engineBlockStore.set(r.hash, r);
-    console.log(`[Archive] Loaded ${engineBlockStore.size} engine block(s)`);
+    let dropped = 0;
+    for (const r of rows) {
+      // Verify on load (data hardening): re-derive + re-verify each block so a
+      // tampered or corrupted archive entry is dropped, never loaded or served.
+      try {
+        const block = decodeBlock(hexToBytes(r.blockHex));
+        if (block.hash !== r.hash || !verifyBlock(block)) { dropped++; continue; }
+      } catch { dropped++; continue; }
+      engineBlockStore.set(r.hash, r);
+    }
+    console.log(`[Archive] Loaded ${engineBlockStore.size} engine block(s)${dropped ? ` (dropped ${dropped} invalid)` : ''}`);
   } catch { /* no archive yet */ }
 }
 
 async function saveEngineBlocks() {
   if (!engineStoreDirty) return;
   engineStoreDirty = false;
-  await fs.writeFile(ENGINE_BLOCKS_FILE, JSON.stringify([...engineBlockStore.values()])).catch(() => {});
+  await atomicWrite(ENGINE_BLOCKS_FILE, JSON.stringify([...engineBlockStore.values()]));
 }
 // Flush periodically rather than on every block (archival is append-heavy).
 setInterval(() => { saveEngineBlocks().catch(() => {}); }, 5_000);
@@ -242,7 +276,7 @@ async function loadKeyBlobs() {
 async function saveKeyBlobs() {
   if (!keyBlobDirty) return;
   keyBlobDirty = false;
-  await fs.writeFile(KEYBLOBS_FILE, JSON.stringify([...keyBlobStore.values()])).catch(() => {});
+  await atomicWrite(KEYBLOBS_FILE, JSON.stringify([...keyBlobStore.values()]));
 }
 setInterval(() => { saveKeyBlobs().catch(() => {}); }, 5_000);
 
@@ -259,7 +293,7 @@ async function loadUsernames() {
 async function saveUsernames() {
   if (!usernameDirty) return;
   usernameDirty = false;
-  await fs.writeFile(USERNAMES_FILE, JSON.stringify([...usernameRegistry.entries()])).catch(() => {});
+  await atomicWrite(USERNAMES_FILE, JSON.stringify([...usernameRegistry.entries()]));
 }
 setInterval(() => { saveUsernames().catch(() => {}); }, 5_000);
 
@@ -278,7 +312,7 @@ async function loadOperators() {
 function recordOperator(accountId) {
   if (operators.length >= OPERATOR_COUNT || operators.includes(accountId)) return;
   operators.push(accountId);
-  fs.writeFile(OPERATORS_FILE, JSON.stringify(operators)).catch(() => {});
+  atomicWrite(OPERATORS_FILE, JSON.stringify(operators));
   console.log(`[Attester] operator #${operators.length}: ${accountId.slice(0, 12)}…`);
 }
 
@@ -394,7 +428,7 @@ async function loadOrCreateAttesterKey() {
   } catch { /* generate below */ }
   const priv = bytesToHex(randomBytes(32));
   const pub = enginePublicKeyFromPrivate(priv);
-  await fs.writeFile(ATTESTER_KEY_FILE, JSON.stringify({ priv })).catch(() => {});
+  await atomicWrite(ATTESTER_KEY_FILE, JSON.stringify({ priv }), 0o600); // private key — owner-only
   console.log('[Attester] Generated new attester key');
   return { priv, pub };
 }
@@ -414,7 +448,7 @@ async function loadOrCreateSigningKey() {
     );
     const privateJwk = await globalThis.crypto.subtle.exportKey('jwk', pair.privateKey);
     const publicJwk  = await globalThis.crypto.subtle.exportKey('jwk', pair.publicKey);
-    await fs.writeFile(SIGNING_KEY_FILE, JSON.stringify({ private: privateJwk, public: publicJwk }));
+    await atomicWrite(SIGNING_KEY_FILE, JSON.stringify({ private: privateJwk, public: publicJwk }), 0o600); // private key — owner-only
     console.log('[FaceVerify] Generated new signing key pair');
     return { privKey: pair.privateKey, pubKeyStr: Buffer.from(JSON.stringify(publicJwk)).toString('base64') };
   }
@@ -447,9 +481,9 @@ async function loadOrCreatePrivKey() {
     return privateKeyFromRaw(Buffer.from(saved.raw, 'base64'));
   } catch {
     const key = await generateKeyPair('Ed25519');
-    await fs.writeFile(PEER_ID_FILE, JSON.stringify({
+    await atomicWrite(PEER_ID_FILE, JSON.stringify({
       raw: Buffer.from(key.raw).toString('base64'),
-    }));
+    }), 0o600); // private key — owner-only
     console.log(`[Relay] Generated new peer ID: ${peerIdFromPrivateKey(key).toString()}`);
     return key;
   }
@@ -927,7 +961,7 @@ async function main() {
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names; operators list is kept
         currentGeneration = Number(m.generation) || currentGeneration + 1;
-        fs.writeFile(GENERATION_FILE, JSON.stringify(currentGeneration)).catch(() => {});
+        atomicWrite(GENERATION_FILE, JSON.stringify(currentGeneration));
         console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}… → generation ${currentGeneration}`);
       } catch { /* malformed */ }
       return;
