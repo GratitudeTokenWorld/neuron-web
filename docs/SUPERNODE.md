@@ -73,7 +73,6 @@ git init
 git remote add origin https://github.com/GratitudeTokenWorld/neuron-web.git
 git fetch origin
 git checkout -b main origin/main      # .relay-*.json are gitignored → untouched
-rm -f relay-server.js                 # old runtime; replaced by relay-server.ts
 npm install                           # tsx + engine deps
 
 
