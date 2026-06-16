@@ -158,6 +158,46 @@ The first two are the ones you cannot regenerate.
 
 ---
 
+## Data integrity & permissions
+
+The relay is a **cache, not the source of truth** — engine blocks are
+account-signed + accumulator-committed, key-blobs are face+PIN-encrypted, and any
+loss re-derives from clients + gossip + the other super-node. So tampering with a
+store file is mostly *detectable denial*, not theft. On top of that, the relay
+hardens its own persistence (Tier 1):
+
+- **Atomic writes.** Every store file is written via temp → `fsync` → `.bak`
+  snapshot → atomic `rename`, so a crash/power-loss mid-write can't truncate or
+  corrupt it, and a reader never sees a half-written file. The `.tmp`/`.bak`
+  sidecars are gitignored.
+- **Verify-on-load.** The engine-block archive re-decodes + hash/signature-checks
+  every entry on boot; tampered/corrupt blocks are dropped (and counted in the
+  `Loaded N engine block(s) (dropped X invalid)` log line), never served.
+- **Key files are written `0o600`** (owner-only). Files created *before* this
+  landed must be tightened once, by hand:
+  ```bash
+  chmod 600 .relay-attester-key.json .relay-signing-key.json .relay-peer-id.json
+  ```
+  The attester key is consensus-critical (it signs personhood) — guard it, and let
+  **attester #2 / 2-of-2** be the structural defense so one stolen key isn't enough.
+
+**Recommended (optional, not required):** run the relay as a **dedicated non-root
+user**. It contains the blast radius if the process is ever remotely exploited
+(an RCE gets that user's files, not root on the box). It is *not* necessary on a
+dedicated single-purpose box (there's little else to contain, and it doesn't
+protect the attester key either way), and it does **not** require regenerating the
+node — just `adduser`, `chown` the existing relay folder (identity preserved), and
+re-register pm2 under that user. Do it if you ever co-locate other services or want
+defense-in-depth.
+
+**Deferred hardening:** HMAC-tag the non-self-authenticating bookkeeping files
+(`operators`/`usernames`/`generation`) so external/accidental edits are detected
+(Tier 2); migrate the JSON stores to a checksummed, crash-safe LSM store
+(LevelDB/RocksDB or SQLite-WAL) — robustness + TB-scale in one (Tier 3, see
+*Scaling*).
+
+---
+
 ## Resets & operators
 
 A network reset is honored **only** when **signed by an operator** — the first
