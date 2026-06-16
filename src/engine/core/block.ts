@@ -24,7 +24,18 @@ export const GENESIS_PREV: Hex = '0'.repeat(64);
 /** Free mint granted to each verified human on account open (see roadmap economics). */
 export const MINT_AMOUNT = 1_000_000n;
 
-export type BlockType = 'open' | 'send' | 'receive' | 'update';
+export type BlockType =
+  | 'open'
+  | 'send'
+  | 'receive'
+  | 'update'
+  // Native NFTs (Bucket B): an NFT is a small ownership key on the account-chain —
+  // mint binds a token to content (CID) + metadata; send/receive transfer ownership
+  // exactly like a payment (block-lattice, claim-on-receive); burn destroys it.
+  | 'nft-mint'
+  | 'nft-send'
+  | 'nft-receive'
+  | 'nft-burn';
 
 /** The signed content of a block (everything except the derived root/hash/sig). */
 export interface BlockContent {
@@ -48,6 +59,11 @@ export interface BlockContent {
   // pqPub, …) applied to the account record. String→string keeps the canonical
   // encoding deterministic and balance-free.
   updates?: Record<string, string>;
+  // nft-*: token id (all), the content reference (CID) + metadata (mint only).
+  // `recipient` (send) and `sourceHash` (receive) are reused from payments.
+  tokenId?: Hex;
+  contentRef?: string;
+  nftMeta?: Record<string, string>;
 }
 
 export interface Block extends BlockContent {
@@ -81,6 +97,18 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
     out.amount = c.amount?.toString();
   } else if (c.type === 'update') {
     out.updates = c.updates;
+  } else if (c.type === 'nft-mint') {
+    out.tokenId = c.tokenId;
+    out.contentRef = c.contentRef;
+    out.nftMeta = c.nftMeta;
+  } else if (c.type === 'nft-send') {
+    out.tokenId = c.tokenId;
+    out.recipient = c.recipient;
+  } else if (c.type === 'nft-receive') {
+    out.tokenId = c.tokenId;
+    out.sourceHash = c.sourceHash;
+  } else if (c.type === 'nft-burn') {
+    out.tokenId = c.tokenId;
   }
   return out;
 }

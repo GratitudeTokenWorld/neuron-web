@@ -16,7 +16,7 @@ import { proveDoubleSpend, verifyDoubleSpend, type DoubleSpendEvidence } from '.
 import { ValidatorRegistry } from '../engine/consensus/validators.js';
 import { EpochSeeds } from '../engine/consensus/seed.js';
 import { CommitteeFinality, type CommitteeVote, type WeightSource } from '../engine/consensus/finality.js';
-import type { Hex } from '../engine/core/hash.js';
+import { hashHex, utf8ToBytes, type Hex } from '../engine/core/hash.js';
 
 /**
  * Minimal signer shape the engine block builders need (compressed P-256 pub +
@@ -91,6 +91,17 @@ export class EngineLedger extends EventEmitter {
   private readonly identity = new InMemoryIdentityRegistry();
   /** sendBlockHash → unclaimed send, mirroring DAGLedger.unclaimedSends. */
   readonly unclaimedSends = new Map<string, { fromPub: string; toPub: string; amount: number }>();
+  /**
+   * Native NFTs (Bucket B). An NFT is a small ownership key, transferred on the
+   * block-lattice exactly like a payment. `nftOwner` is the ownership index
+   * (tokenId → current owner pub); `nftInfo` holds immutable token data (minter +
+   * content CID + metadata); `unclaimedNftTransfers` mirrors `unclaimedSends` for
+   * in-flight transfers; `burnedNfts` are permanently destroyed.
+   */
+  private readonly nftOwner = new Map<string, string>();
+  private readonly nftInfo = new Map<string, { minter: string; contentRef: string; meta: Record<string, string> }>();
+  private readonly unclaimedNftTransfers = new Map<string, { tokenId: string; fromPub: string; toPub: string }>();
+  private readonly burnedNfts = new Set<string>();
   /**
    * Phase 2 (fraud-proof safety): accounts proven to have equivocated
    * (double-spent). Their chains are frozen — every block is `rejected` and the
@@ -326,6 +337,141 @@ export class EngineLedger extends EventEmitter {
     this.emit('account:updated', { pub, updates });
   }
 
+  // ── Native NFTs (Bucket B) ───────────────────────────────────────────────────
+
+  /** Deterministic, collision-free token id: unique per (minter, chain index, content). */
+  private nftTokenId(minter: string, index: number, contentRef: string): Hex {
+    return hashHex(utf8ToBytes(`nft:${minter}:${index}:${contentRef}`));
+  }
+
+  /** Mint a new NFT bound to `contentRef` (a content CID) + metadata; owner = minter. */
+  async createMintNft(pub: string, contentRef: string, meta: Record<string, string>, keys: SignerKeys): Promise<{ block?: Block; tokenId?: string; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    if (!contentRef) return { error: 'contentRef required' };
+    const h = this.held.get(pub)!;
+    const index = head.index + 1;
+    const tokenId = this.nftTokenId(pub, index, contentRef);
+    const block = createBlock(
+      { accountId: pub, index, type: 'nft-mint', previousHash: head.hash, shard: head.shard,
+        timestamp: Date.now(), balance: head.balance, tokenId, contentRef, nftMeta: meta },
+      keys.priv, h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.applyNftMint(block);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block, tokenId };
+  }
+
+  /** Transfer an owned NFT to a recipient — claimable by them via {@link createReceiveNft}. */
+  async createTransferNft(pub: string, tokenId: string, recipientIdentifier: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    const recipientPub = this.resolveToPublicKey(recipientIdentifier);
+    if (!recipientPub) return { error: 'Recipient not found' };
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    if (this.nftOwner.get(tokenId) !== pub) return { error: 'You do not own this NFT' };
+    const head = this.getAccountHead(pub)!;
+    const h = this.held.get(pub)!;
+    const block = createBlock(
+      { accountId: pub, index: head.index + 1, type: 'nft-send', previousHash: head.hash, shard: head.shard,
+        timestamp: Date.now(), balance: head.balance, tokenId, recipient: recipientPub },
+      keys.priv, h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.applyNftSend(block);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block };
+  }
+
+  /** Claim an incoming NFT transfer — the recipient becomes the owner. */
+  async createReceiveNft(recipientPub: string, nftSendHash: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    const unclaimed = this.unclaimedNftTransfers.get(nftSendHash);
+    if (!unclaimed) return { error: 'NFT transfer not found or already claimed' };
+    if (unclaimed.toPub !== recipientPub) return { error: 'This NFT is not addressed to you' };
+    const head = this.getAccountHead(recipientPub);
+    if (!head) return { error: 'Account not opened' };
+    const h = this.held.get(recipientPub)!;
+    const block = createBlock(
+      { accountId: recipientPub, index: head.index + 1, type: 'nft-receive', previousHash: head.hash, shard: head.shard,
+        timestamp: Date.now(), balance: head.balance, tokenId: unclaimed.tokenId, sourceHash: nftSendHash },
+      keys.priv, h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.applyNftReceive(block);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block };
+  }
+
+  /** Permanently destroy an owned NFT. */
+  async createBurnNft(pub: string, tokenId: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    if (this.nftOwner.get(tokenId) !== pub) return { error: 'You do not own this NFT' };
+    const head = this.getAccountHead(pub)!;
+    const h = this.held.get(pub)!;
+    const block = createBlock(
+      { accountId: pub, index: head.index + 1, type: 'nft-burn', previousHash: head.hash, shard: head.shard,
+        timestamp: Date.now(), balance: head.balance, tokenId },
+      keys.priv, h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.applyNftBurn(block);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block };
+  }
+
+  // Apply helpers — shared by local create + foreign addBlock so both paths agree.
+  private applyNftMint(b: Block): void {
+    if (!b.tokenId || !b.contentRef) return;
+    this.nftOwner.set(b.tokenId, b.accountId);
+    this.nftInfo.set(b.tokenId, { minter: b.accountId, contentRef: b.contentRef, meta: b.nftMeta ?? {} });
+    this.emit('nft:minted', { tokenId: b.tokenId, owner: b.accountId });
+  }
+  private applyNftSend(b: Block): void {
+    if (!b.tokenId || !b.recipient) return;
+    this.nftOwner.delete(b.tokenId); // in flight until the recipient claims it
+    this.unclaimedNftTransfers.set(b.hash, { tokenId: b.tokenId, fromPub: b.accountId, toPub: b.recipient });
+  }
+  private applyNftReceive(b: Block): void {
+    if (!b.tokenId) return;
+    if (b.sourceHash) this.unclaimedNftTransfers.delete(b.sourceHash);
+    this.nftOwner.set(b.tokenId, b.accountId);
+    this.emit('nft:transferred', { tokenId: b.tokenId, owner: b.accountId });
+  }
+  private applyNftBurn(b: Block): void {
+    if (!b.tokenId) return;
+    this.burnedNfts.add(b.tokenId);
+    this.nftOwner.delete(b.tokenId);
+    this.emit('nft:burned', { tokenId: b.tokenId });
+  }
+
+  getNftOwner(tokenId: string): string | undefined { return this.nftOwner.get(tokenId); }
+  getNftInfo(tokenId: string): { minter: string; contentRef: string; meta: Record<string, string> } | undefined { return this.nftInfo.get(tokenId); }
+  isNftBurned(tokenId: string): boolean { return this.burnedNfts.has(tokenId); }
+  /** All NFTs currently owned by `pub` (with their content + metadata). */
+  getNftsOwnedBy(pub: string): { tokenId: string; contentRef: string; meta: Record<string, string>; minter: string }[] {
+    const out: { tokenId: string; contentRef: string; meta: Record<string, string>; minter: string }[] = [];
+    for (const [tokenId, owner] of this.nftOwner) {
+      if (owner !== pub) continue;
+      const info = this.nftInfo.get(tokenId);
+      if (info) out.push({ tokenId, contentRef: info.contentRef, meta: info.meta, minter: info.minter });
+    }
+    return out;
+  }
+  /** Incoming NFT transfers addressed to `pub` that haven't been claimed yet. */
+  getUnclaimedNftsForAccount(pub: string): { nftSendHash: string; tokenId: string; fromPub: string }[] {
+    const out: { nftSendHash: string; tokenId: string; fromPub: string }[] = [];
+    for (const [hash, t] of this.unclaimedNftTransfers) if (t.toPub === pub) out.push({ nftSendHash: hash, tokenId: t.tokenId, fromPub: t.fromPub });
+    return out;
+  }
+
   // ── Applying remote blocks (from the network) ────────────────────────────────
 
   /**
@@ -386,6 +532,36 @@ export class EngineLedger extends EventEmitter {
           return { success: false, error: 'receive does not match source send' };
         }
       }
+      // NFT blocks never move balance, and each has its own ownership invariant.
+      if (block.type === 'nft-mint') {
+        if (block.balance !== head.balance) return { success: false, error: 'nft-mint must preserve balance' };
+        if (!block.tokenId || !block.contentRef) return { success: false, error: 'nft-mint missing token/content' };
+        if (this.nftOwner.has(block.tokenId) || this.nftInfo.has(block.tokenId) || this.burnedNfts.has(block.tokenId)) {
+          return { success: false, error: 'nft tokenId already exists' };
+        }
+      }
+      if (block.type === 'nft-send') {
+        if (block.balance !== head.balance) return { success: false, error: 'nft-send must preserve balance' };
+        if (!block.tokenId || !block.recipient) return { success: false, error: 'nft-send missing token/recipient' };
+        if (this.nftOwner.get(block.tokenId) !== block.accountId) return { success: false, error: 'nft-send: not the owner' };
+      }
+      if (block.type === 'nft-receive') {
+        if (block.balance !== head.balance) return { success: false, error: 'nft-receive must preserve balance' };
+        if (!block.tokenId || !block.sourceHash) return { success: false, error: 'nft-receive missing token/source' };
+        // Validate against the source nft-send when we hold it (catches a forged
+        // claim). If absent (cross-account ordering), apply optimistically — the
+        // recipient's own node always holds the source; other nodes converge as it
+        // propagates, and a holder of the source rejects any forgery.
+        const src = this.allBlocks.get(block.sourceHash);
+        if (src && (src.type !== 'nft-send' || src.recipient !== block.accountId || src.tokenId !== block.tokenId)) {
+          return { success: false, error: 'nft-receive does not match source' };
+        }
+      }
+      if (block.type === 'nft-burn') {
+        if (block.balance !== head.balance) return { success: false, error: 'nft-burn must preserve balance' };
+        if (!block.tokenId) return { success: false, error: 'nft-burn missing token' };
+        if (this.nftOwner.get(block.tokenId) !== block.accountId) return { success: false, error: 'nft-burn: not the owner' };
+      }
     }
     if (h.acc.rootWithHex(block.hash) !== block.accumulatorRoot) return { success: false, error: 'accumulator root mismatch' };
     h.acc.append(block.hash);
@@ -397,6 +573,14 @@ export class EngineLedger extends EventEmitter {
       this.unclaimedSends.delete(block.sourceHash);
     } else if (block.type === 'update' && block.updates) {
       this.applyAccountUpdate(block.accountId, block.updates);
+    } else if (block.type === 'nft-mint') {
+      this.applyNftMint(block);
+    } else if (block.type === 'nft-send') {
+      this.applyNftSend(block);
+    } else if (block.type === 'nft-receive') {
+      this.applyNftReceive(block);
+    } else if (block.type === 'nft-burn') {
+      this.applyNftBurn(block);
     }
     this.allBlocks.set(block.hash, block);
     this.appliedAt.set(block.hash, Date.now());  // foreign block enters the challenge window
@@ -431,8 +615,9 @@ export class EngineLedger extends EventEmitter {
   private freezeEquivocator(ev: DoubleSpendEvidence): boolean {
     if (this.equivocated.has(ev.accountId)) return false;  // already frozen
     this.equivocated.set(ev.accountId, ev);
-    // Void the account's unclaimed sends so no recipient can still claim them.
+    // Void the account's unclaimed sends + NFT transfers so nothing can still be claimed.
     for (const [hash, s] of this.unclaimedSends) if (s.fromPub === ev.accountId) this.unclaimedSends.delete(hash);
+    for (const [hash, t] of this.unclaimedNftTransfers) if (t.fromPub === ev.accountId) this.unclaimedNftTransfers.delete(hash);
     // Slashing: a double-spending validator forfeits its bond (skin in the game).
     const burned = this.validatorRegistry.slash(ev.accountId);
     if (burned > 0n) this.emit('validator:slashed', { id: ev.accountId, burned, reason: 'double-spend' });
@@ -667,6 +852,10 @@ export class EngineLedger extends EventEmitter {
     this.accountsByPub.clear();
     this.usernameToPub.clear();
     this.unclaimedSends.clear();
+    this.nftOwner.clear();
+    this.nftInfo.clear();
+    this.unclaimedNftTransfers.clear();
+    this.burnedNfts.clear();
     this.allBlocks.clear();
     this.equivocated.clear();
     this.appliedAt.clear();
