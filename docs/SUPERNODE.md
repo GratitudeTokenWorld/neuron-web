@@ -68,7 +68,6 @@ The current relay is **`relay-server.ts`, run via `tsx`**, and needs `src/engine
 
 # 1. (server) make the domain folder track the repo, preserving identity/state
 cd /home/admin/domains/neuronweb.org
-mkdir -p ~/relay-keys-backup && cp .relay-*.json ~/relay-keys-backup/ 2>/dev/null
 git init
 git remote add origin https://github.com/GratitudeTokenWorld/neuron-web.git
 git fetch origin
@@ -195,6 +194,67 @@ defense-in-depth.
 (Tier 2); migrate the JSON stores to a checksummed, crash-safe LSM store
 (LevelDB/RocksDB or SQLite-WAL) — robustness + TB-scale in one (Tier 3, see
 *Scaling*).
+
+---
+
+## Operational hardening (logs, memory, limits)
+
+These keep the box healthy under load **without** capping how large the network
+can grow — every limit below is either a *safety backstop* (triggers only on a
+leak/crash) or *per-IP* (stops one abuser; more users = more IPs, so it never
+throttles legitimate growth). The relay is also designed to scale **horizontally**
+(add more relays), not by uncapping a single box.
+
+**1. Log rotation** (pm2 logs grow unbounded otherwise — eventual disk-fill = outage):
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 50M
+pm2 set pm2-logrotate:retain 10
+pm2 set pm2-logrotate:compress true
+```
+(Per-block/per-request archive logging is already quiet unless `DEBUG_ARCHIVE=1`.)
+
+**2. Memory backstop via the ecosystem file** (`ecosystem.config.cjs`, committed).
+`max_memory_restart` is a runaway/leak backstop, **not** a throughput cap — it
+never throttles requests/connections. Migrate from the bare `pm2 start npm …` to it:
+```bash
+export PEER_RELAYS="/dns4/<other-relay>/tcp/443/wss/http-path/relay-ws/p2p/<id>"
+export RELAY_MAX_MEMORY=1G        # tune to ≈70–80% of box RAM
+pm2 delete neuron-relay
+pm2 start ecosystem.config.cjs && pm2 save
+```
+The real fix for memory-at-scale is the on-disk LSM store (Tier 3 / *Scaling*), not
+a tighter cap.
+
+**3. Raise the file-descriptor limit** (this *helps* scaling — libp2p opens many
+fds; the default 1024 is exhausted as connections grow):
+```bash
+# add to /etc/security/limits.conf (or the relay user's systemd unit):
+#   <user>  soft  nofile  65535
+#   <user>  hard  nofile  65535
+ulimit -n        # verify in the relay's shell after re-login
+```
+
+**4. Per-IP request limiting at nginx (optional, scaling-safe).** Caps a single
+abusive IP, not total throughput. Keep the rates generous:
+```nginx
+# http{} block:
+limit_req_zone  $binary_remote_addr zone=relay:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=relayconn:10m;
+# inside the 443 server{}:
+limit_req  zone=relay  burst=40 nodelay;
+limit_conn relayconn 50;
+```
+Tune up if legitimate clients ever hit it. Do **not** add a global (non-per-IP)
+cap — that *would* limit network growth.
+
+**5. Health + disk monitoring.** A simple external check on `/relay-info`
+(uptime) plus a disk-space alert catches the two most common silent failures.
+`certbot renew --dry-run` once to confirm TLS auto-renewal is armed.
+
+**Knobs to raise as you grow (not now):** `maxReservations` (1024 browser
+circuits/relay) and the per-circuit data limit — raise these, or better, add more
+relays, when a single box approaches saturation.
 
 ---
 
