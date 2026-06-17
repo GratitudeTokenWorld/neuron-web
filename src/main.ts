@@ -1214,12 +1214,21 @@ async function autoClaimPending(): Promise<void> {
   autoClaimRunning = true;
   try {
     for (const acc of localAccounts) {
-      const unclaimed = node.ledger.getUnclaimedForAccount(acc.pub);
-      for (const u of unclaimed) {
+      // Payments
+      for (const u of node.ledger.getUnclaimedForAccount(acc.pub)) {
         const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, engineSigner(acc));
         if (result.block) {
           await node.submitBlock(result.block);
           addLog(`Auto-claimed ${formatUNIT(u.amount)} UNIT from ${resolveNamePlain(u.fromPub)}`, 'success');
+        }
+      }
+      // NFTs (claim-on-receive, same as payments — needed for same-browser transfers
+      // where there's no inbound gossip to trigger the node's auto-receive).
+      for (const u of node.ledger.getUnclaimedNftsForAccount(acc.pub)) {
+        const result = await node.ledger.createReceiveNft(acc.pub, u.nftSendHash, engineSigner(acc));
+        if (result.block) {
+          await node.submitBlock(result.block);
+          addLog(`Auto-claimed NFT from ${resolveNamePlain(u.fromPub)}`, 'success');
         }
       }
     }
