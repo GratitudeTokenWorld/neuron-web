@@ -513,7 +513,10 @@ async function main() {
     if (req.url?.startsWith('/face-verify')) {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      // Must include x-network: the client sends it on /face-verify requests, so a
+      // cross-origin attestation (to a SECOND relay) preflights against this list.
+      // Omitting it silently blocks cross-relay face-verify → only 1 attester (B4).
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-network');
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
     }
 
