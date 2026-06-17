@@ -102,6 +102,14 @@ export class EngineLedger extends EventEmitter {
   /** sendBlockHash → unclaimed send, mirroring DAGLedger.unclaimedSends. */
   readonly unclaimedSends = new Map<string, { fromPub: string; toPub: string; amount: number }>();
   /**
+   * sourceHashes that a receive has already claimed. Needed because blocks can
+   * replay in any cross-account order: if a receive applies BEFORE its source send,
+   * the send would otherwise re-add itself as unclaimed and get claimed a second
+   * time (double-spend). A send is only ever offered as unclaimed if NOT here.
+   */
+  private readonly claimedSends = new Set<string>();
+  private readonly claimedNftTransfers = new Set<string>();
+  /**
    * Native NFTs (Bucket B). An NFT is a small ownership key, transferred on the
    * block-lattice exactly like a payment. `nftOwner` is the ownership index
    * (tokenId → current owner pub); `nftInfo` holds immutable token data (minter +
@@ -297,6 +305,7 @@ export class EngineLedger extends EventEmitter {
       h.acc,
     );
     h.chain.push(block);
+    this.claimedSends.add(sendBlockHash);
     this.unclaimedSends.delete(sendBlockHash);
     this.allBlocks.set(block.hash, block);
     this.emit('block:added', block);
@@ -451,12 +460,16 @@ export class EngineLedger extends EventEmitter {
   }
   private applyNftSend(b: Block): void {
     if (!b.tokenId || !b.recipient) return;
-    this.nftOwner.delete(b.tokenId); // in flight until the recipient claims it
-    this.unclaimedNftTransfers.set(b.hash, { tokenId: b.tokenId, fromPub: b.accountId, toPub: b.recipient });
+    // Only strip ownership if the sender still owns it — a send replayed AFTER its
+    // receive must not clobber the recipient's ownership (cross-account order).
+    if (this.nftOwner.get(b.tokenId) === b.accountId) this.nftOwner.delete(b.tokenId);
+    if (!this.claimedNftTransfers.has(b.hash)) {
+      this.unclaimedNftTransfers.set(b.hash, { tokenId: b.tokenId, fromPub: b.accountId, toPub: b.recipient });
+    }
   }
   private applyNftReceive(b: Block): void {
     if (!b.tokenId) return;
-    if (b.sourceHash) this.unclaimedNftTransfers.delete(b.sourceHash);
+    if (b.sourceHash) { this.claimedNftTransfers.add(b.sourceHash); this.unclaimedNftTransfers.delete(b.sourceHash); }
     this.nftOwner.set(b.tokenId, b.accountId);
     this.emit('nft:transferred', { tokenId: b.tokenId, owner: b.accountId });
   }
@@ -558,7 +571,11 @@ export class EngineLedger extends EventEmitter {
       if (block.type === 'nft-send') {
         if (block.balance !== head.balance) return { success: false, error: 'nft-send must preserve balance' };
         if (!block.tokenId || !block.recipient) return { success: false, error: 'nft-send missing token/recipient' };
-        if (this.nftOwner.get(block.tokenId) !== block.accountId) return { success: false, error: 'nft-send: not the owner' };
+        // Owner — OR already claimed by a receive that replayed first (cross-account
+        // order). A genuine non-owner forgery is neither, so it's still rejected.
+        if (this.nftOwner.get(block.tokenId) !== block.accountId && !this.claimedNftTransfers.has(block.hash)) {
+          return { success: false, error: 'nft-send: not the owner' };
+        }
       }
       if (block.type === 'nft-receive') {
         if (block.balance !== head.balance) return { success: false, error: 'nft-receive must preserve balance' };
@@ -583,8 +600,12 @@ export class EngineLedger extends EventEmitter {
     h.chain.push(block);
 
     if (block.type === 'send' && block.recipient && block.amount !== undefined) {
-      this.unclaimedSends.set(block.hash, { fromPub: block.accountId, toPub: block.recipient, amount: Number(block.amount) });
+      // Only offer as unclaimed if a receive hasn't already claimed it (replay order).
+      if (!this.claimedSends.has(block.hash)) {
+        this.unclaimedSends.set(block.hash, { fromPub: block.accountId, toPub: block.recipient, amount: Number(block.amount) });
+      }
     } else if (block.type === 'receive' && block.sourceHash) {
+      this.claimedSends.add(block.sourceHash);
       this.unclaimedSends.delete(block.sourceHash);
     } else if (block.type === 'update' && block.updates) {
       this.applyAccountUpdate(block.accountId, block.updates);
@@ -867,6 +888,8 @@ export class EngineLedger extends EventEmitter {
     this.accountsByPub.clear();
     this.usernameToPub.clear();
     this.unclaimedSends.clear();
+    this.claimedSends.clear();
+    this.claimedNftTransfers.clear();
     this.nftOwner.clear();
     this.nftInfo.clear();
     this.unclaimedNftTransfers.clear();
