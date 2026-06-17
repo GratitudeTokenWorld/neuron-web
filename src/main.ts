@@ -60,13 +60,30 @@ function blockAmount(b: AnyBlock): number {
 }
 /** For a receive block, the account that sent it (resolved via the source send block). */
 function blockSender(b: AnyBlock): string {
+  if (b.senderPub) return String(b.senderPub);   // engine: denormalized onto the receive
+  if (b.sendFrom) return String(b.sendFrom);       // legacy AccountBlock
   const src = b.sourceHash ?? b.sendBlockHash;
-  if (b.sendFrom) return String(b.sendFrom);
   if (typeof src === 'string') {
     const send = node.ledger.getBlock(src) as AnyBlock | undefined;
     if (send) return blockAccount(send);
   }
   return '';
+}
+
+/**
+ * HTML-safe display for a receive's sender: the live username if we hold the
+ * account record, else the point-in-time `senderName` snapshot carried on the
+ * block (so it shows "from alice" even without holding the sender's chain), else
+ * the pub. Fixes the "from –" gap from the interest-scoped (own+followed) model.
+ */
+function senderDisplay(b: AnyBlock): string {
+  const pub = blockSender(b);
+  if (pub) {
+    const known = localAccounts.some(a => a.pub === pub) || node.ledger.accounts.has(pub);
+    if (known) return resolveName(pub);
+  }
+  if (b.senderName) return escHtml(String(b.senderName));
+  return pub ? resolveName(pub) : '?';
 }
 let cameraStream: MediaStream | null = null;
 let isRecovering = false;
@@ -654,7 +671,7 @@ function showAccountDetail(pub: string) {
     let detail2 = '-';
     const eb = b as unknown as AnyBlock;
     if (b.type === 'send') detail2 = `→ ${resolveName(String(eb.recipient ?? ''))} ${formatUNIT(blockAmount(eb))} UNIT`;
-    else if (b.type === 'receive') detail2 = `← ${resolveName(blockSender(eb))} +${formatUNIT(blockAmount(eb))} UNIT`;
+    else if (b.type === 'receive') detail2 = `← ${senderDisplay(eb)} +${formatUNIT(blockAmount(eb))} UNIT`;
     else if (b.type === 'open') detail2 = `+${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT (genesis)`;
     else if (b.type === 'deploy' && b.contractData) { try { const d = JSON.parse(b.contractData) as { name?: string }; detail2 = escHtml(d.name || 'contract'); } catch { /**/ } }
     else if (b.type === 'call' && b.contractData) { try { const d = JSON.parse(b.contractData) as { contractId: string; method: string }; const c = node.ledger.contracts.get(d.contractId); detail2 = `${escHtml(c?.name ?? trunc(d.contractId))}.${escHtml(d.method)}()`; } catch { /**/ } }
@@ -1230,7 +1247,7 @@ function renderExplorerRow(b: AccountBlock): string {
     counterparty = resolveName(String(eb.recipient ?? ''));
     amount = formatUNIT(blockAmount(eb));
   } else if (b.type === 'receive') {
-    counterparty = resolveName(blockSender(eb));
+    counterparty = senderDisplay(eb);
     amount = formatUNIT(blockAmount(eb));
   } else if (b.type === 'open') {
     amount = formatUNIT(VERIFICATION_MINT_AMOUNT);

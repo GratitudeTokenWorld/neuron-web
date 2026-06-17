@@ -248,6 +248,7 @@ export class EngineLedger extends EventEmitter {
         balance: head.balance - amt,
         recipient: recipientPub,
         amount: amt,
+        recipientName: this.accountsByPub.get(recipientPub)?.username,
       },
       keys.priv,
       h.acc,
@@ -279,6 +280,8 @@ export class EngineLedger extends EventEmitter {
         balance: head.balance + BigInt(Math.round(unclaimed.amount)),
         sourceHash: sendBlockHash,
         amount: BigInt(Math.round(unclaimed.amount)),
+        senderPub: unclaimed.fromPub,
+        senderName: this.accountsByPub.get(unclaimed.fromPub)?.username,
       },
       keys.priv,
       h.acc,
@@ -376,7 +379,8 @@ export class EngineLedger extends EventEmitter {
     const h = this.held.get(pub)!;
     const block = createBlock(
       { accountId: pub, index: head.index + 1, type: 'nft-send', previousHash: head.hash, shard: head.shard,
-        timestamp: Date.now(), balance: head.balance, tokenId, recipient: recipientPub },
+        timestamp: Date.now(), balance: head.balance, tokenId, recipient: recipientPub,
+        recipientName: this.accountsByPub.get(recipientPub)?.username },
       keys.priv, h.acc,
     );
     h.chain.push(block);
@@ -397,7 +401,8 @@ export class EngineLedger extends EventEmitter {
     const h = this.held.get(recipientPub)!;
     const block = createBlock(
       { accountId: recipientPub, index: head.index + 1, type: 'nft-receive', previousHash: head.hash, shard: head.shard,
-        timestamp: Date.now(), balance: head.balance, tokenId: unclaimed.tokenId, sourceHash: nftSendHash },
+        timestamp: Date.now(), balance: head.balance, tokenId: unclaimed.tokenId, sourceHash: nftSendHash,
+        senderPub: unclaimed.fromPub, senderName: this.accountsByPub.get(unclaimed.fromPub)?.username },
       keys.priv, h.acc,
     );
     h.chain.push(block);

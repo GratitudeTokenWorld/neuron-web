@@ -64,6 +64,15 @@ export interface BlockContent {
   tokenId?: Hex;
   contentRef?: string;
   nftMeta?: Record<string, string>;
+  // Denormalized counterparty for display WITHOUT holding the counterparty's chain
+  // (a recipient discards the sender's chain after claiming — scale invariant). The
+  // pub enables a fresh username lookup when the account record is held; the name is
+  // a point-in-time snapshot fallback (a later rename won't change a past tx record,
+  // like a bank statement). `recipientName` on send/nft-send; `senderPub`+
+  // `senderName` on receive/nft-receive.
+  recipientName?: string;
+  senderPub?: Hex;
+  senderName?: string;
 }
 
 export interface Block extends BlockContent {
@@ -92,9 +101,12 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
   } else if (c.type === 'send') {
     out.recipient = c.recipient;
     out.amount = c.amount?.toString();
+    out.recipientName = c.recipientName;
   } else if (c.type === 'receive') {
     out.sourceHash = c.sourceHash;
     out.amount = c.amount?.toString();
+    out.senderPub = c.senderPub;
+    out.senderName = c.senderName;
   } else if (c.type === 'update') {
     out.updates = c.updates;
   } else if (c.type === 'nft-mint') {
@@ -104,9 +116,12 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
   } else if (c.type === 'nft-send') {
     out.tokenId = c.tokenId;
     out.recipient = c.recipient;
+    out.recipientName = c.recipientName;
   } else if (c.type === 'nft-receive') {
     out.tokenId = c.tokenId;
     out.sourceHash = c.sourceHash;
+    out.senderPub = c.senderPub;
+    out.senderName = c.senderName;
   } else if (c.type === 'nft-burn') {
     out.tokenId = c.tokenId;
   }
