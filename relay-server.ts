@@ -286,7 +286,10 @@ let usernameDirty = false;
 
 async function loadUsernames() {
   try {
-    for (const [u, a] of JSON.parse(await fs.readFile(USERNAMES_FILE, 'utf8'))) usernameRegistry.set(u, a);
+    for (const [u, v] of JSON.parse(await fs.readFile(USERNAMES_FILE, 'utf8'))) {
+      // username → { accountId, nid }. Normalize the old string-only format.
+      usernameRegistry.set(u, typeof v === 'string' ? { accountId: v, nid: undefined } : v);
+    }
     console.log(`[Attester] Loaded ${usernameRegistry.size} username(s)`);
   } catch { /* none yet */ }
 }
@@ -574,15 +577,10 @@ async function main() {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'accountId (engine pubkey) required' })); return;
         }
-        // Username uniqueness (fail fast, before consuming the challenge/face).
+        // Username uniqueness is checked BY HUMAN below (after the face match gives us
+        // the nid), not by throwaway accountId — so an abandoned attempt can't orphan
+        // the name. Just capture it here.
         const username = String(body.username || '').trim().toLowerCase();
-        if (username) {
-          const owner = usernameRegistry.get(username);
-          if (owner && owner !== accountId) {
-            res.writeHead(409, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'username taken' })); return;
-          }
-        }
 
         // Derive the Map key once and use it for every lookup/delete so they can't diverge
         // (set/get/delete must agree, else a used or expired session leaks and survives).
@@ -627,34 +625,52 @@ async function main() {
           res.end(JSON.stringify({ error: `Face limit reached (${faceCount}/${faceMax} on ${network})` })); return;
         }
 
-        session.used = true;
-        recordIpVerification(ip);
-
-        // Each face entry has a STABLE nullifier id (assigned once). The per-account
-        // nullifier is `<nid>#<index>`, so up to faceMax accounts per face get distinct,
-        // globally-unique nullifiers (testnet=3 for dev; mainnet=1 → true one-human-one-account).
+        // STABLE per-human id (nid) for this face — assigned once, before any state is
+        // consumed, so the username check below is by-human.
         let nid;
         if (matchedFace) {
           if (!matchedFace.nid) matchedFace.nid = randomUUID();
           nid = matchedFace.nid;
+        } else {
+          nid = randomUUID();
+        }
+
+        // Username uniqueness BY HUMAN: the name belongs to a face (nid), not a
+        // throwaway accountId. The SAME human may (re)claim it — a retry or a new
+        // account — but a DIFFERENT human is rejected. This stops an abandoned attempt
+        // (e.g. one that failed the 2-attester quorum client-side) from orphaning the
+        // name and permanently blocking the retry.
+        if (username) {
+          const existing = usernameRegistry.get(username);
+          if (existing && existing.nid && existing.nid !== nid) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'username taken' })); return;
+          }
+        }
+
+        // All checks passed — now consume the session + commit the face.
+        session.used = true;
+        recordIpVerification(ip);
+        if (matchedFace) {
           matchedFace.count++;
           // Update centroid so future sessions compare against a current reference.
           for (let i = 0; i < 128; i++) {
             matchedFace.descriptor[i] = (matchedFace.descriptor[i] + descriptor[i]) / 2;
           }
         } else {
-          nid = randomUUID();
           faceDescriptorDB.push({ descriptor: Array.from(descriptor), count: 1, network, nid });
         }
         await saveFaceDB();
 
         // Issue an ENGINE attestation: sign a personhood claim over the identity
         // commitment that binds this human (nullifier) to this account (accountId).
+        // The per-account nullifier is `<nid>#<index>`, so up to faceMax accounts per
+        // face get distinct, globally-unique nullifiers (testnet=3; mainnet=1).
         const nullifier = `${nid}#${faceCount}`;
         const commitment = deriveCommitment(nullifier, accountId);
         const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
         console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})`);
-        if (username) { usernameRegistry.set(username, accountId); usernameDirty = true; } // claim the username
+        if (username) { usernameRegistry.set(username, { accountId, nid }); usernameDirty = true; } // claim for this human
         recordOperator(accountId); // first OPERATOR_COUNT attested accounts become operators
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ nullifier, attestation, attesterPub: attester.pub }));
