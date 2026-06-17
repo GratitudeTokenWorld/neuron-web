@@ -446,19 +446,25 @@ export class NeuronNode extends EventEmitter {
   }
 
   private async autoReceiveEngine(block: EngineBlock): Promise<void> {
-    if (block.type !== 'send' || !block.recipient) return;
+    if (block.type !== 'send' && block.type !== 'nft-send') return;
+    if (!block.recipient) return;
     const appKeys = this.localKeys.get(block.recipient); // localKeys is keyed by engine accountId
     if (!appKeys) return; // not addressed to a local account
     const signer = engineKeysFromAppPrivate(appKeys.priv);
-    // Recipient-witnessed finality: wait the challenge window, then finalize ONLY
-    // if the sender hasn't been proven to double-spend in the meantime.
+    const isNft = block.type === 'nft-send';
+    // Recipient-witnessed finality: wait the challenge window, then claim ONLY if
+    // the sender hasn't been proven to double-spend in the meantime. NFTs claim the
+    // same way payments do (block-lattice send → receive).
     setTimeout(async () => {
       if (this.ledger.isEquivocated(block.accountId)) return; // sender double-spent → don't honor
-      const result = await this.ledger.createReceive(block.recipient!, block.hash, signer);
+      const result = isNft
+        ? await this.ledger.createReceiveNft(block.recipient!, block.hash, signer)
+        : await this.ledger.createReceive(block.recipient!, block.hash, signer);
       if (result.block) {
         this.ledger.addBlock(result.block);
         this.net.publishEngineBlock(result.block);
-        this.emit('auto:received', { from: block.accountId, amount: Number(block.amount ?? 0) });
+        if (isNft) this.emit('nft:received', { from: block.accountId, tokenId: block.tokenId });
+        else this.emit('auto:received', { from: block.accountId, amount: Number(block.amount ?? 0) });
       }
     }, CHALLENGE_WINDOW_MS);
   }

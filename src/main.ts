@@ -617,17 +617,12 @@ function showAccountDetail(pub: string) {
     }
   }
 
-  // NFTs owned
+  // NFTs owned (native)
   const nftRows: string[] = [];
-  for (const [contractId, contract] of node.ledger.contracts) {
-    const state = contract.state as Record<string, unknown>;
-    if (!state.tokens || typeof state.tokens !== 'object') continue;
-    const tokens = state.tokens as Record<string, { owner: string; metadata?: unknown; cid?: string }>;
-    for (const [tokenId, token] of Object.entries(tokens)) {
-      if (token.owner !== pub) continue;
-      const meta = typeof token.metadata === 'string' ? token.metadata : JSON.stringify(token.metadata ?? '');
-      nftRows.push(`<tr><td>#${escHtml(tokenId)}</td><td><a class="explorer-contract-link" style="cursor:pointer;color:var(--primary);text-decoration:underline;" data-contract-id="${escHtml(contractId)}">${escHtml(contract.name)}</a></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(meta)}">${escHtml(meta)}</td><td>${token.cid ? escHtml(trunc(token.cid, 16)) : '-'}</td></tr>`);
-    }
+  for (const nft of node.ledger.getNftsOwnedBy(pub)) {
+    const name = nft.meta.name ?? '(unnamed)';
+    const metaStr = Object.entries(nft.meta).filter(([k]) => k !== 'name').map(([k, v]) => `${k}=${v}`).join(', ') || '-';
+    nftRows.push(`<tr><td><span class="hash truncate" title="${escHtml(nft.tokenId)}">${escHtml(trunc(nft.tokenId, 12))}</span></td><td>${escHtml(name)}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(metaStr)}">${escHtml(metaStr)}</td><td><span class="hash truncate" title="${escHtml(nft.contentRef)}">${escHtml(trunc(nft.contentRef, 16))}</span></td></tr>`);
   }
 
   // Contracts deployed
@@ -699,7 +694,7 @@ function showAccountDetail(pub: string) {
     ${nftRows.length > 0 ? `<div class="card" style="margin-top:0;">
       <div class="card-title">NFTs Owned</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>#</th><th>Collection</th><th>Metadata</th><th>CID</th></tr></thead>
+        <thead><tr><th>Token</th><th>Name</th><th>Metadata</th><th>Content</th></tr></thead>
         <tbody>${nftRows.join('')}</tbody>
       </table></div>
     </div>` : ''}
@@ -1117,58 +1112,83 @@ function refreshTxAssets() {
 }
 
 function refreshNFTTransferList() {
-  const localPubs = new Set(localAccounts.map(a => a.pub));
   const rows: string[] = [];
-
-  for (const [contractId, contract] of node.ledger.contracts) {
-    const state = contract.state as Record<string, unknown>;
-    if (!state.tokens || typeof state.tokens !== 'object') continue;
-    const tokens = state.tokens as Record<string, { owner: string; metadata?: unknown; cid?: string }>;
-    for (const [tokenId, token] of Object.entries(tokens)) {
-      if (!localPubs.has(token.owner)) continue;
-      const ownerAcc = localAccounts.find(a => a.pub === token.owner)!;
-      const meta = typeof token.metadata === 'string' ? token.metadata : JSON.stringify(token.metadata ?? '');
-      const cidStr = token.cid ? escHtml(token.cid) : '-';
+  for (const acc of localAccounts) {
+    for (const nft of node.ledger.getNftsOwnedBy(acc.pub)) {
+      const name = nft.meta.name ?? '(unnamed)';
+      const metaStr = Object.entries(nft.meta).filter(([k]) => k !== 'name').map(([k, v]) => `${k}=${v}`).join(', ') || '-';
       rows.push(`<tr>
-        <td>#${escHtml(tokenId)}</td>
-        <td title="${escHtml(contractId)}">${escHtml(contract.name)}</td>
-        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(meta)}">${escHtml(meta)}</td>
-        <td><span class="hash truncate" title="${cidStr}">${cidStr !== '-' ? trunc(cidStr, 16) : '-'}</span></td>
-        <td>${escHtml(ownerAcc.username)}</td>
-        <td><button class="btn btn-outline btn-nft-xfer"
-          data-contract="${escHtml(contractId)}"
-          data-token="${escHtml(tokenId)}"
-          data-from="${escHtml(ownerAcc.pub)}">Transfer</button></td>
+        <td><span class="hash truncate" title="${escHtml(nft.tokenId)}">${escHtml(trunc(nft.tokenId, 12))}</span></td>
+        <td>${escHtml(name)}</td>
+        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(metaStr)}">${escHtml(metaStr)}</td>
+        <td><span class="hash truncate" title="${escHtml(nft.contentRef)}">${escHtml(trunc(nft.contentRef, 16))}</span></td>
+        <td>${escHtml(acc.username)}</td>
+        <td>
+          <button class="btn btn-outline btn-nft-xfer" data-token="${escHtml(nft.tokenId)}" data-from="${escHtml(acc.pub)}">Transfer</button>
+          <button class="btn btn-outline btn-nft-burn" data-token="${escHtml(nft.tokenId)}" data-from="${escHtml(acc.pub)}">Burn</button>
+        </td>
       </tr>`);
     }
   }
 
-  const card = $('#nftTransferCard') as HTMLElement;
   const tbody = $('#nftTransferList');
-  if (rows.length > 0) {
-    tbody.innerHTML = rows.join('');
-    card.style.display = '';
-    tbody.querySelectorAll('.btn-nft-xfer').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const contractId = btn.getAttribute('data-contract')!;
-        const tokenId = parseInt(btn.getAttribute('data-token')!, 10);
-        const fromPub = btn.getAttribute('data-from')!;
-        const acc = localAccounts.find(a => a.pub === fromPub);
-        if (!acc) return;
-        const to = prompt(`Transfer NFT #${tokenId} - enter recipient username or public key:`);
-        if (!to) return;
-        const toPub = node.ledger.resolveToPublicKey(to) ?? to;
-        const result = await node.ledger.createCall(fromPub, contractId, 'transfer', [tokenId, toPub], acc.keys);
-        if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
-        const submit = await node.submitBlock(result.block);
-        if (submit.success) { toast(`NFT #${tokenId} transferred`, 'success'); refreshTransfer(); }
-        else { toast(`Error: ${submit.error}`, 'error'); }
-      });
+  tbody.innerHTML = rows.length > 0
+    ? rows.join('')
+    : `<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:16px;">No NFTs yet — mint one above.</td></tr>`;
+
+  tbody.querySelectorAll('.btn-nft-xfer').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tokenId = btn.getAttribute('data-token')!;
+      const fromPub = btn.getAttribute('data-from')!;
+      const acc = localAccounts.find(a => a.pub === fromPub);
+      if (!acc) return;
+      const to = prompt('Transfer NFT — recipient username or public key:');
+      if (!to) return;
+      const result = await node.ledger.createTransferNft(fromPub, tokenId, to.toLowerCase(), engineSigner(acc));
+      if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
+      const submit = await node.submitBlock(result.block);
+      if (submit.success) { toast('NFT transferred', 'success'); refreshTransfer(); }
+      else { toast(`Error: ${submit.error}`, 'error'); }
     });
-  } else {
-    card.style.display = 'none';
-  }
+  });
+  tbody.querySelectorAll('.btn-nft-burn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tokenId = btn.getAttribute('data-token')!;
+      const fromPub = btn.getAttribute('data-from')!;
+      const acc = localAccounts.find(a => a.pub === fromPub);
+      if (!acc) return;
+      if (!confirm('Permanently burn this NFT? This cannot be undone.')) return;
+      const result = await node.ledger.createBurnNft(fromPub, tokenId, engineSigner(acc));
+      if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
+      const submit = await node.submitBlock(result.block);
+      if (submit.success) { toast('NFT burned', 'success'); refreshTransfer(); }
+      else { toast(`Error: ${submit.error}`, 'error'); }
+    });
+  });
 }
+
+// Mint a native NFT (content/page as an ownership key). Minimal prompt-based flow;
+// a richer upload→CID mint UX can layer on later.
+$('#btnMintNft')?.addEventListener('click', async () => {
+  if (localAccounts.length === 0) { toast('Create an account first', 'error'); return; }
+  let acc = localAccounts[0]!;
+  if (localAccounts.length > 1) {
+    const which = prompt(`Mint from which account?\n${localAccounts.map((a, i) => `${i + 1} = ${a.username}`).join('\n')}`, '1');
+    if (!which) return;
+    const idx = parseInt(which, 10) - 1;
+    if (idx < 0 || idx >= localAccounts.length) return;
+    acc = localAccounts[idx]!;
+  }
+  const name = prompt('NFT name:');
+  if (!name) return;
+  const contentRef = prompt('Content reference (a SmokeStore CID, URL, or any text the token points at):');
+  if (!contentRef) return;
+  const result = await node.ledger.createMintNft(acc.pub, contentRef, { name }, engineSigner(acc));
+  if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
+  const submit = await node.submitBlock(result.block);
+  if (submit.success) { toast(`Minted NFT "${name}"`, 'success'); refreshTransfer(); }
+  else { toast(`Error: ${submit.error}`, 'error'); }
+});
 
 let autoClaimRunning = false;
 async function autoClaimPending(): Promise<void> {
@@ -2635,6 +2655,11 @@ function wireNodeEvents() {
   node.on('auto:received', (data: unknown) => {
     const d = data as { from: string; amount: number };
     addLog(`Auto-received: +${formatUNIT(d.amount)} UNIT`, 'success');
+    refreshTab();
+  });
+  node.on('nft:received', (data: unknown) => {
+    const d = data as { from: string; tokenId?: string };
+    addLog(`NFT received from ${resolveNamePlain(d.from)}`, 'success');
     refreshTab();
   });
   node.on('inbox:signal', (data: unknown) => {

@@ -31,6 +31,7 @@
  */
 
 import { NeuronNode } from '../network/node';
+import type { SignerKeys } from '../ledger/engine-ledger';
 import { AccountBlock, formatUNIT, parseUNIT } from '../core/dag-block';
 import { KeyPair } from '../core/crypto';
 import { NetworkType, StorageProvider } from '../core/dag-ledger';
@@ -350,6 +351,42 @@ export class NeuronChainAPI extends EventEmitter {
     return Array.from(this.node.ledger.contracts.entries()).map(([id, c]) => ({
       id, name: c.name, owner: c.owner, deployedAt: c.deployedAt,
     }));
+  }
+
+  // ── Native NFTs (Bucket B) ──────────────────────────────────────────────────
+  // NFTs are native ownership keys on the account-chain (not contracts). `keys` is
+  // the engine signer for `fromPub` (same convention as `send`).
+
+  /** Mint an NFT bound to a content CID + metadata; returns its tokenId. */
+  async mintNft(fromPub: string, contentRef: string, meta: Record<string, string>, keys: SignerKeys): Promise<{ tokenId?: string; error?: string }> {
+    const result = await this.node.ledger.createMintNft(fromPub, contentRef, meta, keys);
+    if (!result.block) return { error: result.error };
+    const sub = await this.node.submitBlock(result.block);
+    if (!sub.success) return { error: sub.error };
+    return { tokenId: result.tokenId };
+  }
+
+  /** Transfer an owned NFT to a recipient (username or pubkey). */
+  async transferNft(fromPub: string, tokenId: string, toIdentifier: string, keys: SignerKeys): Promise<{ ok?: boolean; error?: string }> {
+    const result = await this.node.ledger.createTransferNft(fromPub, tokenId, toIdentifier, keys);
+    if (!result.block) return { error: result.error };
+    const sub = await this.node.submitBlock(result.block);
+    if (!sub.success) return { error: sub.error };
+    return { ok: true };
+  }
+
+  /** Permanently destroy an owned NFT. */
+  async burnNft(fromPub: string, tokenId: string, keys: SignerKeys): Promise<{ ok?: boolean; error?: string }> {
+    const result = await this.node.ledger.createBurnNft(fromPub, tokenId, keys);
+    if (!result.block) return { error: result.error };
+    const sub = await this.node.submitBlock(result.block);
+    if (!sub.success) return { error: sub.error };
+    return { ok: true };
+  }
+
+  /** NFTs currently owned by an account (with content CID + metadata). */
+  listNfts(ownerPub: string): { tokenId: string; contentRef: string; meta: Record<string, string>; minter: string }[] {
+    return this.node.ledger.getNftsOwnedBy(ownerPub);
   }
 
   // ── Decentralised storage ledger ──────────────────────────────────────────
