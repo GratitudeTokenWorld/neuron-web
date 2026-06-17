@@ -518,13 +518,24 @@ export class NeuronNode extends EventEmitter {
   //         the user recovered their keys).
   private async sweepUnclaimedReceives(): Promise<void> {
     for (const [pub, keys] of this.localKeys) {
-      const unclaimed = this.ledger.getUnclaimedForAccount(pub);
-      for (const { sendBlockHash, fromPub, amount } of unclaimed) {
-        const result = await this.ledger.createReceive(pub, sendBlockHash, keys);
+      const signer = engineKeysFromAppPrivate(keys.priv); // localKeys holds app keys; the engine needs engine keys
+      // Payments
+      for (const { sendBlockHash, fromPub, amount } of this.ledger.getUnclaimedForAccount(pub)) {
+        const result = await this.ledger.createReceive(pub, sendBlockHash, signer);
         if (result.block) {
-          await this.ledger.addBlock(result.block);
-          this.net.publishBlock(result.block);
+          this.ledger.addBlock(result.block);
+          this.net.publishEngineBlock(result.block);
           this.emit('auto:received', { from: fromPub, amount });
+        }
+      }
+      // NFTs — same fallback (needed for same-node transfers: a node doesn't get
+      // its own gossip, so the recipient's auto-receive never fires off the wire).
+      for (const { nftSendHash, fromPub, tokenId } of this.ledger.getUnclaimedNftsForAccount(pub)) {
+        const result = await this.ledger.createReceiveNft(pub, nftSendHash, signer);
+        if (result.block) {
+          this.ledger.addBlock(result.block);
+          this.net.publishEngineBlock(result.block);
+          this.emit('nft:received', { from: fromPub, tokenId });
         }
       }
     }
