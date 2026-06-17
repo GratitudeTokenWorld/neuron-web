@@ -89,10 +89,14 @@ export const EPOCH_WEIGHT_RETAIN = 4;
  * k-of-N Sybil resistance — removes the single-attester SPOF that consensus
  * security reduces to). Only gates NEW account creation; existing accounts replay
  * via addBlock (which doesn't re-check the quorum), so there's no migration break.
- * Availability cost: that many attester relays must be reachable to create an
- * account. Tunable — dial to 1 if a cross-relay attestation path is unavailable.
+ *
+ * Build-injected (vite.config.ts → `__REQUIRED_ATTESTERS__`): **1** for an isolated
+ * LOCAL_ONLY dev stack (only one local relay exists), **2** for production (two
+ * super-nodes). Defaults to 2 outside the bundler (tests/node). Override with the
+ * REQUIRED_ATTESTERS env at build time.
  */
-export const REQUIRED_ATTESTERS = 2;
+declare const __REQUIRED_ATTESTERS__: number | undefined;
+export const REQUIRED_ATTESTERS = typeof __REQUIRED_ATTESTERS__ !== 'undefined' ? __REQUIRED_ATTESTERS__ : 2;
 
 export class EngineLedger extends EventEmitter {
   private readonly held = new Map<string, Held>();

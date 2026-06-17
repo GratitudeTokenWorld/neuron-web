@@ -59,6 +59,12 @@ export default defineConfig({
       ]),
       ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
     ]),
+    // Personhood attesters required to open an account. 1 for an isolated
+    // LOCAL_ONLY dev stack (single local relay), 2 in production (two super-nodes).
+    // Override with REQUIRED_ATTESTERS=<n>.
+    __REQUIRED_ATTESTERS__: JSON.stringify(
+      process.env.REQUIRED_ATTESTERS ? Number(process.env.REQUIRED_ATTESTERS) : (process.env.LOCAL_ONLY ? 1 : 2),
+    ),
   },
   resolve: {
     alias: {
