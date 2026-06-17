@@ -84,6 +84,16 @@ export const DEFAULT_COMMITTEE_SIZE = 64;
 /** How many past epochs of validator-weight snapshots to retain (bounds late-vote verification). */
 export const EPOCH_WEIGHT_RETAIN = 4;
 
+/**
+ * Independent personhood attesters required to OPEN an account (attester-#2 /
+ * k-of-N Sybil resistance — removes the single-attester SPOF that consensus
+ * security reduces to). Only gates NEW account creation; existing accounts replay
+ * via addBlock (which doesn't re-check the quorum), so there's no migration break.
+ * Availability cost: that many attester relays must be reachable to create an
+ * account. Tunable — dial to 1 if a cross-relay attestation path is unavailable.
+ */
+export const REQUIRED_ATTESTERS = 2;
+
 export class EngineLedger extends EventEmitter {
   private readonly held = new Map<string, Held>();
   private readonly accountsByPub = new Map<string, LedgerAccount>();

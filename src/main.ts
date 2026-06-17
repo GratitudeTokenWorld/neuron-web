@@ -9,6 +9,7 @@ import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detect
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
+import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
 import type { TypedAttestation } from './engine/core/attestation';
 import { encodeBlock, decodeBlock } from './engine/core/block';
 import { bytesToHex, hexToBytes } from './engine/core/hash';
@@ -1558,6 +1559,21 @@ function faceVerifyEndpoint(base: string, endpoint: string): string {
   return base ? `${base}/face-verify/${endpoint}` : `/face-verify/${endpoint}`;
 }
 
+/**
+ * Face-verify HTTP base for a relay (attester-#2): its announced `faceVerifyUrl`,
+ * else derived from its `/dns4/<host>/` multiaddr — so a SECONDARY relay is
+ * reachable cross-origin for attestation (its `/face-verify` sets CORS `*`). The
+ * origin relay (and dev) uses a relative path. Empty string ⇒ relative.
+ */
+function relayFaceVerifyBase(relay: import('./network/libp2p-network').KnownRelayRecord): string {
+  if (relay.faceVerifyUrl) return relay.faceVerifyUrl;
+  const m = relay.addr?.match(/\/dns[46]\/([^/]+)\//);
+  if (!m) return '';
+  const host = m[1];
+  if (typeof window !== 'undefined' && host === window.location.hostname) return ''; // origin → relative
+  return `https://${host}`; // secondary relay → absolute cross-origin
+}
+
 function pickRandomRelays(relays: import('./network/libp2p-network').KnownRelayRecord[], n: number) {
   const eligible = relays.filter(r => r.signingPub);
   return eligible.sort(() => Math.random() - 0.5).slice(0, n);
@@ -1586,7 +1602,7 @@ async function getRelayChallenges(
   }
   const results: PendingChallenge[] = [];
   for (const relay of targets) {
-    const base = relay.faceVerifyUrl || '';
+    const base = relayFaceVerifyBase(relay);
     try {
       const res = await fetch(faceVerifyEndpoint(base, 'challenge'), {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network }, body: '{}',
@@ -1747,7 +1763,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       faceLimitError = result.faceLimitError;
       usernameTakenError = result.usernameTakenError;
     }
-    if (attestations.length === 0 || !nullifier) {
+    if (attestations.length < REQUIRED_ATTESTERS || !nullifier) {
       if (usernameTakenError) {
         addLog(`Username taken: ${username}`, 'error');
         toast('Username already taken', 'error');
@@ -1760,9 +1776,11 @@ $('#btnCreateAccount').addEventListener('click', async () => {
         statusEl.innerHTML = `<span style="color:var(--danger)">${escHtml(faceLimitError)} You cannot create more accounts with this face on ${escHtml(node.ledger.network)}.</span>`;
         restoreCreateBtn(); return;
       }
-      addLog('FaceID: No identity attestation obtained', 'error');
-      toast('Identity attestation failed. Is the attester running?', 'error');
-      statusEl.innerHTML = `<span style="color:var(--danger)">Identity attestation failed — at least one personhood attestation is required. Ensure the attester is running and try again.</span>`;
+      // Attester-#2 / k-of-N: a unique human must be vouched for by REQUIRED_ATTESTERS
+      // INDEPENDENT relays so no single compromised attester can mint Sybils.
+      addLog(`FaceID: ${attestations.length}/${REQUIRED_ATTESTERS} independent attestations obtained`, 'error');
+      toast(`Need ${REQUIRED_ATTESTERS} independent attesters; reached ${attestations.length}`, 'error');
+      statusEl.innerHTML = `<span style="color:var(--danger)">Identity needs <strong>${REQUIRED_ATTESTERS} independent personhood attestations</strong> (Sybil resistance), but only ${attestations.length} attester relay(s) responded. Ensure ${REQUIRED_ATTESTERS} relays are online and reachable, then try again.</span>`;
       restoreCreateBtn(); return;
     }
     addLog(`FaceID: ${attestations.length} attestation(s) collected`, 'success');

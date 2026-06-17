@@ -1,5 +1,5 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
-import { EngineLedger, CHALLENGE_WINDOW_MS } from '../ledger/engine-ledger';
+import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS } from '../ledger/engine-ledger';
 import { Libp2pNetwork } from './libp2p-network';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
@@ -118,7 +118,7 @@ export class NeuronNode extends EventEmitter {
 
   constructor(network: NetworkType = 'testnet') {
     super();
-    this.ledger = new EngineLedger(network);
+    this.ledger = new EngineLedger(network, undefined, { min: REQUIRED_ATTESTERS, requiredTypes: ['personhood'] });
     this.net = new Libp2pNetwork(network);
     this.store = new SmokeStore();
     this.storage = new StorageManager(this.ledger, this.net, this.store, this.localKeys);
