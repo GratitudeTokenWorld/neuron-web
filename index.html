@@ -600,8 +600,14 @@
       inset: 0;
       background: rgba(0,0,0,0.75);
       z-index: 2000;
-      align-items: center;
+      /* Pinned to the TOP of the viewport, not centred: the user is looking at
+         their own face and following instructions, so the feed must sit as close
+         to the webcam as possible — a centred box drags the eyes (and the head)
+         downward, which hurts liveness/enrollment capture. */
+      align-items: flex-start;
       justify-content: center;
+      padding: 12px 0;
+      overflow-y: auto;
     }
     .camera-modal.active { display: flex; }
 
@@ -642,8 +648,11 @@
       background: #000;
     }
 
+    /* Step/status line sits ABOVE the video (see .camera-modal-inner order):
+       instructions belong where the eyes already are, not below the feed.
+       Side padding clears the absolutely-positioned close button. */
     .camera-modal-status {
-      padding: 12px 16px;
+      padding: 12px 52px;
       font-size: 13px;
       color: var(--text-dim);
       text-align: center;
@@ -654,17 +663,24 @@
       gap: 8px;
     }
 
+    .camera-modal-video { position: relative; line-height: 0; }
+
+    /* Live guidance ("Look at the camera", challenge prompts) overlays the TOP of
+       the feed — closest to the webcam, and never hidden behind the chin/face. */
     .camera-modal-overlay {
       position: absolute;
-      bottom: 56px;
+      top: 0;
       left: 0;
       right: 0;
       text-align: center;
       color: var(--accent);
       font-size: 13px;
+      line-height: 1.4;
       font-family: var(--mono);
-      text-shadow: 0 1px 4px rgba(0,0,0,0.8);
-      padding: 8px;
+      text-shadow: 0 1px 4px rgba(0,0,0,0.9);
+      padding: 10px 12px;
+      background: linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0));
+      pointer-events: none;
     }
 
     /* Confirm dialog overlay */
@@ -888,9 +904,13 @@
   <div class="camera-modal" id="cameraModal">
     <div class="camera-modal-inner">
       <button class="camera-modal-close" id="cameraModalClose">&times;</button>
-      <video id="faceVideo" autoplay muted playsinline></video>
-      <div class="camera-modal-overlay" id="cameraOverlay"></div>
+      <!-- Status first, then the feed with its overlay pinned to the top edge:
+           every instruction the user must follow is above/at the top of the video. -->
       <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
+      <div class="camera-modal-video">
+        <video id="faceVideo" autoplay muted playsinline></video>
+        <div class="camera-modal-overlay" id="cameraOverlay"></div>
+      </div>
     </div>
   </div>
 
