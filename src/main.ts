@@ -5,7 +5,7 @@ import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
@@ -1813,6 +1813,11 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // This raises the bar against presentation attacks (a photo or a recording held
     // up to a real camera), not against a modified app — closing that needs
     // server-side verification of the captured frames.
+    // One guard for the whole enrollment: the face must stay in frame from the
+    // first challenge through the last capture sample (gaps included). Breaking
+    // continuity voids the run — see PresenceGuard for the attack it closes.
+    const presence = newPresenceGuard();
+
     if (pendingChallenges.length > 0) {
       const issued = pendingChallenges.map(c => c.type);
       const turn = (issued.find(t => t === 'look-left' || t === 'look-right')
@@ -1825,22 +1830,39 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
 
       for (const action of sequence) {
-        const actionDone = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue));
+        const actionDone = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence);
         if (!actionDone) {
-          addLog(`FaceID: challenge "${action}" not detected — aborting account creation`, 'error');
-          toast('Challenge failed — please perform each requested action and try again', 'error');
-          statusEl.innerHTML = `<span style="color:var(--danger)">Challenge timed out on "${escHtml(action)}". Try again.</span>`;
+          const lost = presence.lost;
+          addLog(`FaceID: ${lost ? 'face left the frame' : `challenge "${action}" not detected`} — aborting`, 'error');
+          toast(lost ? 'Face left the frame — start again' : 'Challenge failed — perform each action and try again', 'error');
+          statusEl.innerHTML = lost
+            ? '<span style="color:var(--danger)">Your face left the frame during the checks. Stay in view from start to finish.</span>'
+            : `<span style="color:var(--danger)">Challenge timed out on "${escHtml(action)}". Try again.</span>`;
           hideCameraModal(); restoreCreateBtn(); return;
         }
-        await new Promise(r => setTimeout(r, 700));  // let the ✓ land before the next prompt
+        // Watched pause — a blind sleep here would be a free window to swap faces.
+        if (!await holdPresence(video, 700, presence, cue => renderCaptureCue(cue))) {
+          addLog('FaceID: face left the frame between checks — aborting', 'error');
+          toast('Face left the frame — start again', 'error');
+          statusEl.innerHTML = '<span style="color:var(--danger)">Your face left the frame between checks. Stay in view from start to finish.</span>';
+          hideCameraModal(); restoreCreateBtn(); return;
+        }
       }
     }
 
     // Face enrollment (camera still open, immediately after challenge action)
     setCameraStatus('<span class="spinner"></span> Step 3/3: Hold still — capturing face map');
-    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
+    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue), presence);
     hideCameraModal();
 
+    if (!faceMap && presence.lost) {
+      // Continuity broke between the challenges and the samples: the face that
+      // passed the checks is not provably the face being enrolled.
+      addLog('FaceID: face left the frame during capture — aborting account creation', 'error');
+      toast('Face left the frame — start again', 'error');
+      statusEl.innerHTML = '<span style="color:var(--danger)">Your face left the frame during capture. Stay in view from the first check to the last sample.</span>';
+      restoreCreateBtn(); return;
+    }
     if (!faceMap) {
       addLog('FaceID: Face enrollment FAILED - could not capture enough samples', 'error');
       toast('Face enrollment failed', 'error');

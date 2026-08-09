@@ -84,6 +84,83 @@ export interface CaptureCue {
   state?: 'ok' | 'fail';
 }
 
+// ──── Presence continuity (anti-swap) ────
+
+/**
+ * Longest gap with NO detected face before an enrollment is void.
+ *
+ * 1000 ms, not 2000: the detector samples every ~80–100 ms, so a second still
+ * tolerates ~10 consecutive misses — ample for motion blur during a fast head
+ * turn, a dropped frame, or a slow laptop — while being too short to physically
+ * swap a phone/print in front of the lens. Two seconds is comfortably enough
+ * time to make that swap, which is exactly the attack this closes.
+ */
+export const FACE_ABSENCE_LIMIT_MS = 1000;
+
+/**
+ * Continuity across a whole enrollment: the same face must stay in frame from
+ * the first challenge through the last capture sample. Without it, an attacker
+ * can satisfy the challenges with their own live face and then swap in a photo
+ * of someone else for the capture that actually becomes the identity — the
+ * challenges prove *a* human was present, not that they are the person enrolled.
+ *
+ * Shared by reference across every stage so absence is measured over the gaps
+ * between stages too, which is where a swap would happen.
+ */
+export interface PresenceGuard {
+  lastSeenAt: number;
+  maxAbsenceMs: number;
+  /** Latched: once continuity breaks the enrollment cannot be salvaged. */
+  lost: boolean;
+}
+
+export function newPresenceGuard(maxAbsenceMs = FACE_ABSENCE_LIMIT_MS): PresenceGuard {
+  return { lastSeenAt: Date.now(), maxAbsenceMs, lost: false };
+}
+
+/** Record a sighting. */
+function markSeen(guard?: PresenceGuard): void {
+  if (guard) guard.lastSeenAt = Date.now();
+}
+
+/** True when the face has been gone too long (latches `lost`). */
+function absenceBroken(guard?: PresenceGuard): boolean {
+  if (!guard) return false;
+  if (guard.lost) return true;
+  if (Date.now() - guard.lastSeenAt > guard.maxAbsenceMs) guard.lost = true;
+  return guard.lost;
+}
+
+/**
+ * Wait `ms` while keeping the presence guard fed — used for the pauses BETWEEN
+ * challenge actions and between capture samples, which would otherwise be blind
+ * windows. Returns false if continuity broke. Detection here skips landmarks
+ * (presence only), so it is cheaper than the action detectors.
+ */
+export async function holdPresence(
+  video: HTMLVideoElement,
+  ms: number,
+  guard?: PresenceGuard,
+  onStatus?: (cue: CaptureCue) => void,
+): Promise<boolean> {
+  const until = Date.now() + ms;
+  if (!guard) { await sleep(ms); return true; }
+  while (Date.now() < until) {
+    try {
+      const det = await faceapi.detectSingleFace(
+        video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 }),
+      );
+      if (det) markSeen(guard);
+    } catch { /* treat as a miss */ }
+    if (absenceBroken(guard)) {
+      onStatus?.({ label: 'Face lost — start again', guide: 'search', state: 'fail', left: 0, right: 0 });
+      return false;
+    }
+    await sleep(80);
+  }
+  return true;
+}
+
 // ──── Face Descriptor Capture ────
 
 export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
@@ -111,6 +188,7 @@ export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<Fa
 export async function enrollFace(
   video: HTMLVideoElement,
   onProgress: (step: number, total: number, cue: CaptureCue) => void,
+  guard?: PresenceGuard,
 ): Promise<FaceMap | null> {
   const descriptors: number[][] = [];
   let retries = 0;
@@ -121,7 +199,9 @@ export async function enrollFace(
       label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i), right: pct(i),
     });
-    await sleep(800);
+    // Watched pause, not a blind sleep: the window between samples is the last
+    // place a swapped face could slip in unnoticed.
+    if (!await holdPresence(video, 800, guard, c => onProgress(i + 1, ENROLLMENT_SAMPLES, c))) return null;
 
     const desc = await captureFaceDescriptor(video);
     if (!desc) {
@@ -130,9 +210,10 @@ export async function enrollFace(
         label: 'Look at the camera', guide: 'search', left: pct(i), right: pct(i),
       });
       i--;
-      await sleep(1000);
+      if (!await holdPresence(video, 1000, guard, c => onProgress(i + 2, ENROLLMENT_SAMPLES, c))) return null;
       continue;
     }
+    markSeen(guard);
     descriptors.push(desc.data);
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
       label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
@@ -140,6 +221,7 @@ export async function enrollFace(
     });
   }
 
+  if (guard?.lost) return null;
   if (descriptors.length < ENROLLMENT_SAMPLES) return null;
 
   // Average descriptors
@@ -196,6 +278,7 @@ export async function detectChallenge(
   type: 'blink' | 'look-left' | 'look-right' | 'smile',
   timeoutMs = 12000,
   onStatus?: (cue: CaptureCue) => void,
+  guard?: PresenceGuard,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   const EAR_THRESHOLD = 0.28;
@@ -239,7 +322,15 @@ export async function detectChallenge(
     } catch {
       await sleep(100); continue;
     }
-    if (!det?.landmarks) { await sleep(100); continue; }
+    if (!det?.landmarks) {
+      // A miss counts toward the continuity budget — this is where a swap shows up.
+      if (absenceBroken(guard)) {
+        onStatus?.({ label: 'Face lost — start again', guide: 'search', state: 'fail', left: 0, right: 0 });
+        return false;
+      }
+      await sleep(100); continue;
+    }
+    markSeen(guard);
 
     const pts = det.landmarks.positions as Point[];
     const videoWidth = video.videoWidth || 640;
