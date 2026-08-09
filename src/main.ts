@@ -984,6 +984,9 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
     // target oval; a retreat runs it back down. Driving it from progress rather
     // than a looping animation means the ring only moves when the user does.
     if (cue.guide === 'depth' && cue.depth) {
+      // Which way to travel: the arrows point + drift outward on a "move back"
+      // leg and inward on a "move closer" one (see .cg-depth-arrow).
+      guide.setAttribute('data-depth', cue.depth);
       const p = Math.max(0, Math.min(100, progress)) / 100;
       const scale = cue.depth === 'in' ? 0.5 + 0.5 * p : 1 - 0.5 * p;
       guide.style.setProperty('--depth-scale', scale.toFixed(3));

@@ -846,6 +846,30 @@
       transition: transform 0.12s linear;
     }
 
+    /* The arrows say which WAY to move, and are the only cue that does: the ring
+       is a distance READOUT (how far along the leg you are), not an instruction.
+       Camera-framing metaphor — brackets open outward to widen the shot ("move
+       back") and close inward to tighten it ("move closer"), so they point and
+       drift the same way the user must travel.
+
+       The flip is a scaleY about each arrow's own centre, deliberately kept as a
+       separate factor from the drift: in `translateY(...) scaleY(...)` the
+       translate is applied in the UNflipped outer space, so its sign stays
+       honest and the two never fight. */
+    .cg-depth-arrow {
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: cg-depth-drift 1.6s ease-in-out infinite;
+    }
+    .cg-depth-top    { --travel: -4px; --flip: 1; }
+    .cg-depth-bottom { --travel: 4px;  --flip: 1; }
+    .capture-guide[data-depth="in"] .cg-depth-top    { --travel: 4px;  --flip: -1; }
+    .capture-guide[data-depth="in"] .cg-depth-bottom { --travel: -4px; --flip: -1; }
+    @keyframes cg-depth-drift {
+      0%, 100% { transform: translateY(0) scaleY(var(--flip, 1)); }
+      50%      { transform: translateY(var(--travel, 0)) scaleY(var(--flip, 1)); }
+    }
+
     /* Mouth open: the jaw ellipse stretches vertically, like a slow "ahh". */
     .cg-jaw { transform-box: fill-box; transform-origin: center top; animation: cg-jaw 1.8s ease-in-out infinite; }
     @keyframes cg-jaw { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
@@ -1147,8 +1171,10 @@
             <g class="cg-depth">
               <!-- Same geometry as .cg-oval: scale(1) lands exactly on it. -->
               <ellipse class="cg-line cg-depth-oval" cx="100" cy="74" rx="44" ry="58"/>
-              <path class="cg-line" d="M100 20 l-7 9 M100 20 l7 9" opacity="0.6"/>
-              <path class="cg-line" d="M100 128 l-7 -9 M100 128 l7 -9" opacity="0.6"/>
+              <!-- Authored pointing OUTWARD (top arrow up, bottom arrow down);
+                   CSS flips the pair on a "move closer" leg. -->
+              <path class="cg-line cg-depth-arrow cg-depth-top" d="M100 20 l-5 6 M100 20 l5 6" opacity="0.6"/>
+              <path class="cg-line cg-depth-arrow cg-depth-bottom" d="M100 128 l-5 -6 M100 128 l5 -6" opacity="0.6"/>
             </g>
             <g class="cg-brow">
               <path class="cg-line cg-brow-arc" d="M68 54 q12 -7 24 0"/>
