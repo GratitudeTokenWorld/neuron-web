@@ -13,6 +13,7 @@
  */
 
 import { createLibp2p } from 'libp2p';
+import { applyGossipsubCompat } from './gossipsub-compat.js';
 import { webRTC } from '@libp2p/webrtc';
 import { webSockets } from '@libp2p/websockets';
 import { WebSockets as WsMatcher, WebSocketsSecure as WssMatcher } from '@multiformats/multiaddr-matcher';
@@ -593,6 +594,11 @@ export class Libp2pNetwork extends EventEmitter {
       id: peerIdFromString(relayInfo.peerId),
       addrs: [multiaddr(relayInfo.bootstrapAddr.replace(`/p2p/${relayInfo.peerId}`, ''))],
     }] : [];
+
+    // gossipsub 14.x cannot form streams against libp2p 3.x without these shims —
+    // without them a client can sometimes SEND via a patched relay but never
+    // RECEIVES (silent; see src/network/gossipsub-compat.ts).
+    applyGossipsubCompat();
 
     this.libp2p = await createLibp2p({
       // libp2p ≥3.3 ships a default BROWSER connection gater that denies every

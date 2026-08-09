@@ -36,8 +36,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { promises as fs } from 'fs';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { AbstractMessageStream } from '@libp2p/utils';
-import { GossipSub } from '@chainsafe/libp2p-gossipsub';
+import { applyGossipsubCompat } from '../src/network/gossipsub-compat.js';
 import { randomBytes, randomUUID } from 'crypto';
 // Engine identity: this server is the ATTESTER — it signs engine attestations
 // (imported directly, run via tsx) instead of old face-hash credentials.
@@ -50,64 +49,10 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // held even when light clients holding a shard go offline.
 import { decodeBlock, verifyBlock } from '../src/engine/core/block.js';
 
-// ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
-// New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
-// but NOT the .sink / .source duplex interface that it-pipe expects.
-// gossipsub's OutboundStream calls pipe(pushable, rawStream) - it-pipe checks
-// isDuplex(rawStream) = rawStream.sink != null && rawStream.source != null,
-// which fails, causing a TypeError that is silently swallowed and leaving
-// streamsOutbound empty (no messages flow).
-Object.defineProperty(AbstractMessageStream.prototype, 'source', {
-  get() { return this; },
-  configurable: true,
-  enumerable: false,
-});
-Object.defineProperty(AbstractMessageStream.prototype, 'sink', {
-  get() {
-    const self = this;
-    return async (source) => {
-      for await (const chunk of source) {
-        self.send(chunk);
-      }
-    };
-  },
-  configurable: true,
-  enumerable: false,
-});
-
-// ── Fix B: multiaddr.tuples() API mismatch in GossipSub.addPeer ──────────────
-// gossipsub 14.x calls multiaddr.tuples() for IP scoring but libp2p's internal
-// multiaddr objects (different class instance) don't have this method, causing
-// addPeer() to throw before pushing to outboundInflightQueue - so no streams form.
-// Patch: catch the error and add the peer manually without IP scoring.
-const _origAddPeer = GossipSub.prototype.addPeer;
-GossipSub.prototype.addPeer = function(peerId, direction, addr) {
-  try {
-    return _origAddPeer.call(this, peerId, direction, addr);
-  } catch {
-    const id = peerId.toString();
-    if (!this.peers.has(id)) {
-      this.peers.set(id, peerId);
-      this.score?.addPeer(id);
-      if (!this.outbound.has(id)) {
-        this.outbound.set(id, direction === 'outbound');
-      }
-    }
-  }
-};
-
-// ── Fix C: onIncomingStream handler signature mismatch ───────────────────────
-// libp2p (this version) calls registered protocol handlers as handler(stream, connection)
-// with two positional args, but gossipsub 14.x expects handler({ stream, connection })
-// as a single destructured object. Without this fix, connection.remotePeer is undefined,
-// createInboundStream is never called, and no inbound streams or mesh form.
-const _origOnIncomingStream = GossipSub.prototype.onIncomingStream;
-GossipSub.prototype.onIncomingStream = function(streamOrObj, connection) {
-  if (connection !== undefined && streamOrObj?.connection === undefined) {
-    return _origOnIncomingStream.call(this, { stream: streamOrObj, connection });
-  }
-  return _origOnIncomingStream.call(this, streamOrObj);
-};
+// gossipsub 14.x ↔ libp2p 3.x interop shims (fixes A/B/C) — now shared with the
+// BROWSER build, which needs them just as much (clients could send but never
+// receive without them). See src/network/gossipsub-compat.ts for the details.
+applyGossipsubCompat();
 
 const PORT = parseInt(process.env.PORT || '9090', 10);
 // All runtime state (identity keys, face DB, archives, logs) lives under one
