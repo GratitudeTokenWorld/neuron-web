@@ -130,3 +130,56 @@ describe('native NFTs', () => {
     expect(ledger.addBlock(evil).error).toBe('nft-mint must preserve balance');
   });
 });
+
+/**
+ * Reload survival, in BOTH cross-account orders.
+ *
+ * A refresh rebuilds the ledger from persisted blocks (node.ts start():
+ * loadAllEngineBlocks -> addBlock). Those blocks are sorted accountId-then-index
+ * (libp2p-network.sortEngineBlocks), which is correct WITHIN a chain but
+ * alphabetical ACROSS accounts — so the recipient's nft-receive can be replayed
+ * before the sender's nft-mint/nft-send, depending purely on how the two public
+ * keys happen to sort.
+ *
+ * Reported as "transfers work back and forth instantly, but when I refresh the
+ * browser the NFT is gone", and it also truncated the minter's chain: the
+ * rejected mint made every later block non-sequential, dropping the balance back
+ * to the open block.
+ *
+ * Both orders must reconstruct the same ownership, so this replays each.
+ */
+describe('NFT state survives a reload in either replay order', () => {
+  for (const recipientFirst of [false, true]) {
+    it(`restores ownership when the ${recipientFirst ? 'RECIPIENT' : 'SENDER'} chain replays first`, async () => {
+      const { ledger, alice, bob } = await setup();
+
+      const mint = await ledger.createMintNft(alice.pub, 'cid-reload', { name: 'Reload' }, alice);
+      const tokenId = mint.tokenId!;
+      const send = await ledger.createTransferNft(alice.pub, tokenId, bob.pub, alice);
+      await ledger.createReceiveNft(bob.pub, send.block!.hash, bob);
+      expect(ledger.getNftsOwnedBy(bob.pub).map(n => n.tokenId)).toEqual([tokenId]);
+
+      // Group by account (index order preserved), then order the groups.
+      const byAccount = new Map<string, Block[]>();
+      for (const b of ledger.getAllBlocks()) {
+        if (!byAccount.has(b.accountId)) byAccount.set(b.accountId, []);
+        byAccount.get(b.accountId)!.push(b);
+      }
+      const order = recipientFirst ? [bob.pub, alice.pub] : [alice.pub, bob.pub];
+      const replayed = new EngineLedger('testnet');
+      const rejected: string[] = [];
+      for (const pub of order) {
+        for (const b of byAccount.get(pub) ?? []) {
+          const r = replayed.addBlock(b);
+          if (!r.success) rejected.push(`${b.type}#${b.index}: ${r.error}`);
+        }
+      }
+
+      expect(rejected).toEqual([]);
+      expect(replayed.getNftsOwnedBy(alice.pub).map(n => n.tokenId)).toEqual([]);
+      expect(replayed.getNftsOwnedBy(bob.pub).map(n => n.tokenId)).toEqual([tokenId]);
+      // The minter's chain must be intact, not truncated back to the open block.
+      expect(replayed.getAccountHead(alice.pub)?.index).toBe(ledger.getAccountHead(alice.pub)?.index);
+    });
+  }
+});

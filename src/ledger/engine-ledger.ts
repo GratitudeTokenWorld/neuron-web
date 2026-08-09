@@ -490,7 +490,9 @@ export class EngineLedger extends EventEmitter {
   // Apply helpers — shared by local create + foreign addBlock so both paths agree.
   private applyNftMint(b: Block): void {
     if (!b.tokenId || !b.contentRef) return;
-    this.nftOwner.set(b.tokenId, b.accountId);
+    // Don't claim ownership if a transfer already assigned it — the same
+    // replayed-out-of-order case applyNftSend guards against, from the other end.
+    if (!this.nftOwner.has(b.tokenId)) this.nftOwner.set(b.tokenId, b.accountId);
     this.nftInfo.set(b.tokenId, { minter: b.accountId, contentRef: b.contentRef, meta: b.nftMeta ?? {} });
     this.emit('nft:minted', { tokenId: b.tokenId, owner: b.accountId });
   }
@@ -600,7 +602,15 @@ export class EngineLedger extends EventEmitter {
       if (block.type === 'nft-mint') {
         if (block.balance !== head.balance) return { success: false, error: 'nft-mint must preserve balance' };
         if (!block.tokenId || !block.contentRef) return { success: false, error: 'nft-mint missing token/content' };
-        if (this.nftOwner.has(block.tokenId) || this.nftInfo.has(block.tokenId) || this.burnedNfts.has(block.tokenId)) {
+        // Uniqueness is `nftInfo`/`burnedNfts` — the records only a MINT or BURN
+        // writes. Deliberately NOT nftOwner: a receive that replayed first sets an
+        // owner for a token whose mint has not been applied yet (persisted blocks
+        // are ordered accountId-then-index, so the recipient's chain can land
+        // before the sender's), and treating that as "already exists" rejected the
+        // genuine mint. That truncated the minter's chain, so every later block was
+        // then 'non-sequential' — the NFT vanished on reload and the minter's
+        // balance fell back to the open block.
+        if (this.nftInfo.has(block.tokenId) || this.burnedNfts.has(block.tokenId)) {
           return { success: false, error: 'nft tokenId already exists' };
         }
       }
