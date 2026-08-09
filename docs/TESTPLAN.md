@@ -49,10 +49,13 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
    The capture UI shows a centre-out green bar, a rising tone, and a wireframe
-   guide over the (mirrored) feed. It runs: a short **"relax your face"**
-   baseline (requires a still, forward-facing pose), then **five actions in a
-   random order drawn per enrollment** — smile, open mouth, raise eyebrows, close
-   eyes, and a head turn — each animated, each with a 12 s budget and each
+   guide over the (mirrored) feed. It runs a **setup stage** first — frame your
+   head ("move closer" / "move back" / "hold your head level"), then **move
+   toward the camera and back**, which dials in the distance *and* proves the
+   face is three-dimensional; exactly one face must be in shot throughout — then
+   a **"relax your face"** baseline taken at that settled distance, then **five
+   actions in a random order drawn per enrollment** — smile, open mouth, raise
+   eyebrows, close eyes, and a head turn — each animated, each with a 12 s budget and each
    requiring the action to be **held ~0.3 s** (a momentary flicker does not
    count); then **capture** — hold still for 3 samples. The drawn order is
    written to the app log (`challenge sequence …`) — check it differs between runs.
@@ -62,11 +65,13 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    aborts with "face left the frame" rather than continuing.
    **Anti-spoof checks worth trying:** sliding your body sideways must NOT satisfy
    the head turn (expect "turn, not slide"); holding a photo up must fail every
-   action. The **depth** action ("move closer" / "move further away") is the
-   strongest of them — a real head changes *shape* as it approaches (the eyes are
-   nearer the lens than the jaw, so they magnify faster), while a phone, tablet or
-   print is flat and merely scales. Try it with a face on a phone screen: the size
-   changes, the shape does not, and it should report "flat image detected".
+   action. The **setup depth sweep** is the strongest of them — a real head changes
+   *shape* as it approaches (the eyes are nearer the lens than the jaw, so they
+   magnify faster), while a phone, tablet or print is flat and merely scales.
+   Two spoof tests worth running deliberately: (a) hold a face on a phone screen
+   and move it toward the camera — size grows, shape does not, expect **"flat
+   image detected"**; (b) have a second person step into frame, or hold a photo
+   beside your own face — expect **"only one face in frame"**.
 2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
    panel then shows `2/2` (or `3/3`) independent attestations.
 3. **Pass:** account opens; balance = 1,000,000 UNIT.

@@ -975,12 +975,22 @@ function resetCaptureCue(): void {
 /** Why a face capture run was rejected — callers render their own copy. */
 type FaceCaptureFailure =
   | { kind: 'presence' }
+  | { kind: 'setup'; reason: 'flat' | 'multi-face' | 'timeout' }
   | { kind: 'challenge'; action: string }
   | { kind: 'capture' };
 
 function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
   if (f.kind === 'presence') {
     return '<span style="color:var(--danger)">Your face left the frame. Stay in view from the first check to the last sample.</span>';
+  }
+  if (f.kind === 'setup') {
+    if (f.reason === 'flat') {
+      return '<span style="color:var(--danger)">That looks like a photo or a screen, not a real face — the image did not change shape as it moved. Use your own face in front of the camera.</span>';
+    }
+    if (f.reason === 'multi-face') {
+      return '<span style="color:var(--danger)">More than one face was in shot. Make sure you are alone in frame and try again.</span>';
+    }
+    return '<span style="color:var(--danger)">Could not set up the camera — get your face framed, level and lit, then try again.</span>';
   }
   if (f.kind === 'challenge') {
     return `<span style="color:var(--danger)">Timed out on "${escHtml(f.action)}". Try again.</span>`;
@@ -1015,14 +1025,16 @@ async function challengeAndCapture(
   }
   addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
 
-  // Measure the relaxed face ONCE, before the first prompt. Calibrating inside
-  // each action captured the tail of the previous one (still smiling, mouth
-  // still open) and broke the check that followed.
-  const neutral = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
-  if (!neutral) {
-    addLog(`FaceID: ${presence.lost ? 'face left the frame' : 'could not read a neutral face'}`, 'error');
-    return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
+  // SETUP first: frame the head, prove it is 3D by moving it, check nothing else
+  // is in shot, and only then measure the relaxed face — once, at a known-good
+  // distance. (Calibrating inside each action captured the tail of the previous
+  // one — still smiling, mouth still open — and broke the check that followed.)
+  const setup = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
+  if (!setup.ok) {
+    addLog(`FaceID: setup failed (${setup.reason})`, 'error');
+    return { failure: setup.reason === 'presence' ? { kind: 'presence' } : { kind: 'setup', reason: setup.reason } };
   }
+  const neutral = setup.neutral;
 
   for (const action of sequence) {
     const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence, neutral);

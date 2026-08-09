@@ -66,7 +66,7 @@ export function stopCamera(stream: MediaStream): void {
 export type CaptureGuide = 'search' | 'turn' | 'blink' | 'eyes' | 'smile' | 'mouth' | 'brow' | 'depth' | 'hold';
 
 /** An action the user can be challenged to perform. */
-export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 'raise-brows' | 'move-depth' | 'look-left' | 'look-right';
+export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 'raise-brows' | 'look-left' | 'look-right';
 
 /**
  * The expressions demanded per enrollment, drawn in a random order alongside a
@@ -83,7 +83,7 @@ export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 
  * the user's own measured jitter, and blink stays out.
  */
 export const CHALLENGE_EXPRESSIONS: readonly ChallengeAction[] =
-  ['smile', 'mouth-open', 'raise-brows', 'close-eyes', 'move-depth'];
+  ['smile', 'mouth-open', 'raise-brows', 'close-eyes'];
 
 /**
  * How many expressions are demanded per enrollment (plus the head turn).
@@ -441,76 +441,171 @@ export type NeutralBaseline = FaceMetrics & NeutralStats;
  *
  * 10 frames, first 4 discarded (transition), median of the rest.
  */
+export type CalibrationFailure = 'presence' | 'flat' | 'multi-face' | 'timeout';
+export type CalibrationResult =
+  | { ok: true; neutral: NeutralBaseline }
+  | { ok: false; reason: CalibrationFailure };
+
+/**
+ * SETUP: dial in the camera distance, prove the face is three-dimensional, and
+ * screen the frame — all before a single expression is measured.
+ *
+ * Doing this first, rather than as one more randomly-drawn action, matters:
+ *
+ *  - Every other metric is a normalised ratio, so a face across the room passes
+ *    them all — while its landmarks are a few pixels apart and every delta is
+ *    noise. The baseline must be taken at a known-good distance or everything
+ *    downstream is calibrated against mush.
+ *  - The depth sweep is the one check a screen cannot pass. The eyes sit ~8-10cm
+ *    nearer the lens than the jaw silhouette, so on a real head the eye-span /
+ *    jaw-width ratio RISES on approach. A phone, tablet or print is flat: moving
+ *    it scales the image and leaves that ratio untouched. Running it up front
+ *    means a spoof is rejected before it can attempt anything else.
+ *  - The whole frame is checked while the user is moving anyway: exactly one
+ *    face (a second one means a bystander, or a screen held beside a real head)
+ *    and a level, forward-facing pose.
+ *
+ * Stages: frame it → move closer (perspective must respond) → settle back →
+ * baseline. Returns the neutral measurements taken at the settled distance.
+ */
 export async function calibrateNeutral(
   video: HTMLVideoElement,
   onStatus?: (cue: CaptureCue) => void,
   guard?: PresenceGuard,
-): Promise<NeutralBaseline | null> {
+): Promise<CalibrationResult> {
   const FRAMES = 8;
-  // The baseline is taken right after the liveness step, which just asked the
-  // user to turn their head both ways — so the face is often still rotated. A
-  // real run recorded neutral at yaw=0.817 / skew=0.387 (frontal is ~0.55 / ~0),
-  // and every later comparison was measured against that lie: simply facing
-  // forward again then read as a huge "turn". Frames are therefore only accepted
-  // while the face is FRONTAL and STILL; anything else restarts the window.
-  const FRONTAL_YAW = 0.13;     // |yaw − 0.55| — covers normal facial asymmetry
+  const FRONTAL_YAW = 0.13;      // |yaw − 0.55| — covers normal facial asymmetry
   const FRONTAL_SKEW = 0.15;
   const STABLE_YAW_RANGE = 0.04;
-  // FRAMING, checked before anything else. Every metric is a normalised ratio, so
-  // a face far from the camera still "works" — but at that distance the landmarks
-  // are a handful of pixels apart, which is what makes the expression deltas noisy
-  // and the captured descriptor weak. Demand a properly framed head up front
-  // instead of letting a distant face produce unreliable results throughout.
-  const MIN_FACE_FRAC = 0.13;   // eye span as a fraction of frame width
-  const MAX_FACE_FRAC = 0.45;   // too close: the face gets cropped
+  const MAX_ROLL_DEG = 16;       // head tilt; beyond this the landmarks skew
+  const MIN_FACE_FRAC = 0.13;    // eye span as a fraction of frame width
+  const MAX_FACE_FRAC = 0.45;
   const CENTRE_MIN = 0.25, CENTRE_MAX = 0.75;
+  // Depth sweep: how much closer, and how much the perspective must respond.
+  const APPROACH_RATIO = 1.30;
+  const SHAPE_DELTA = 0.025;     // relative rise in eye-span / jaw-width
+  const FLAT_SHAPE_MAX = 0.35;   // fraction of SHAPE_DELTA that reads as "flat"
+  const deadline = Date.now() + 40000;
+
+  type Phase = 'frame' | 'approach' | 'settle' | 'baseline';
+  let phase: Phase = 'frame';
+  let startFrac = 0, startShape = 0;
   const samples: FaceMetrics[] = [];
-  const deadline = Date.now() + 10000;
+
+  const fail = (reason: CalibrationFailure): CalibrationResult => {
+    debugMetrics(`calibration failed: ${reason}`);
+    return { ok: false, reason };
+  };
 
   while (Date.now() < deadline) {
-    let det: { landmarks?: { positions: Point[] } } | undefined;
+    // detectAllFaces (not Single) so a second face in frame is visible to us.
+    let dets: { landmarks?: { positions: Point[] } }[] = [];
     try {
-      det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
-        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
+      dets = await faceapi
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } }[];
     } catch { await sleep(80); continue; }
-    if (!det?.landmarks) {
-      if (absenceBroken(guard)) return null;
-      await sleep(80); continue;
+
+    if (!dets.length || !dets[0]?.landmarks) {
+      if (absenceBroken(guard)) return fail('presence');
+      onStatus?.({ label: 'Show your face', guide: 'search', left: 0, right: 0 });
+      samples.length = 0;
+      await sleep(80);
+      continue;
+    }
+    if (dets.length > 1) {
+      // A screen held next to a real head, a bystander, a poster on the wall.
+      samples.length = 0;
+      debugMetrics(`calibration: ${dets.length} faces in frame`);
+      onStatus?.({ label: 'Only one face in frame', guide: 'search', state: 'fail', left: 0, right: 0 });
+      await sleep(150);
+      continue;
     }
     markSeen(guard);
 
-    const pts = det.landmarks.positions as Point[];
+    const pts = dets[0].landmarks!.positions as Point[];
     const m = metricsOf(pts, video.videoWidth);
+    const rollDeg = Math.abs(Math.atan2(pts[45].y - pts[36].y, pts[45].x - pts[36].x) * 180 / Math.PI);
 
-    // 1. Framing first — no point measuring a face that is too small to measure.
-    const faceFrac = faceScale(pts) / (video.videoWidth || 640);
-    const framing =
-      faceFrac < MIN_FACE_FRAC ? 'Move closer' :
-      faceFrac > MAX_FACE_FRAC ? 'Move back' :
-      (m.centreX < CENTRE_MIN || m.centreX > CENTRE_MAX) ? 'Centre your face' : null;
-    if (framing) {
+    // ── framing + pose, enforced in every phase ──────────────────────────────
+    const badFrame =
+      m.frac < MIN_FACE_FRAC ? 'Move closer' :
+      m.frac > MAX_FACE_FRAC ? 'Move back' :
+      (m.centreX < CENTRE_MIN || m.centreX > CENTRE_MAX) ? 'Centre your face' :
+      rollDeg > MAX_ROLL_DEG ? 'Hold your head level' :
+      (Math.abs(m.yaw - 0.55) > FRONTAL_YAW || Math.abs(m.skew) > FRONTAL_SKEW) ? 'Look straight at the camera' : null;
+
+    if (phase !== 'approach' && badFrame) {
       samples.length = 0;
-      debugMetrics(`framing ${framing}: faceFrac=${faceFrac.toFixed(3)} cx=${m.centreX.toFixed(3)}`);
-      onStatus?.({ label: framing, guide: 'search', left: 0, right: 0 });
+      onStatus?.({ label: badFrame, guide: 'search', left: 0, right: 0 });
       await sleep(80);
       continue;
     }
 
-    // 2. Then pose: frontal and still.
-    if (Math.abs(m.yaw - 0.55) > FRONTAL_YAW || Math.abs(m.skew) > FRONTAL_SKEW) {
-      samples.length = 0;                       // still turned — start over
-      onStatus?.({ label: 'Look straight at the camera', guide: 'search', left: 0, right: 0 });
-      await sleep(60);
+    if (phase === 'frame') {
+      // Hold a good frame briefly, then record the reference for the sweep.
+      samples.push(m);
+      if (samples.length > FRAMES) samples.shift();
+      const yaws = samples.map(x => x.yaw);
+      if (samples.length === FRAMES && Math.max(...yaws) - Math.min(...yaws) <= STABLE_YAW_RANGE) {
+        startFrac = m.frac;
+        startShape = m.shape;
+        samples.length = 0;
+        phase = 'approach';
+        debugMetrics(`calibration: framed at frac=${startFrac.toFixed(3)} shape=${startShape.toFixed(4)}`);
+        continue;
+      }
+      onStatus?.({
+        label: 'Hold still', guide: 'hold',
+        left: Math.round((samples.length / FRAMES) * 100),
+        right: Math.round((samples.length / FRAMES) * 100),
+      });
+      await sleep(40);
       continue;
     }
+
+    if (phase === 'approach') {
+      const sizeProgress = (m.frac / startFrac - 1) / (APPROACH_RATIO - 1);
+      const shapeRel = startShape > 0 ? (m.shape / startShape - 1) : 0;
+      const shapeProgress = shapeRel / SHAPE_DELTA;
+      debugMetrics(`depth frac=${m.frac.toFixed(3)}/${startFrac.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)}`);
+
+      if (sizeProgress >= 1 && shapeProgress >= 1) {
+        phase = 'settle';
+        onStatus?.({ label: 'Good — move back', guide: 'depth', left: 100, right: 100 });
+        await sleep(120);
+        continue;
+      }
+      // Moved a long way with no perspective response ⇒ the surface is flat.
+      if (sizeProgress >= 1.15 && shapeProgress < FLAT_SHAPE_MAX) {
+        onStatus?.({ label: 'Flat image detected — use your real face', guide: 'depth', state: 'fail', left: 0, right: 0 });
+        return fail('flat');
+      }
+      const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
+      onStatus?.({ label: 'Move closer', guide: 'depth', left: pct, right: pct });
+      await sleep(50);
+      continue;
+    }
+
+    if (phase === 'settle') {
+      // Back inside the framed band, then hold for the baseline.
+      if (m.frac > startFrac * 1.12) {
+        onStatus?.({ label: 'Move back', guide: 'depth', left: 0, right: 0 });
+        await sleep(60);
+        continue;
+      }
+      phase = 'baseline';
+      samples.length = 0;
+      continue;
+    }
+
+    // ── baseline ─────────────────────────────────────────────────────────────
     samples.push(m);
     if (samples.length > FRAMES) samples.shift();
-
     if (samples.length === FRAMES) {
       const yaws = samples.map(x => x.yaw);
-      if (Math.max(...yaws) - Math.min(...yaws) <= STABLE_YAW_RANGE) break;   // settled
-      samples.shift();                          // still moving — keep sliding
+      if (Math.max(...yaws) - Math.min(...yaws) <= STABLE_YAW_RANGE) break;
+      samples.shift();
     }
     onStatus?.({
       label: 'Relax your face', guide: 'hold',
@@ -519,15 +614,13 @@ export async function calibrateNeutral(
     });
     await sleep(30);
   }
-  if (samples.length < FRAMES) {
-    debugMetrics(`neutral: gave up — never held a still, forward-facing pose`);
-    return null;
-  }
+
+  if (samples.length < FRAMES) return fail('timeout');
 
   const kept = samples;
   const med = (pick: (m: FaceMetrics) => number) => {
-    const s = kept.map(pick).sort((a, b) => a - b);
-    return s[Math.floor(s.length / 2)];
+    const v = kept.map(pick).sort((a, b) => a - b);
+    return v[Math.floor(v.length / 2)];
   };
   // EAR ignores frames caught mid-blink so the open-eye reference stays honest.
   const open = kept.map(m => m.ear).filter(e => e > 0.15).sort((a, b) => a - b);
@@ -536,8 +629,6 @@ export async function calibrateNeutral(
     lift: med(m => m.lift), width: med(m => m.width), open: med(m => m.open),
     yaw: med(m => m.yaw), skew: med(m => m.skew), centreX: med(m => m.centreX),
     brow: med(m => m.brow), frac: med(m => m.frac), shape: med(m => m.shape),
-    // Spread of the open-eye EAR. close-eyes compares a windowed MEAN against
-    // this, so the bar has to be set from the noise, not from a guessed factor.
     earSd: (() => {
       const xs = kept.map(m => m.ear);
       const mu = xs.reduce((a, b) => a + b, 0) / (xs.length || 1);
@@ -545,7 +636,7 @@ export async function calibrateNeutral(
     })(),
   };
   debugMetrics(`neutral(once): ear=${neutral.ear.toFixed(3)} lift=${neutral.lift.toFixed(4)} width=${neutral.width.toFixed(4)} open=${neutral.open.toFixed(3)} yaw=${neutral.yaw.toFixed(3)} skew=${neutral.skew.toFixed(3)} cx=${neutral.centreX.toFixed(3)} brow=${neutral.brow.toFixed(4)} earSd=${neutral.earSd.toFixed(4)} frac=${neutral.frac.toFixed(3)} shape=${neutral.shape.toFixed(4)}`);
-  return neutral;
+  return { ok: true, neutral };
 }
 
 /** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
@@ -642,11 +733,6 @@ export async function detectChallenge(
   // slide fail even when it drifts less than the cap above.
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
-  // Depth challenge. The size change must be large enough for perspective to be
-  // measurable, and the SHAPE must move with it — that second half is the actual
-  // anti-spoof, because a flat screen scales without changing shape at all.
-  const DEPTH_SIZE_RATIO = 1.35;    // when approaching (inverse when receding)
-  const DEPTH_SHAPE_DELTA = 0.025;  // relative change in eye-span / jaw-width
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
   const BROW_DELTA = 0.025;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
@@ -692,12 +778,12 @@ export async function detectChallenge(
   const actionLabel =
     type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
     type === 'mouth-open' ? 'open mouth' : type === 'raise-brows' ? 'raise eyebrows' :
-    type === 'close-eyes' ? 'close eyes' : type === 'move-depth' ? 'move closer/away' :
+    type === 'close-eyes' ? 'close eyes' :
     type === 'look-left' ? 'look left' : 'look right';
   const guide: CaptureGuide =
     type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
     type === 'mouth-open' ? 'mouth' : type === 'raise-brows' ? 'brow' :
-    type === 'close-eyes' ? 'eyes' : type === 'move-depth' ? 'depth' : 'turn';
+    type === 'close-eyes' ? 'eyes' : 'turn';
   // Bar side for a head turn. Landmarks are in RAW video coordinates, so a user
   // turning to their own left moves the nose toward higher x; the feed is
   // mirrored for display, which puts that motion on the viewer's left. Hence
@@ -709,7 +795,6 @@ export async function detectChallenge(
     type === 'mouth-open' ? 'Open your mouth' :
     type === 'raise-brows' ? 'Raise your eyebrows' :
     type === 'close-eyes' ? 'Close your eyes' :
-    type === 'move-depth' ? (neutral && neutral.frac > 0.25 ? 'Move away' : 'Move closer') :
     `Turn head ${turnSide}`;
 
   onStatus?.({ label: prompt, guide, dir: guide === 'turn' ? turnSide : undefined, left: 0, right: 0 });
@@ -915,38 +1000,6 @@ export async function detectChallenge(
       }
       const pct = Math.max(0, Math.min(99, Math.round((browΔ / BROW_DELTA) * 100)));
       onStatus?.({ label: 'Raise your eyebrows', guide: 'brow', left: pct, right: pct });
-
-    } else if (type === 'move-depth') {
-      const m = metricsOf(pts, video.videoWidth);
-      const fracRef = neutral?.frac || m.frac;
-      const shapeRef = neutral?.shape || m.shape;
-      // Approach unless the head already fills the frame, in which case recede.
-      const wantCloser = fracRef <= 0.25;
-      const sizeGoal = wantCloser ? DEPTH_SIZE_RATIO : 1 / DEPTH_SIZE_RATIO;
-      const sizeProgress = wantCloser
-        ? (m.frac / fracRef - 1) / (sizeGoal - 1)
-        : (1 - m.frac / fracRef) / (1 - sizeGoal);
-      // Perspective must move in the direction the motion implies.
-      const shapeRel = shapeRef > 0 ? (m.shape / shapeRef - 1) : 0;
-      const shapeProgress = (wantCloser ? shapeRel : -shapeRel) / DEPTH_SHAPE_DELTA;
-      debugMetrics(`depth frac=${m.frac.toFixed(3)}/${fracRef.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)} wantCloser=${wantCloser}`);
-
-      if (sustained(sizeProgress >= 1 && shapeProgress >= 1)) {
-        onStatus?.({ label: 'Depth confirmed', guide: 'depth', left: 100, right: 100, state: 'ok' });
-        return true;
-      }
-      // If the head clearly moved but the shape did NOT, the surface is flat —
-      // a phone, tablet or print. Say so rather than letting it time out silently.
-      if (sizeProgress >= 1 && shapeProgress < 0.35) {
-        onStatus?.({ label: 'Flat image detected — use your real face', guide: 'depth', left: 0, right: 0 });
-        await sleep(60);
-        continue;
-      }
-      const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
-      onStatus?.({
-        label: wantCloser ? 'Move closer' : 'Move away',
-        guide: 'depth', left: pct, right: pct,
-      });
 
     } else if (type === 'close-eyes') {
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
