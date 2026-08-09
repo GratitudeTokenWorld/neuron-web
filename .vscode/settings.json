@@ -1,0 +1,7 @@
+{
+  // .openstack-venv holds the OpenStack CLI used by scripts/os.sh (called by
+  // absolute path) — it is NOT this project's Python environment. Don't
+  // auto-activate it in every terminal, and keep Python tooling off it.
+  "python.terminal.activateEnvironment": false,
+  "python.defaultInterpreterPath": ""
+}
