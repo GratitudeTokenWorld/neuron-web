@@ -63,7 +63,24 @@ export function stopCamera(stream: MediaStream): void {
 // ──── Capture cues (UI contract) ────
 
 /** Which wireframe animation the UI should overlay on the camera feed. */
-export type CaptureGuide = 'search' | 'turn' | 'blink' | 'smile' | 'hold';
+export type CaptureGuide = 'search' | 'turn' | 'blink' | 'smile' | 'mouth' | 'hold';
+
+/** An action the user can be challenged to perform. */
+export type ChallengeAction = 'blink' | 'smile' | 'mouth-open' | 'look-left' | 'look-right';
+
+/**
+ * The actions used to gate enrollment, in the order-randomised sequence.
+ *
+ * `blink` is deliberately EXCLUDED. Measured on real hardware, this landmark
+ * model barely moves the eye-aspect-ratio during a blink: open ≈ 0.32, a full
+ * blink bottoms at ≈ 0.29, while frame-to-frame jitter alone spans 0.29–0.35.
+ * There is no threshold that separates a blink from noise, so any setting is
+ * either unpassable or free — security theatre either way. `mouth-open` replaces
+ * it: same "do a thing on demand" property, with a signal an order of magnitude
+ * larger (neutral ≈ 0.1, open ≈ 0.5). The blink detector is kept for hardware
+ * where it does work, and can be re-added here once verified with neuron_debug.
+ */
+export const CHALLENGE_SEQUENCE_ACTIONS: readonly ChallengeAction[] = ['smile', 'mouth-open'];
 
 /**
  * One frame of capture feedback. Structured rather than a pre-baked sentence so
@@ -278,11 +295,33 @@ function faceScale(pts: Point[]): number {
  * Both are compared against the user's OWN neutral face (see calibration in
  * detectChallenge), because absolute values vary hugely between faces.
  */
-function mouthMetrics(pts: Point[]): { lift: number; width: number } {
+function mouthMetrics(pts: Point[]): { lift: number; width: number; open: number } {
   const s = faceScale(pts) || 1;
   const centreY = (pts[51].y + pts[57].y) / 2;
   const cornerY = (pts[48].y + pts[54].y) / 2;
-  return { lift: (centreY - cornerY) / s, width: dist(pts[48], pts[54]) / s };
+  const w = dist(pts[48], pts[54]);
+  return {
+    lift: (centreY - cornerY) / s,
+    width: w / s,
+    // Jaw drop: lip gap over mouth width. Huge, unambiguous signal (neutral
+    // ~0.1, open ~0.5+) — the one facial action this landmark model reports
+    // reliably on every face.
+    open: w < 0.001 ? 0 : dist(pts[51], pts[57]) / w,
+  };
+}
+
+/**
+ * Head YAW, independent of where the head is in the frame.
+ *
+ * Nose tip's position between the jaw edges (0 ↔ 16), 0.5 when facing forward.
+ * Sliding the whole body sideways moves nose and jaw together so the ratio does
+ * not change — only actually ROTATING the head does. The previous test measured
+ * raw nose-x displacement in pixels, which is why shifting your body passed it.
+ */
+function yawRatio(pts: Point[]): number {
+  const left = pts[0].x, right = pts[16].x;
+  const span = right - left;
+  return Math.abs(span) < 1 ? 0.5 : (pts[30].x - left) / span;
 }
 
 /** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
@@ -310,17 +349,19 @@ function debugMetrics(msg: string): void {
  */
 export async function detectChallenge(
   video: HTMLVideoElement,
-  type: 'blink' | 'look-left' | 'look-right' | 'smile',
+  type: ChallengeAction,
   timeoutMs = 12000,
   onStatus?: (cue: CaptureCue) => void,
   guard?: PresenceGuard,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  // Learn the neutral face first. Short enough not to feel like a wait, long
-  // enough for ~5-10 detections. The prompt during this window asks for a
-  // RELAXED face, so the baseline can't accidentally capture the action itself.
-  const CALIBRATION_MS = 800;
-  const calibrationEnds = Date.now() + CALIBRATION_MS;
+  // Calibrate by SAMPLE COUNT, not wall-clock. The first inference after a model
+  // or input-size change costs 1-3s (kernel compilation), which blew straight
+  // through an 800ms window and left the baseline at zero — the trigger then fell
+  // back to a fixed threshold no blink could reach. Counting frames cannot fail
+  // that way. The prompt here asks for a RELAXED face so the baseline can never
+  // capture the action itself.
+  const CALIBRATION_FRAMES = 6;
   // Blink: EAR must fall to this fraction of the user's own open-eye value.
   //
   // 0.62 was far too deep and broke blink entirely: face-api's 68-point model is
@@ -338,28 +379,37 @@ export async function detectChallenge(
   const BLINK_FRAMES = 1;
   // Smile: corners must rise AND the mouth widen, vs. this user's neutral.
   // Requiring both rejects "mouth open" (widens little, corners don't rise) and
-  // a jaw drop. Values are fractions of inter-eye distance, tightened 15% after
-  // a real run passed too easily.
-  const SMILE_LIFT_DELTA = 0.0138;
-  const SMILE_WIDTH_DELTA = 0.0345;
+  // a jaw drop. Fractions of inter-eye distance; tightened 15% + 10% after real
+  // runs passed too easily.
+  const SMILE_LIFT_DELTA = 0.0152;
+  const SMILE_WIDTH_DELTA = 0.0380;
+  // Jaw drop: lip gap / mouth width, over the calibrated neutral. Neutral sits
+  // near 0.1, a deliberate open mouth clears 0.4 — enormous margin.
+  const MOUTH_OPEN_DELTA = 0.22;
+  // Head yaw as a fraction of face width (see yawRatio). ~0.06 is a clear,
+  // deliberate turn; body translation produces ~0.
+  const YAW_DELTA = 0.055;
   let earBelowCount = 0;
   let sawEyesOpen = false;
-  let baselineNoseX: number | null = null;
-  const baselineSamples: number[] = [];
-  // Calibrated neutrals (filled during the calibration window).
+  // Calibrated neutrals (filled during the calibration frames).
   const earOpenSamples: number[] = [];
   const liftSamples: number[] = [];
   const widthSamples: number[] = [];
+  const openSamples: number[] = [];
+  const yawSamples: number[] = [];
+  let openNeutral = 0, yawNeutral = 0.5;
   let earOpen = 0, liftNeutral = 0, widthNeutral = 0;
   /** Deepest closure seen — reported on timeout so a near-miss is tunable. */
   let earMin = Infinity;
   const mean = (a: number[]) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
 
   const actionLabel =
-    type === 'blink' ? 'blink' :
-    type === 'smile' ? 'smile' :
+    type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
+    type === 'mouth-open' ? 'open mouth' :
     type === 'look-left' ? 'look left' : 'look right';
-  const guide: CaptureGuide = type === 'blink' ? 'blink' : type === 'smile' ? 'smile' : 'turn';
+  const guide: CaptureGuide =
+    type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
+    type === 'mouth-open' ? 'mouth' : 'turn';
   // Bar side for a head turn. Landmarks are in RAW video coordinates, so a user
   // turning to their own left moves the nose toward higher x; the feed is
   // mirrored for display, which puts that motion on the viewer's left. Hence
@@ -367,8 +417,8 @@ export async function detectChallenge(
   const turnSide: 'left' | 'right' = type === 'look-right' ? 'right' : 'left';
   // Opening prompt, in the same wording the in-progress cues use.
   const prompt =
-    type === 'blink' ? 'Blink' :
-    type === 'smile' ? 'Smile' : `Turn head ${turnSide}`;
+    type === 'blink' ? 'Blink' : type === 'smile' ? 'Smile' :
+    type === 'mouth-open' ? 'Open your mouth' : `Turn head ${turnSide}`;
 
   onStatus?.({ label: prompt, guide, left: 0, right: 0 });
 
@@ -398,10 +448,9 @@ export async function detectChallenge(
     markSeen(guard);
 
     const pts = det.landmarks.positions as Point[];
-    const videoWidth = video.videoWidth || 640;
 
-    // ── Calibration window: learn this user's neutral face ────────────────────
-    if (Date.now() < calibrationEnds) {
+    // ── Calibration: learn this user's neutral face ───────────────────────────
+    if (widthSamples.length < CALIBRATION_FRAMES) {
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
       const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
       const ear = (rightEAR + leftEAR) / 2;
@@ -409,12 +458,11 @@ export async function detectChallenge(
       const m = mouthMetrics(pts);
       liftSamples.push(m.lift);
       widthSamples.push(m.width);
-      const pct = Math.round(((CALIBRATION_MS - (calibrationEnds - Date.now())) / CALIBRATION_MS) * 100);
-      onStatus?.({
-        label: type === 'blink' ? 'Look at the camera' : type === 'smile' ? 'Relax your face' : prompt,
-        guide, left: pct, right: pct,
-      });
-      await sleep(40);
+      openSamples.push(m.open);
+      yawSamples.push(yawRatio(pts));
+      const pct = Math.round((widthSamples.length / CALIBRATION_FRAMES) * 100);
+      onStatus?.({ label: 'Relax your face', guide, left: pct, right: pct });
+      await sleep(30);
       continue;
     }
     // 70th percentile, not the mean: if the user happens to blink during the
@@ -428,7 +476,9 @@ export async function detectChallenge(
     if (!widthNeutral && widthSamples.length) {
       liftNeutral = mean(liftSamples);
       widthNeutral = mean(widthSamples);
-      debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)}`);
+      openNeutral = mean(openSamples);
+      yawNeutral = mean(yawSamples);
+      debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)} open=${openNeutral.toFixed(3)} yaw=${yawNeutral.toFixed(3)}`);
     }
 
     if (type === 'blink') {
@@ -463,28 +513,21 @@ export async function detectChallenge(
       });
 
     } else if (type === 'look-left' || type === 'look-right') {
-      const nose = pts[30];
-      if (baselineNoseX === null) {
-        baselineSamples.push(nose.x);
-        if (baselineSamples.length >= 5) {
-          baselineNoseX = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
-        } else {
-          await sleep(80); continue;
-        }
-      }
-      // Acceptance stays direction-agnostic (|delta|) as before — the anti-replay
-      // value is in "the head moved on demand", and enforcing a sign here would
-      // hard-block enrollment if the camera/mirror convention is ever inverted.
-      // The BAR uses the signed delta, so it always mirrors the real movement.
-      const signed = nose.x - baselineNoseX;
+      // Yaw, not displacement: sliding the body sideways no longer counts, because
+      // the nose keeps its position between the jaw edges. Acceptance stays
+      // direction-agnostic — the anti-replay value is "the head rotated on
+      // demand", and enforcing a sign would hard-block enrollment if the
+      // camera/mirror convention were inverted. The BAR uses the signed value,
+      // so it always mirrors the real movement.
+      const signed = yawRatio(pts) - yawNeutral;
       const delta = Math.abs(signed);
-      const threshold = videoWidth * 0.08;
-      if (delta > threshold * 0.85) {
+      debugMetrics(`turn yawΔ=${signed.toFixed(4)} needed=±${YAW_DELTA}`);
+      if (delta >= YAW_DELTA) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
         return true;
       }
-      const pct = Math.min(99, Math.round((delta / threshold) * 100));
-      const movingLeft = signed > 0;   // raw nose x rises when the user turns to their left
+      const pct = Math.min(99, Math.round((delta / YAW_DELTA) * 100));
+      const movingLeft = signed > 0;   // nose drifts toward higher x when turning to their left
       onStatus?.({
         label: `Turn head ${turnSide}`,
         guide: 'turn',
@@ -509,6 +552,16 @@ export async function detectChallenge(
         (liftΔ / SMILE_LIFT_DELTA), (widthΔ / SMILE_WIDTH_DELTA),
       ) * 100)));
       onStatus?.({ label: 'Smile', guide: 'smile', left: pct, right: pct });
+
+    } else if (type === 'mouth-open') {
+      const openΔ = mouthMetrics(pts).open - openNeutral;
+      debugMetrics(`mouth openΔ=${openΔ.toFixed(3)}/${MOUTH_OPEN_DELTA}`);
+      if (openΔ >= MOUTH_OPEN_DELTA) {
+        onStatus?.({ label: 'Mouth open detected', guide: 'mouth', left: 100, right: 100, state: 'ok' });
+        return true;
+      }
+      const pct = Math.max(0, Math.min(99, Math.round((openΔ / MOUTH_OPEN_DELTA) * 100)));
+      onStatus?.({ label: 'Open your mouth', guide: 'mouth', left: pct, right: pct });
     }
 
     // Fast cadence: a blink's closed phase is ~100ms, so polling must be as

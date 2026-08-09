@@ -689,6 +689,7 @@
     .capture-guide g { display: none; }
     .capture-guide[data-guide="turn"]  .cg-turn,
     .capture-guide[data-guide="blink"] .cg-blink,
+    .capture-guide[data-guide="mouth"] .cg-mouth,
     .capture-guide[data-guide="smile"] .cg-smile { display: block; }
 
     .cg-oval {
@@ -716,6 +717,10 @@
     /* Blink: the lids close and reopen on a human-ish cadence. */
     .cg-eye { transform-box: fill-box; transform-origin: center; animation: cg-blink 2.2s ease-in-out infinite; }
     @keyframes cg-blink { 0%, 82%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.08); } }
+
+    /* Mouth open: the jaw ellipse stretches vertically, like a slow "ahh". */
+    .cg-jaw { transform-box: fill-box; transform-origin: center top; animation: cg-jaw 1.8s ease-in-out infinite; }
+    @keyframes cg-jaw { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
 
     /* Smile: the arc draws itself in, then resets. */
     .cg-smile-arc { stroke-dasharray: 60; stroke-dashoffset: 60; animation: cg-draw 2s ease-in-out infinite; }
@@ -996,6 +1001,11 @@
             </g>
             <g class="cg-smile">
               <path class="cg-line cg-smile-arc" d="M76 96 q24 22 48 0"/>
+              <circle class="cg-line" cx="78" cy="64" r="2.5"/>
+              <circle class="cg-line" cx="122" cy="64" r="2.5"/>
+            </g>
+            <g class="cg-mouth">
+              <ellipse class="cg-line cg-jaw" cx="100" cy="100" rx="17" ry="12"/>
               <circle class="cg-line" cx="78" cy="64" r="2.5"/>
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
             </g>
