@@ -615,11 +615,27 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
+      /* Mobile: 90% of the viewport width, uncapped — on a phone the feed should
+         be as large as the screen allows. PC is sized by height instead; see the
+         min-width query below. */
       width: 90%;
-      max-width: 520px;
+      max-width: none;
       overflow: hidden;
       position: relative;
       animation: fadeIn 0.2s ease;
+    }
+
+    /* PC: the feed is 50% of the viewport HEIGHT and the width follows from the
+       camera's own aspect ratio.
+
+       Deliberately not `object-fit: cover` inside a fixed box: cropping the
+       display would show the user a tighter frame than face-api actually sees.
+       The framing gate measures eye-span against the FULL frame width, so a
+       cropped view could read as well-framed on screen while the gate still
+       says "move closer" — the exact display/detection mismatch the capture
+       flow is built to avoid. The whole frame stays visible. */
+    @media (min-width: 641px) {
+      .camera-modal-inner { width: auto; max-width: 92vw; }
     }
 
     /* Centred against the header row, not a fixed offset from the modal top —
@@ -652,6 +668,11 @@
       display: block;
       background: #000;
       transform: scaleX(-1);
+    }
+    @media (min-width: 641px) {
+      /* Height drives the size; width: auto keeps the aspect ratio so the SVG
+         guide overlay (which fills the wrapper) stays registered to the image. */
+      .camera-modal video { height: 50vh; width: auto; max-width: 92vw; margin: 0 auto; }
     }
 
     /* ── Centre-anchored capture progress ──────────────────────────────────────

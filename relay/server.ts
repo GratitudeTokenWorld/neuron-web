@@ -221,6 +221,9 @@ const FACE_USE_TTL_MS = 5 * 60 * 1000;
 
 function releaseStaleFaceUses() {
   const now = Date.now();
+  // Local flag: unlike the engine/username stores there is no module-level
+  // faceDb dirty bit — saveFaceDB() writes unconditionally — so track it here.
+  let faceDbDirty = false;
   for (const [accountId, use] of pendingFaceUses) {
     if (now - use.at < FACE_USE_TTL_MS) continue;
     pendingFaceUses.delete(accountId);
