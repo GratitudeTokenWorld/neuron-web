@@ -62,7 +62,11 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    aborts with "face left the frame" rather than continuing.
    **Anti-spoof checks worth trying:** sliding your body sideways must NOT satisfy
    the head turn (expect "turn, not slide"); holding a photo up must fail every
-   action.
+   action. The **depth** action ("move closer" / "move further away") is the
+   strongest of them — a real head changes *shape* as it approaches (the eyes are
+   nearer the lens than the jaw, so they magnify faster), while a phone, tablet or
+   print is flat and merely scales. Try it with a face on a phone screen: the size
+   changes, the shape does not, and it should report "flat image detected".
 2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
    panel then shows `2/2` (or `3/3`) independent attestations.
 3. **Pass:** account opens; balance = 1,000,000 UNIT.

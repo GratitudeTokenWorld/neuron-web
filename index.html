@@ -692,6 +692,7 @@
     .capture-guide[data-guide="eyes"]  .cg-blink,
     .capture-guide[data-guide="mouth"] .cg-mouth,
     .capture-guide[data-guide="brow"]  .cg-brow,
+    .capture-guide[data-guide="depth"] .cg-depth,
     .capture-guide[data-guide="smile"] .cg-smile { display: block; }
 
     .cg-oval {
@@ -730,6 +731,10 @@
     /* Raise eyebrows: the brow arcs lift away from the eyes and settle back. */
     .cg-brow-arc { animation: cg-brow 2s ease-in-out infinite; }
     @keyframes cg-brow { 0%, 100% { transform: translateY(4px); } 45%, 65% { transform: translateY(-4px); } }
+
+    /* Depth: the outline breathes in and out — move toward/away from the lens. */
+    .cg-depth-oval { transform-box: fill-box; transform-origin: center; animation: cg-depth 2.4s ease-in-out infinite; }
+    @keyframes cg-depth { 0%, 100% { transform: scale(0.78); opacity: 0.55; } 50% { transform: scale(1.15); opacity: 1; } }
 
     /* Mouth open: the jaw ellipse stretches vertically, like a slow "ahh". */
     .cg-jaw { transform-box: fill-box; transform-origin: center top; animation: cg-jaw 1.8s ease-in-out infinite; }
@@ -1021,6 +1026,11 @@
               <ellipse class="cg-line cg-jaw" cx="100" cy="100" rx="17" ry="12"/>
               <circle class="cg-line" cx="78" cy="64" r="2.5"/>
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
+            </g>
+            <g class="cg-depth">
+              <ellipse class="cg-line cg-depth-oval" cx="100" cy="74" rx="30" ry="40"/>
+              <path class="cg-line" d="M100 20 l-7 9 M100 20 l7 9" opacity="0.6"/>
+              <path class="cg-line" d="M100 128 l-7 -9 M100 128 l7 -9" opacity="0.6"/>
             </g>
             <g class="cg-brow">
               <path class="cg-line cg-brow-arc" d="M68 54 q12 -7 24 0"/>

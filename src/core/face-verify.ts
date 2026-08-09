@@ -63,10 +63,10 @@ export function stopCamera(stream: MediaStream): void {
 // ──── Capture cues (UI contract) ────
 
 /** Which wireframe animation the UI should overlay on the camera feed. */
-export type CaptureGuide = 'search' | 'turn' | 'blink' | 'eyes' | 'smile' | 'mouth' | 'brow' | 'hold';
+export type CaptureGuide = 'search' | 'turn' | 'blink' | 'eyes' | 'smile' | 'mouth' | 'brow' | 'depth' | 'hold';
 
 /** An action the user can be challenged to perform. */
-export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 'raise-brows' | 'look-left' | 'look-right';
+export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 'raise-brows' | 'move-depth' | 'look-left' | 'look-right';
 
 /**
  * The expressions demanded per enrollment, drawn in a random order alongside a
@@ -83,7 +83,7 @@ export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 
  * the user's own measured jitter, and blink stays out.
  */
 export const CHALLENGE_EXPRESSIONS: readonly ChallengeAction[] =
-  ['smile', 'mouth-open', 'raise-brows', 'close-eyes'];
+  ['smile', 'mouth-open', 'raise-brows', 'close-eyes', 'move-depth'];
 
 /**
  * How many expressions are demanded per enrollment (plus the head turn).
@@ -376,6 +376,20 @@ function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
 interface FaceMetrics {
   ear: number; lift: number; width: number; open: number;
   yaw: number; skew: number; centreX: number; brow: number;
+  /** Eye span as a fraction of frame width — how big the head is. */
+  frac: number;
+  /**
+   * PERSPECTIVE shape: eye span over jaw width.
+   *
+   * The eyes sit ~8-10cm nearer the lens than the jaw silhouette, so on a real
+   * 3D head this ratio RISES as the face approaches (near features magnify
+   * faster) and falls as it recedes. On a flat surface — a phone, a tablet, a
+   * printed photo — every point is the same distance away, so moving it only
+   * scales the image and this ratio does not change at all. That difference is
+   * what the depth challenge tests, and it is the one check a screen replay
+   * cannot fake no matter what it displays.
+   */
+  shape: number;
 }
 
 /** Neutral plus the measured jitter of the open-eye signal (see close-eyes). */
@@ -404,6 +418,11 @@ function metricsOf(pts: Point[], videoWidth: number): FaceMetrics {
     yaw: y.jawRatio, skew: y.skew,
     centreX: frameCentreX(pts, videoWidth),
     brow: browLift(pts),
+    frac: faceScale(pts) / (videoWidth || 640),
+    shape: (() => {
+      const jaw = Math.abs(pts[16].x - pts[0].x);
+      return jaw < 1 ? 0 : faceScale(pts) / jaw;
+    })(),
   };
 }
 
@@ -516,7 +535,7 @@ export async function calibrateNeutral(
     ear: open.length ? open[Math.floor(open.length * 0.7)] : med(m => m.ear),
     lift: med(m => m.lift), width: med(m => m.width), open: med(m => m.open),
     yaw: med(m => m.yaw), skew: med(m => m.skew), centreX: med(m => m.centreX),
-    brow: med(m => m.brow),
+    brow: med(m => m.brow), frac: med(m => m.frac), shape: med(m => m.shape),
     // Spread of the open-eye EAR. close-eyes compares a windowed MEAN against
     // this, so the bar has to be set from the noise, not from a guessed factor.
     earSd: (() => {
@@ -525,7 +544,7 @@ export async function calibrateNeutral(
       return Math.sqrt(xs.reduce((a, b) => a + (b - mu) ** 2, 0) / (xs.length || 1));
     })(),
   };
-  debugMetrics(`neutral(once): ear=${neutral.ear.toFixed(3)} lift=${neutral.lift.toFixed(4)} width=${neutral.width.toFixed(4)} open=${neutral.open.toFixed(3)} yaw=${neutral.yaw.toFixed(3)} skew=${neutral.skew.toFixed(3)} cx=${neutral.centreX.toFixed(3)} brow=${neutral.brow.toFixed(4)} earSd=${neutral.earSd.toFixed(4)}`);
+  debugMetrics(`neutral(once): ear=${neutral.ear.toFixed(3)} lift=${neutral.lift.toFixed(4)} width=${neutral.width.toFixed(4)} open=${neutral.open.toFixed(3)} yaw=${neutral.yaw.toFixed(3)} skew=${neutral.skew.toFixed(3)} cx=${neutral.centreX.toFixed(3)} brow=${neutral.brow.toFixed(4)} earSd=${neutral.earSd.toFixed(4)} frac=${neutral.frac.toFixed(3)} shape=${neutral.shape.toFixed(4)}`);
   return neutral;
 }
 
@@ -623,6 +642,11 @@ export async function detectChallenge(
   // slide fail even when it drifts less than the cap above.
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
+  // Depth challenge. The size change must be large enough for perspective to be
+  // measurable, and the SHAPE must move with it — that second half is the actual
+  // anti-spoof, because a flat screen scales without changing shape at all.
+  const DEPTH_SIZE_RATIO = 1.35;    // when approaching (inverse when receding)
+  const DEPTH_SHAPE_DELTA = 0.025;  // relative change in eye-span / jaw-width
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
   const BROW_DELTA = 0.025;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
@@ -668,12 +692,12 @@ export async function detectChallenge(
   const actionLabel =
     type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
     type === 'mouth-open' ? 'open mouth' : type === 'raise-brows' ? 'raise eyebrows' :
-    type === 'close-eyes' ? 'close eyes' :
+    type === 'close-eyes' ? 'close eyes' : type === 'move-depth' ? 'move closer/away' :
     type === 'look-left' ? 'look left' : 'look right';
   const guide: CaptureGuide =
     type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
     type === 'mouth-open' ? 'mouth' : type === 'raise-brows' ? 'brow' :
-    type === 'close-eyes' ? 'eyes' : 'turn';
+    type === 'close-eyes' ? 'eyes' : type === 'move-depth' ? 'depth' : 'turn';
   // Bar side for a head turn. Landmarks are in RAW video coordinates, so a user
   // turning to their own left moves the nose toward higher x; the feed is
   // mirrored for display, which puts that motion on the viewer's left. Hence
@@ -684,7 +708,9 @@ export async function detectChallenge(
     type === 'blink' ? 'Blink' : type === 'smile' ? 'Smile' :
     type === 'mouth-open' ? 'Open your mouth' :
     type === 'raise-brows' ? 'Raise your eyebrows' :
-    type === 'close-eyes' ? 'Close your eyes' : `Turn head ${turnSide}`;
+    type === 'close-eyes' ? 'Close your eyes' :
+    type === 'move-depth' ? (neutral && neutral.frac > 0.25 ? 'Move further away' : 'Move closer') :
+    `Turn head ${turnSide}`;
 
   onStatus?.({ label: prompt, guide, dir: guide === 'turn' ? turnSide : undefined, left: 0, right: 0 });
 
@@ -889,6 +915,38 @@ export async function detectChallenge(
       }
       const pct = Math.max(0, Math.min(99, Math.round((browΔ / BROW_DELTA) * 100)));
       onStatus?.({ label: 'Raise your eyebrows', guide: 'brow', left: pct, right: pct });
+
+    } else if (type === 'move-depth') {
+      const m = metricsOf(pts, video.videoWidth);
+      const fracRef = neutral?.frac || m.frac;
+      const shapeRef = neutral?.shape || m.shape;
+      // Approach unless the head already fills the frame, in which case recede.
+      const wantCloser = fracRef <= 0.25;
+      const sizeGoal = wantCloser ? DEPTH_SIZE_RATIO : 1 / DEPTH_SIZE_RATIO;
+      const sizeProgress = wantCloser
+        ? (m.frac / fracRef - 1) / (sizeGoal - 1)
+        : (1 - m.frac / fracRef) / (1 - sizeGoal);
+      // Perspective must move in the direction the motion implies.
+      const shapeRel = shapeRef > 0 ? (m.shape / shapeRef - 1) : 0;
+      const shapeProgress = (wantCloser ? shapeRel : -shapeRel) / DEPTH_SHAPE_DELTA;
+      debugMetrics(`depth frac=${m.frac.toFixed(3)}/${fracRef.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)} wantCloser=${wantCloser}`);
+
+      if (sustained(sizeProgress >= 1 && shapeProgress >= 1)) {
+        onStatus?.({ label: 'Depth confirmed', guide: 'depth', left: 100, right: 100, state: 'ok' });
+        return true;
+      }
+      // If the head clearly moved but the shape did NOT, the surface is flat —
+      // a phone, tablet or print. Say so rather than letting it time out silently.
+      if (sizeProgress >= 1 && shapeProgress < 0.35) {
+        onStatus?.({ label: 'Flat image detected — use your real face', guide: 'depth', left: 0, right: 0 });
+        await sleep(60);
+        continue;
+      }
+      const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
+      onStatus?.({
+        label: wantCloser ? 'Move closer' : 'Move further away',
+        guide: 'depth', left: pct, right: pct,
+      });
 
     } else if (type === 'close-eyes') {
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
