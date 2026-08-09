@@ -944,7 +944,12 @@ async function challengeAndCapture(
       return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
     }
     // Watched pause — a blind sleep here would be a free window to swap faces.
-    if (!await holdPresence(video, 700, presence, cue => renderCaptureCue(cue))) {
+    // Also long enough (and explicitly prompted) for the user to RETURN TO
+    // NEUTRAL: the next action calibrates its baseline immediately, and a
+    // baseline caught mid-action (mouth still open, head still turned) makes
+    // that check either unpassable or free.
+    renderCaptureCue({ label: 'Relax your face', guide: 'hold', left: 0, right: 0 });
+    if (!await holdPresence(video, 1200, presence, cue => renderCaptureCue(cue))) {
       addLog('FaceID: face left the frame between checks', 'error');
       return { failure: { kind: 'presence' } };
     }

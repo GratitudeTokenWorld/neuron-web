@@ -311,17 +311,33 @@ function mouthMetrics(pts: Point[]): { lift: number; width: number; open: number
 }
 
 /**
- * Head YAW, independent of where the head is in the frame.
+ * TWO independent head-yaw estimates, both translation- and scale-invariant.
  *
- * Nose tip's position between the jaw edges (0 ↔ 16), 0.5 when facing forward.
- * Sliding the whole body sideways moves nose and jaw together so the ratio does
- * not change — only actually ROTATING the head does. The previous test measured
- * raw nose-x displacement in pixels, which is why shifting your body passed it.
+ * A single estimate is not enough: sliding the body sideways still shifts a face
+ * that sits off-centre in the lens, because perspective genuinely rotates it a
+ * little. Demanding that two estimators built from *different* landmark groups
+ * agree — in magnitude and in sign — separates a deliberate head rotation from
+ * that residual perspective drift.
+ *
+ *  - `skew`     nose tip's distance to the far vs near outer eye corner,
+ *               normalised by eye span. Eye landmarks are the most stable in the
+ *               68-point model, so this is the primary signal.
+ *  - `jawRatio` nose tip's position between the jaw edges (0.5 facing forward).
+ *               Silhouette points are noisier, so it acts as the corroborator.
+ *
+ * Both are 0-centred at rest (jawRatio at 0.5) and both grow in the SAME
+ * direction as the head turns, so a sign check is meaningful.
  */
-function yawRatio(pts: Point[]): number {
-  const left = pts[0].x, right = pts[16].x;
-  const span = right - left;
-  return Math.abs(span) < 1 ? 0.5 : (pts[30].x - left) / span;
+function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
+  const nose = pts[30];
+  const eyeR = pts[36];               // subject's right eye, outer corner
+  const eyeL = pts[45];               // subject's left eye, outer corner
+  const eyeSpan = dist(eyeR, eyeL) || 1;
+  const jawSpan = pts[16].x - pts[0].x;
+  return {
+    skew: (dist(nose, eyeR) - dist(nose, eyeL)) / eyeSpan,
+    jawRatio: Math.abs(jawSpan) < 1 ? 0.5 : (nose.x - pts[0].x) / jawSpan,
+  };
 }
 
 /** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
@@ -361,7 +377,21 @@ export async function detectChallenge(
   // back to a fixed threshold no blink could reach. Counting frames cannot fail
   // that way. The prompt here asks for a RELAXED face so the baseline can never
   // capture the action itself.
-  const CALIBRATION_FRAMES = 6;
+  // Collect 10, discard the first 4, take the MEDIAN of the rest.
+  //
+  // Measured baselines were being poisoned by the tail of the PREVIOUS action:
+  // real runs calibrated at yaw=0.198 (head still turned) and open=0.495 (mouth
+  // still open) where neutral is ~0.59 and ~0.33. A baseline captured mid-action
+  // makes the next check either unpassable or free — which is exactly the
+  // "passed instantly without doing anything" symptom. Dropping the leading
+  // frames skips the transition, and a median ignores any that slip through.
+  const CALIBRATION_FRAMES = 10;
+  const CALIBRATION_DROP = 4;
+  const median = (a: number[]) => {
+    const s = [...a].sort((x, y) => x - y);
+    return s.length ? s[Math.floor(s.length / 2)] : 0;
+  };
+  const settled = (a: number[]) => median(a.slice(CALIBRATION_DROP));
   // Blink: EAR must fall to this fraction of the user's own open-eye value.
   //
   // 0.62 was far too deep and broke blink entirely: face-api's 68-point model is
@@ -386,9 +416,13 @@ export async function detectChallenge(
   // Jaw drop: lip gap / mouth width, over the calibrated neutral. Neutral sits
   // near 0.1, a deliberate open mouth clears 0.4 — enormous margin.
   const MOUTH_OPEN_DELTA = 0.22;
-  // Head yaw as a fraction of face width (see yawRatio). ~0.06 is a clear,
-  // deliberate turn; body translation produces ~0.
-  const YAW_DELTA = 0.055;
+  // Head turn. Measured: at rest the jaw-ratio jitters ±0.03, and a deliberate
+  // turn reached 0.12 — so 0.055 sat only ~2x above noise, which is why leaning
+  // sideways could clear it. 0.085 keeps a real turn comfortable while putting
+  // ~3x the noise band between them. The skew corroborator must move too: body
+  // translation barely changes it, a rotation changes it a lot.
+  const YAW_DELTA = 0.085;
+  const SKEW_DELTA = 0.05;
   let earBelowCount = 0;
   let sawEyesOpen = false;
   // Calibrated neutrals (filled during the calibration frames).
@@ -397,11 +431,11 @@ export async function detectChallenge(
   const widthSamples: number[] = [];
   const openSamples: number[] = [];
   const yawSamples: number[] = [];
-  let openNeutral = 0, yawNeutral = 0.5;
+  const skewSamples: number[] = [];
+  let openNeutral = 0, yawNeutral = 0.5, skewNeutral = 0;
   let earOpen = 0, liftNeutral = 0, widthNeutral = 0;
   /** Deepest closure seen — reported on timeout so a near-miss is tunable. */
   let earMin = Infinity;
-  const mean = (a: number[]) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
 
   const actionLabel =
     type === 'blink' ? 'blink' : type === 'smile' ? 'smile' :
@@ -459,7 +493,9 @@ export async function detectChallenge(
       liftSamples.push(m.lift);
       widthSamples.push(m.width);
       openSamples.push(m.open);
-      yawSamples.push(yawRatio(pts));
+      const y = yawSignals(pts);
+      yawSamples.push(y.jawRatio);
+      skewSamples.push(y.skew);
       const pct = Math.round((widthSamples.length / CALIBRATION_FRAMES) * 100);
       onStatus?.({ label: 'Relax your face', guide, left: pct, right: pct });
       await sleep(30);
@@ -474,11 +510,12 @@ export async function detectChallenge(
       earOpen = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.7))];
     }
     if (!widthNeutral && widthSamples.length) {
-      liftNeutral = mean(liftSamples);
-      widthNeutral = mean(widthSamples);
-      openNeutral = mean(openSamples);
-      yawNeutral = mean(yawSamples);
-      debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)} open=${openNeutral.toFixed(3)} yaw=${yawNeutral.toFixed(3)}`);
+      liftNeutral = settled(liftSamples);
+      widthNeutral = settled(widthSamples);
+      openNeutral = settled(openSamples);
+      yawNeutral = settled(yawSamples);
+      skewNeutral = settled(skewSamples);
+      debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)} open=${openNeutral.toFixed(3)} yaw=${yawNeutral.toFixed(3)} skew=${skewNeutral.toFixed(3)}`);
     }
 
     if (type === 'blink') {
@@ -519,14 +556,23 @@ export async function detectChallenge(
       // demand", and enforcing a sign would hard-block enrollment if the
       // camera/mirror convention were inverted. The BAR uses the signed value,
       // so it always mirrors the real movement.
-      const signed = yawRatio(pts) - yawNeutral;
+      const y = yawSignals(pts);
+      const signed = y.jawRatio - yawNeutral;
+      const skewΔ = y.skew - skewNeutral;
       const delta = Math.abs(signed);
-      debugMetrics(`turn yawΔ=${signed.toFixed(4)} needed=±${YAW_DELTA}`);
-      if (delta >= YAW_DELTA) {
+      // Two independent estimators, both past threshold and both moving the SAME
+      // way. Leaning or sliding sideways nudges the jaw ratio (perspective) but
+      // leaves the eye-referenced skew almost untouched, so it can no longer pass.
+      const agree = Math.sign(signed) === Math.sign(skewΔ);
+      debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} agree=${agree}`);
+      if (delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
         return true;
       }
-      const pct = Math.min(99, Math.round((delta / YAW_DELTA) * 100));
+      // Bar tracks the WEAKER signal, so it only fills on a genuine rotation.
+      const pct = Math.min(99, Math.round(Math.min(
+        delta / YAW_DELTA, Math.abs(skewΔ) / SKEW_DELTA,
+      ) * 100));
       const movingLeft = signed > 0;   // nose drifts toward higher x when turning to their left
       onStatus?.({
         label: `Turn head ${turnSide}`,
