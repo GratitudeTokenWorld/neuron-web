@@ -1,4 +1,13 @@
-# Scaling NeuronChain to 1B+ Users — Reference Architecture Roadmap
+# Scaling NeuronChain to 10B Users — Reference Architecture Roadmap
+
+> **Target raised 1B → 10B (decided 2026-08-09).** The design was written
+> against 1B; the *Measured baseline* below projects it at 10B and it holds,
+> because nothing in the architecture depends on N — every role's cost is
+> bounded by its declared capacity, and demand growth is met by fleet growth.
+> The keyword is **decentralized**: no role — archival super-nodes included —
+> is *required* to hold everything (full mirrors stay allowed as an opt-in
+> durability bonus). Where "1B" appears in historical prose below, read it as
+> the era the text was written in, not the ceiling.
 
 ## Context
 
@@ -12,7 +21,7 @@ distributed media store, and a cryptographically sound face+PIN+post-quantum
 identity/recovery layer.
 
 **Goal of this document:** a *reference architecture* showing how the **current
-features** can be re-expressed so the core scales to 1B+ users. Success = a
+features** can be re-expressed so the core scales to 10B users. Success = a
 credible, benchmarkable architecture where **per-node cost is bounded by the data
 a node actually cares about, not by total network size.**
 
@@ -20,7 +29,7 @@ The single acceptance criterion everything below serves:
 
 > **Scale invariant:** for any node, memory, storage, bandwidth, and CPU must be
 > `O(own data + followed/subscribed data)` — never `O(total network)`. If any
-> subsystem is `O(N)` in users, posts, files, or votes, it fails at 1B.
+> subsystem is `O(N)` in users, posts, files, or votes, it fails at 10B.
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
@@ -38,7 +47,7 @@ The single acceptance criterion everything below serves:
 
 ## Target topology: tiered hybrid
 
-Pure browser-P2P at 1B is an unsolved problem; the realistic, benchmarkable path
+Pure browser-P2P at 10B is an unsolved problem; the realistic, benchmarkable path
 is three cooperating tiers. The current code already implies this split (browser
 clients + relay servers) — we formalize and scale it.
 
@@ -225,7 +234,7 @@ them needs global balances. Forks, however, are strictly per-account.
   signatures attest it; mismatches are challengeable.
 - **Finality stays local & fast:** the 2/3 threshold / 10s timeout
   ([vote.ts:45-46](src/core/vote.ts#L45)) now resolves within a small shard
-  committee instead of waiting on a 1B-node broadcast.
+  committee instead of waiting on a 10B-node broadcast.
 
 **Reused:** entire `VoteManager`, optimistic path, abstain logic, `chainHeadHash`
 balance proof. **New:** per-shard vote topics, shard committee membership, Merkle
@@ -431,7 +440,7 @@ content routing, interest-scoped announcements, quota guard, archival pinning, G
 ([relay-server.js:134,157-169]) — more relays = weaker Sybil resistance; O(n)
 linear face matching; ledger Sybil check is hash-only & effectively dead
 ([dag-ledger.ts:181-210]); biometric uniqueness is statistically + legally
-untenable at 1B.
+untenable at 10B.
 
 **Target design**
 - **Keep the sound crypto unchanged.** Account model (`pub` + PQ keys +
@@ -521,7 +530,7 @@ component in the system.
   (locked mint) offset by reward inflation. Inflation rate is a security-budget
   parameter to tune (too high dilutes/gameable; too low under-incentivizes).
 - **Observability & load-testing harness:** simulation able to spin up N virtual
-  nodes and measure the scale invariant — without it, "scales to 1B" can't be
+  nodes and measure the scale invariant — without it, "scales to 10B" can't be
   confirmed.
 - **Security:** shard takeover resistance (min super-nodes/shard), DHT eclipse
   resistance, attestation collusion bounds.
@@ -539,20 +548,28 @@ Phase status against the plan below, and what a new session should pick up.
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
 | 3 — Storage CDN + tiered nodes | **engine built, NOT wired** | `src/engine/content` exists; `storage-manager.ts` still on the legacy `DAGLedger`, `EngineLedger.createStorage*` are `deferred()` stubs |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
-| Verification (below) | **never run** | `src/engine/sim` harness exists; the 10x/100x/1000x flat-cost proof has not been executed |
+| Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 
 The manual E2E matrix (TESTPLAN T1-T6) passed on the two-relay dev network on
 2026-08-09; T7 (operator reset) was skipped by decision as a dev-mode affordance.
 
-**Recommended next step: run the simulation first.** It is already built, it is
-the cheapest step, and it converts "G1 is a known violation" into a measured
-curve — which then says whether G1 or G2 is the real bottleneck and gives a
-before/after number to prove a fix worked. Implementing G1 first means rewriting
-username resolution with no baseline to compare against.
+The simulation baseline has been run and extended (see *Measured baseline*
+below): the engine's block layer holds the invariant exactly, and the harness
+now also measures the **fix designs** for G1 (DHT directory), G2 (counterparty
+proof packets) and decentralized archival, plus a 10B projection from the
+measured constants. Each G-fix now has a before/after number waiting for its
+implementation.
 
-Then, in order: **G1** (global `accounts` topic — fails first), **G2**
-(counterparty chain replication), **Phase 3 wiring**, **Phase 4**. The migration
-seam (~182 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
+**G1 is implemented (2026-08-09)** — clients no longer ingest the global
+`accounts` topic; relays archive + serve records via `/resolve` and clients
+resolve on demand with local signature verification (see *Deferred gaps* → G1
+for the change list). It needs a **manual re-run of TESTPLAN T2/T3/T5** (face
+flows can't be automated; resolution, transfers and recovery all cross the new
+path).
+
+Next, in order: **G2** (counterparty chain replication — measured target
+`sim/counterparty.ts`), **Phase 3 wiring**, **Phase 4**. The migration seam
+(~182 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
 caller, as each one is moved off the `DAGLedger` compatibility surface.
 
 ---
@@ -584,7 +601,7 @@ Each phase is independently benchmarkable; do not advance until its invariant ho
 
 ---
 
-## Verification — how to confirm "scales to 1B without issues"
+## Verification — how to confirm "scales to 10B without issues"
 
 Build a **discrete-event / multi-process simulation** (virtual nodes against the
 real protocol code) and assert these **scale invariants** as simulated user count
@@ -605,6 +622,85 @@ Pass criteria: invariants 1–5 hold flat across the sweep; 6 verified by advers
 multi-attester test; 7 verified by archival-retrieval test. Any `O(N)` curve =
 not ready.
 
+### Measured baseline (run 2026-08-09, `src/engine/sim`)
+
+The harness was run and then **extended to cover what the original scenario was
+structurally blind to**: the original `scenario.ts` routes only engine *blocks*
+(no account directory → G1 invisible; no receive/counterparty path → G2
+invisible). Four modules now measure each mechanism with real crypto at feasible
+N, plus a projection to target scale. All are asserted in tests (`npm test`).
+
+**1. Interest-routed blocks (`scenario.ts`) — invariants 1, 2, 4.** Per-node
+cost is *exactly* the follow bound, flat across a 256× sweep
+(follow=25, blocks/account=5):
+
+| N | recv/node | store/node | KB/node | broadcast baseline | saving |
+|---|---|---|---|---|---|
+| 50 | 130 | 130 | 82.3 | 250 | 1.9× |
+| 800 | 130 | 130 | 82.3 | 4,000 | 30.8× |
+| 12,800 | 130 | 130 | 82.3 | 64,000 | 492.3× |
+
+**2. G1 fix measured (`directory.ts`) — username directory as DHT records.**
+One signed record = **328 B**; a client pays only for names it resolves (flat
+16 KB for 50 names at any N), a server holds ≈ k/M of the directory, lookups
+are O(log M) hops. Control: today's global `accounts` topic costs every node
+the whole directory — and the *live* record is **4,889 B** (dominated by
+`pqPub`/`pqKemPub`, which don't belong in a directory), re-published by every
+node for every account it holds on a 20 s tick with an unconditional IDB write
+per receipt. G1 is worse than "O(N) once"; it is O(N) per tick.
+
+| N / servers | client KB | gossip baseline KB | server share | hops avg/max |
+|---|---|---|---|---|
+| 4,000 / 32 | 16.0 | 1,281 | 34.2% | 2.4 / 4 |
+| 16,000 / 128 | 16.0 | 5,125 | 12.0% | 3.2 / 6 |
+| 64,000 / 512 | 16.0 | 20,500 | 3.6% | 4.3 / 7 |
+
+**3. G2 fix measured (`counterparty.ts`) — verify by proof, drop the chain.**
+Real signed chains, real RFC-6962 proofs: the compact packet
+`{open, head, open-proof, send, send-proof}` verifies a payment **and** the
+sender's verified-human genesis in O(log n); tampering (wrong recipient, altered
+amount, foreign block, truncated proof) is rejected.
+
+| sender chain | full-chain pull (today) | proof packet (fix) | saving |
+|---|---|---|---|
+| 16 | 9.3 KB | 2.66 KB | 3.5× |
+| 256 | 143.0 KB | 3.19 KB | 44.8× |
+| 1,024 | 571.3 KB | 3.45 KB | 165.5× |
+
+**4. Decentralized archival (`archival.ts`) — no required full replica.**
+Each account's history gets exactly **K rendezvous-assigned holders** (HRW, same
+math as the relay federation) out of an open fleet S — per-account granularity,
+so there is no O(N/4096) per-shard floor. Sweeping N and S together 16×
+(K=4): per-node load stays flat (≈ K·N·bytes/S), losing any node costs at most
+that one holder, a joiner takes ≈ K/S of slots, and the largest node's share of
+the archive shrinks 52% → 14% → 3.6%. **Full replicas remain opt-in** — an
+operator may mirror everything (today's two dev relays do exactly that) as a
+durability bonus, but the required redundancy is met without them, so they are
+never load-bearing.
+
+**5. Projection to 1B/10B (`projection.ts`) — from measured constants.**
+Constants measured from real objects (block 569 B canonical, packet 2,993 B,
+directory record 328 B), assumptions: chain length 200, follows 200, 2
+posts/day, K=4, k=8, 2 TB archive nodes, 50M-record directory servers, 5,000-peer
+relays, 5% concurrent:
+
+| | 1B users | 10B users |
+|---|---|---|
+| Light client | 0.8 MB stored, 0.23 MB/day | **identical** (N-independent) |
+| Archive total | 0.11 PB | 1.14 PB |
+| Archive fleet (2 TB nodes) | 228 · share 0.44% | 2,276 · share 0.04% |
+| Directory fleet | 160 · 16.4 GB each | 1,600 · share 0.06% |
+| Relay fleet | 20,000 | 200,000 |
+| Committee residual | 5.7 blk/s/shard | 56.5 blk/s/shard |
+
+The decentralization law all of this encodes: **a node's cost is set by its
+declared capacity, never by network size; demand growth is met by fleet growth,
+so every node's share of any global dataset → 0.** The one honest O(N/shards)
+residual is committee validation traffic — at 10B and 4,096 shards still only
+~57 blocks/s per shard (one modest machine), but the projection asserts the
+ceiling so growth past it forces the shard-count parameter up rather than
+silently overloading validators.
+
 ---
 
 ## What is already sound (keep, do not redesign)
@@ -619,22 +715,34 @@ not ready.
 
 ## Deferred: scale-invariant gaps in the CURRENT build
 
-> **Status: explore after the architecture/refactor work is finished** (agreed
-> 2026-08-09, during the two-relay manual E2E run). Both are live violations of
-> the invariant in this repo today. Neither hurts a small testnet, and both have
-> a designed fix already described above — they are *unimplemented*, not unsolved.
-> Revisit them together: they are the two remaining `O(N)`-shaped subsystems.
+> **Status (2026-08-09): G1 is implemented** (pending the manual T2/T3/T5
+> re-run — resolution, transfers and recovery all cross the new `/resolve`
+> path). **G2 remains a live violation** with a measured fix design waiting
+> (`sim/counterparty.ts`).
 
-**G1 — The global `accounts` topic is `O(N)` (the one that fails first).**
-Every client subscribes to a single network-wide `accounts` gossip topic
-([`libp2p-network.ts`](../src/network/libp2p-network.ts) `start()`), so **every
-node ingests every account record ever created** — memory, bandwidth and storage
-all scale with total users, not with interest. Engine *blocks* are already
-correctly per-shard; the account/username directory is the straggler. It is also
-why a sender needs the recipient's record locally before `createSend` can resolve
-a username at all. *Designed fix (Subsystem 3):* interest-scoped announcements +
-on-demand resolution — look a username up via the DHT (`findProviders`) when you
-need it instead of ingesting the whole directory; cache what you resolve.
+**G1 — The global `accounts` topic is `O(N)`. FIXED 2026-08-09 (client dir
+ingest gone; awaiting manual T2 re-verify).** What shipped:
+- **Clients no longer subscribe** to the global `accounts` topic
+  ([`libp2p-network.ts`](../src/network/libp2p-network.ts) `start()`), and
+  `publishLocalData` no longer echoes foreign records (which also kills the
+  stale-anchor reversion risk outright). Owners still publish their OWN records
+  on the topic (create/update/20 s tick) — O(own), invariant-clean.
+- **Relays are the directory tier**: they archive engine-verified records from
+  the topic (`.relay-accounts.json`) and serve them via **GET `/resolve`**
+  (`?username=` or `?pub=`, plain CORS, no preflight). Forged records are
+  dropped at the relay (signature check) and again at the client.
+- **On-demand resolution**: `node.resolveAccount(identifier)` → local ledger →
+  relay `/resolve` → signature-verify (`network/account-resolver.ts`, records
+  self-sign `account:{pub}:{username}:{createdAt}:{faceMapHash}` with the
+  engine key) → register + cache. Wired into the send flow, NFT transfer, token
+  transfer, explorer search, the API surface (`api.send`, `api.resolveAccount`)
+  and the recovery integrity check (which on a wiped device previously skipped
+  silently). Create-path records are now engine-signed from the start
+  (previously app-JWK-signed until the first 20 s tick re-signed them).
+- Per-client directory cost is now O(contacts resolved), measured shape in
+  `sim/directory.ts` (328 B record, flat per client). *At scale* the relay
+  `/resolve` call is replaced by DHT `findProviders` — the call site
+  (`account-resolver.ts`) is the seam; the record format doesn't change.
 
 **G2 — Counterparty verification replicates whole chains.**
 A recipient pulls the sender's **entire account chain** to verify one payment
@@ -648,6 +756,9 @@ so an offline-received send is not missed ([`node.ts`](../src/network/node.ts)
 via a per-account **Merkle accumulator inclusion proof** from a super-node in
 `O(log n)`, keep only your own receive block + the proof, and drop the foreign
 chain. Also caps the startup refresh (proof re-check, not chain re-pull).
+*The fix is measured:* `sim/counterparty.ts` builds the packet from real chains
+and proofs — 3.45 KB flat vs a 571 KB chain pull at length 1,024, adversarial
+cases rejected (see *Measured baseline*).
 
 **Consequence to keep in mind meanwhile (correct, not a bug):** node views are
 *asymmetric by design* — a recipient holds the sender's chain, the sender holds
@@ -659,7 +770,7 @@ the recipient's shard; a "claimed ✓" indicator needs an inbox ack.
 
 ## Hard problems / honest open risks
 
-- **1B pure-P2P is unsolved;** the tiered-hybrid topology is what makes it
+- **10B pure-P2P is unsolved;** the tiered-hybrid topology is what makes it
   tractable — accept the (open-membership, redundant) super-node/relay tiers.
 - **Identity is now consensus-critical (mitigated by defense-in-depth).** The capped
   age-weighted model removes the capital dimension, so consensus security reduces to
@@ -670,7 +781,7 @@ the recipient's shard; a "claimed ✓" indicator needs an inbox ack.
   honest-minority fork). Residual: the personhood/dedup layer still warrants the most
   adversarial testing of any component, and Layer 3's weak-subjectivity checkpoints
   reintroduce a small, bounded dose of social trust.
-- **Biometric uniqueness at 1B** hits statistical false-match limits even with
+- **Biometric uniqueness at 10B** hits statistical false-match limits even with
   ZK dedup — pluggable attestations hedge this; don't rely on face alone.
 - **Inflation tuning & activity-age gaming.** The reward-inflation rate is a live
   security-budget knob; and "activity-based age" must be defined so participation

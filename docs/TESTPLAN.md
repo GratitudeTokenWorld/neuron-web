@@ -107,11 +107,22 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 
 ## T2 — Account sync across relays (the "did not sync" bug)
 
+> **Changed by G1 (2026-08-09):** clients no longer ingest the global `accounts`
+> topic. Browser A learns about `bob` **on demand** — the explorer search / send
+> flow calls the relays' `GET /resolve?username=bob` and verifies the record's
+> signature locally. So bob will NOT appear in A spontaneously; he appears when
+> A first searches for or sends to him. Sanity-check the endpoint directly:
+> `curl "http://80.97.27.224:9092/resolve?username=bob&network=testnet"` (expect
+> the JSON record within ~20 s of bob's creation — the owner's publish tick).
+> Also expect `[Archive] Stored account record user=…` in relay logs with
+> `DEBUG_ARCHIVE=1`.
+
 1. Browser B (other profile) → create `bob` (same face is fine on testnet, limit 3).
-2. In Browser A, look up `bob` (search/profile). **Pass:** bob's account + username
-   resolve in A within ~10 s without either browser talking to the other directly
-   (close B's tab first for a stricter test: A must get bob's chain from a relay
-   archive, not from B).
+2. In Browser A, **search for `bob`** (explorer search) or start a transfer to
+   him. **Pass:** bob's account + username resolve in A within ~10 s without
+   either browser talking to the other directly (close B's tab first for a
+   stricter test: A must get bob's record from a relay `/resolve` and his chain
+   from a relay archive, not from B).
 3. Reload Browser A (F5). **Pass:** alice persists, balance intact, no re-enrollment.
 4. `curl http://80.97.27.224:9092/relay-info` and RELAY2: same `generation`, and both
    relays' logs show bob's open block archived (`[Archive] Stored open …`).
@@ -191,12 +202,16 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 | # | Test | Result | Notes |
 |---|------|--------|-------|
 | T1 | 2-attester account creation | ☑ | |
-| T2 | Cross-relay account sync | ☑ | |
-| T3 | Transfers + offline claim | ☑ | |
-| T4 | NFT mint/transfer/burn | ☑ | Reload loss fixed in `482ac05` — replay order across accounts |
-| T5 | Recovery after wipe (1 relay down) | ☑ | |
+| T2 | Cross-relay account sync | ☑ → ☐ | **Re-run needed:** G1 moved resolution to on-demand `/resolve` (2026-08-09) |
+| T3 | Transfers + offline claim | ☑ → ☐ | **Re-run needed:** send flow now resolves the recipient via `/resolve` |
+| T4 | NFT mint/transfer/burn | ☑ | Reload loss fixed in `482ac05`; transfer recipient now resolves on demand |
+| T5 | Recovery after wipe (1 relay down) | ☑ → ☐ | **Re-run needed:** blob integrity check now fetches the record via `/resolve` on a wiped device |
 | T6 | Username uniqueness + face limit | ☑ | |
 | T7 | Operator-gated reset | ☐ | Skipped by decision — reset is a dev-mode affordance |
+
+> Re-runs require deploying the updated relay to both cloud boxes first
+> (`git pull && npm install && pm2 restart neuron-relay`, then check `pm2 jlist`
+> restart counts again after >60 s — see CLAUDE.md relay caution).
 
 File failures with: browser console log, `pm2 logs` from both relays, and which
 browser/profile was which account.

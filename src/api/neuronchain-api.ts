@@ -104,7 +104,12 @@ export class NeuronChainAPI extends EventEmitter {
 
   getAccount(pub: string) { return this.node.ledger.getAccountByPub(pub); }
   getAccountByUsername(username: string) { return this.node.ledger.getAccountByUsername(username); }
+  /** Synchronous, local-only. Prefer {@link resolveAccount} which also fetches
+   *  unknown counterparties on demand (G1 — records are no longer gossiped). */
   resolveAddress(identifier: string): string | undefined { return this.node.ledger.resolveToPublicKey(identifier); }
+  /** Resolve a username/accountId, fetching + verifying from a relay directory
+   *  if unknown locally. Returns null if no relay has a verifiable record. */
+  resolveAccount(identifier: string): Promise<string | null> { return this.node.resolveAccount(identifier); }
 
   // ── Transfers ─────────────────────────────────────────────────────────────
 
@@ -118,6 +123,9 @@ export class NeuronChainAPI extends EventEmitter {
     amount: number,
     keys: KeyPair,
   ): Promise<{ block?: AccountBlock; error?: string }> {
+    // G1: recipient records are not gossiped any more — resolve on demand so
+    // the ledger's synchronous lookup inside createSend succeeds.
+    if (!(await this.node.resolveAccount(toIdentifier))) return { error: 'Recipient not found' };
     const result = await this.node.ledger.createSend(fromPub, toIdentifier, amount, keys);
     if (!result.block) return result;
     const submitResult = await this.node.submitBlock(result.block);

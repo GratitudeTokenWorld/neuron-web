@@ -10,6 +10,8 @@ import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, deriv
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
+import { sign as engineSignRecord } from './engine/core/keys';
+import { relayHttpBase } from './network/account-resolver';
 import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
 import type { TypedAttestation } from './engine/core/attestation';
 import { encodeBlock, decodeBlock } from './engine/core/block';
@@ -1443,6 +1445,8 @@ function refreshNFTTransferList() {
       if (!acc) return;
       const to = prompt('Transfer NFT — recipient username or public key:');
       if (!to) return;
+      // G1: fetch + verify the recipient's record on demand if unknown locally.
+      if (!(await node.resolveAccount(to.toLowerCase()))) { toast('Recipient not found', 'error'); return; }
       const result = await node.ledger.createTransferNft(fromPub, tokenId, to.toLowerCase(), engineSigner(acc));
       if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
       const submit = await node.submitBlock(result.block);
@@ -1850,24 +1854,8 @@ function faceVerifyEndpoint(base: string, endpoint: string): string {
   return base ? `${base}/face-verify/${endpoint}` : `/face-verify/${endpoint}`;
 }
 
-/**
- * HTTP base for a relay's `/relay-info` + `/face-verify/*` endpoints, derived
- * from its multiaddr. Two shapes:
- *  - `/dns4/<host>/…/wss/…`  → `https://<host>`      (nginx-fronted production relay)
- *  - `/ip4/<ip>/tcp/<p>/ws`  → `http://<ip>:<p+2>`   (bare dev relay; HTTP is PORT+2)
- * Empty string ⇒ same-origin relay → use the relative path (Vite/nginx proxy).
- */
-function relayHttpBase(addr: string | undefined): string {
-  if (!addr) return '';
-  const dns = addr.match(/\/dns[46]\/([^/]+)\//);
-  if (dns) {
-    if (typeof window !== 'undefined' && dns[1] === window.location.hostname) return ''; // origin → relative
-    return `https://${dns[1]}`;
-  }
-  const ip = addr.match(/\/ip4\/([^/]+)\/tcp\/(\d+)\/ws(\/|$)/);
-  if (ip) return `http://${ip[1]}:${Number(ip[2]) + 2}`;
-  return '';
-}
+// relayHttpBase moved to network/account-resolver.ts (shared with the G1
+// on-demand resolution path in node.resolveAccount) — imported at the top.
 
 /**
  * Face-verify HTTP base for a relay (attester-#2): its announced `faceVerifyUrl`,
@@ -2151,7 +2139,11 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Submit through node (publishes to libp2p network)
     await node.submitBlock(openBlock);
     const accPayload = `account:${accountId}:${username}:${account.createdAt}:${faceMap.hash}`;
-    const accSig = await signData(accPayload, keys);
+    // Engine-signed from the start (G1): the record is served by relay /resolve
+    // and verified against the engine accountId — an app-JWK signature would
+    // fail that check and leave the account unresolvable until the first 20 s
+    // publish tick re-signed it.
+    const accSig = engineSignRecord(accPayload, engineSigner({ keys }).priv);
     node.net.saveAccount(accountId, {
       username, pub: accountId, balance: 1000000, nonce: 0,
       createdAt: account.createdAt, faceMapHash: faceMap.hash,
@@ -2264,8 +2256,14 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       encryptedCanonical: blobData.encryptedCanonical ? String(blobData.encryptedCanonical) : undefined,
     };
 
-    // Verify linked anchor against on-chain account data (prevents relay from serving fake blobs)
-    const onChainAccount = await node.net.loadAccount(blob.pub);
+    // Verify linked anchor against on-chain account data (prevents relay from serving fake blobs).
+    // G1: on a wiped device the record is no longer in IDB via gossip — resolve
+    // it on demand (signature-verified) so this integrity check still runs.
+    let onChainAccount = await node.net.loadAccount(blob.pub);
+    if (!onChainAccount) {
+      await node.resolveAccount(String(blob.pub));
+      onChainAccount = await node.net.loadAccount(blob.pub);
+    }
     if (onChainAccount && onChainAccount.linkedAnchor && blob.linkedAnchor) {
       const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.linkedAnchor));
       if (!hashValid) {
@@ -2488,7 +2486,9 @@ async function syncAccountRecord(
   const merged: Record<string, unknown> = { ...existing, ...changed, pub: acc.pub, username: acc.username };
   if ('faceMapHash' in changed) {
     const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${String(changed.faceMapHash)}`;
-    merged._sig = await signData(payload, acc.keys);
+    // Engine-signed (G1): relays verify records against the engine accountId
+    // before archiving them for /resolve — an app-JWK signature would be dropped.
+    merged._sig = engineSignRecord(payload, engineSigner(acc).priv);
   }
   await node.net.saveAccount(acc.pub, merged as Parameters<typeof node.net.saveAccount>[1]);
   // Keep the ledger's in-memory copy in step: publishLocalData() rebuilds the
@@ -2799,6 +2799,10 @@ $('#btnSendTx').addEventListener('click', async () => {
   // PIN required for all transfers
   if (!await requirePin(sender)) return;
 
+  // G1: the recipient's record is no longer gossiped to everyone — resolve it
+  // on demand (local ledger/cache hit first, then relay /resolve + verify).
+  if (!(await node.resolveAccount(to.toLowerCase()))) { toast('Recipient not found', 'error'); return; }
+
   if (assetId === '__unit__') {
     const amount = parseUNIT(amountInput);
     if (amount <= 0) { toast('Invalid amount', 'error'); return; }
@@ -2819,8 +2823,8 @@ $('#btnSendTx').addEventListener('click', async () => {
     const contract = node.ledger.contracts.get(assetId);
     if (!contract) { toast('Contract not found', 'error'); return; }
     const sym = String((contract.state as Record<string, unknown>).symbol ?? '');
-    // Always pass pub key so balances are keyed consistently
-    const toPub = node.ledger.resolveToPublicKey(to) ?? to;
+    // Always pass pub key so balances are keyed consistently (resolved above)
+    const toPub = node.ledger.resolveToPublicKey(to.toLowerCase()) ?? to;
     const result = await node.ledger.createCall(sender.pub, assetId, 'transfer', [toPub, amount], sender.keys);
     if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
     const sub = await node.submitBlock(result.block);
@@ -2880,7 +2884,7 @@ document.addEventListener('click', (e) => {
   if (accountLink) { showAccountDetail(accountLink.dataset.pub!); return; }
 });
 
-$('#btnExplorerSearch').addEventListener('click', () => {
+$('#btnExplorerSearch').addEventListener('click', async () => {
   const query = $<HTMLInputElement>('#explorerSearch').value.trim().toLowerCase();
   if (!query) return;
   const detail = $('#explorerDetail');
@@ -2909,6 +2913,12 @@ $('#btnExplorerSearch').addEventListener('click', () => {
   if (node.ledger.getAccountChain(query).length > 0) { showAccountDetail(query); return; }
 
   if (node.ledger.contracts.has(query)) { showContractDetail(query); return; }
+
+  // G1: not known locally — try on-demand resolution from the relay directory
+  // (username or accountId). The record is signature-verified before use.
+  detail.innerHTML = '<div class="card" style="color:var(--text-muted);text-align:center;">Searching the network…</div>';
+  const resolved = await node.resolveAccount(query);
+  if (resolved) { showAccountDetail(resolved); return; }
 
   detail.innerHTML = '<div class="card" style="color:var(--text-muted);text-align:center;">No results found.</div>';
 });

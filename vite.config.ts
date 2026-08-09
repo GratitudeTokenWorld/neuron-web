@@ -34,6 +34,10 @@ export default defineConfig({
       '/face-verify': {
         target: 'http://localhost:9092',
       },
+      // G1 on-demand account resolution against the same-origin dev relay.
+      '/resolve': {
+        target: 'http://localhost:9092',
+      },
     },
   },
   build: {

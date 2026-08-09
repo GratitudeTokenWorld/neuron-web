@@ -707,7 +707,12 @@ export class Libp2pNetwork extends EventEmitter {
     const pubsub = this.libp2p.services.pubsub as unknown as GossipSub;
     for (let i = 0; i < NUM_SYNAPSES; i++) pubsub.subscribe(topicBlocks(this.network, i));
     pubsub.subscribe(topicVotes(this.network));
-    pubsub.subscribe(topicAccounts(this.network));
+    // G1 fix: clients do NOT subscribe to the global accounts topic any more —
+    // ingesting every account record ever created is O(total users) per node,
+    // the first-failing scale-invariant violation. We still PUBLISH our own
+    // records on it (the relays' directory tier stays subscribed and archives
+    // them); foreign accounts are resolved on demand via /resolve + verified
+    // locally (account-resolver.ts) and cached with cacheAccount().
     pubsub.subscribe(topicGeneration(this.network));
     pubsub.subscribe(topicStorageReceipts(this.network));
     pubsub.subscribe(topicStorageCacheRequests(this.network));
@@ -1343,6 +1348,18 @@ export class Libp2pNetwork extends EventEmitter {
     const data = { ...clean, _gen: this.generation, _version: this.accountVersionCounter };
     this.db.put('accounts', data as unknown as NeuronDB['accounts']).catch(() => {});
     this.publish(topicAccounts(this.network), data);
+  }
+
+  /**
+   * G1: cache a foreign account record obtained via on-demand resolution.
+   * Pure local persistence — no gossip publish (we are not the record's owner)
+   * and no version stamp (the counter tracks our OWN publishes; the record
+   * keeps the owner's `_version` so a later resolve can compare freshness).
+   */
+  async cacheAccount(record: Record<string, unknown>): Promise<void> {
+    if (!this.running || !record.pub) return;
+    const { faceDescriptor: _fd, ...clean } = record as Record<string, unknown> & { faceDescriptor?: unknown };
+    await this.db.put('accounts', { ...clean, _gen: this.generation } as unknown as NeuronDB['accounts']).catch(() => {});
   }
 
   saveContract(id: string, contract: Record<string, unknown>): void {

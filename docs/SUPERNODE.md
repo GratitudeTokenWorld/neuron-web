@@ -50,6 +50,7 @@ the node's identity and breaks the baked bootstrap address).
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
 | `.relay-keyblobs.json` | archived face+PIN-encrypted key-blobs (for peer-independent recovery) | recovery needs a live peer holding the blob until it re-fills |
 | `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
+| `.relay-accounts.json` | account-record archive (G1 directory tier): engine-verified records served via `/resolve` | re-fills from owners' 20 s publish ticks; until then clients can't resolve usernames this relay alone knew |
 | `.relay-operators.json` | the first 3 accountIds attested — the only accounts allowed to wipe this relay | anyone could re-claim an operator slot; **kept across wipes** |
 
 ---
@@ -128,9 +129,10 @@ server {
     proxy_read_timeout 86400s;
   }
 
-  # attester + relay info (HTTP)
+  # attester + relay info + G1 account resolution (HTTP)
   location /face-verify { proxy_pass http://127.0.0.1:9092; }
   location /relay-info  { proxy_pass http://127.0.0.1:9092; }
+  location /resolve     { proxy_pass http://127.0.0.1:9092; }
 
   # the web app (static dist) — if served from here
   location / { root /home/admin/domains/neuronweb.org/dist; try_files $uri /index.html; }
@@ -304,14 +306,18 @@ nuking the shared network while letting a founder reset it.
 
 ---
 
-## Scaling (how this stays fast + safe at 1B accounts)
+## Scaling (how this stays fast + safe at 10B accounts)
 
 The principle: **shard so nothing is whole, index by accountId so nothing is scanned,
 verify so nothing is trusted.**
 
-- **Shard the archive across many super-nodes.** No node holds all 4096 shards — each
-  holds a few (~244K accounts/shard at 1B), K-redundant (3–5 holders/shard). One node
-  holding 16 shards ≈ tens of GB, not TB.
+- **Shard the archive across many super-nodes.** No node is *required* to hold all
+  4096 shards (opt-in full mirrors stay welcome as a durability bonus — the two dev
+  relays are exactly that). At 10B accounts one shard ≈ 2.44M accounts, so whole-shard
+  assignment puts an O(N/4096) floor under every holder; the measured target shape
+  (`src/engine/sim/archival.ts`) assigns **per-account** via rendezvous (HRW) instead —
+  K holders per account out of an open fleet, each node bounded by its declared
+  capacity, largest node's share of the archive → 0 as the fleet grows.
 - **Storage engine:** the JSON archive here is fine for the first node / testing. At
   scale, swap `.relay-engine-blocks.json` for a **per-shard LSM store (RocksDB/LevelDB)
   keyed by accountId** — point lookups stay single-digit-ms at TB scale. Queries are

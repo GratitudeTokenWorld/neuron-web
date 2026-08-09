@@ -75,6 +75,12 @@ const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || inData('.relay-engi
 // Key-blob archive: lets a fully-wiped device recover without any peer online
 // (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
 const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || inData('.relay-keyblobs.json');
+// Account-record archive (G1): the relay is the directory tier now that clients
+// no longer subscribe to the global `accounts` topic — they resolve a username/
+// pub on demand via HTTP `/resolve` and cache the result. Records here are
+// self-certifying (signed by the account's engine key), so serving them is
+// untrusted: the client re-verifies every record it accepts.
+const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || inData('.relay-accounts.json');
 // Username uniqueness registry (attester-enforced, Phase 3): the first account
 // attested for a username owns it; a later different-account claim is rejected.
 const USERNAMES_FILE = process.env.USERNAMES_FILE || inData('.relay-usernames.json');
@@ -286,6 +292,48 @@ async function saveKeyBlobs() {
   await atomicWrite(KEYBLOBS_FILE, JSON.stringify([...keyBlobStore.values()]));
 }
 setInterval(() => { saveKeyBlobs().catch(() => {}); }, 5_000);
+
+// ── Account-record archive (G1 directory tier) ───────────────────────────────
+// `${network}:${pub}` → account record (username, pub, createdAt, pq keys, …).
+// Only ENGINE-VERIFIED records are stored: the record self-signs
+// `account:{pub}:{username}:{createdAt}:{faceMapHash}` with the account key, so
+// an attacker cannot evict a real record by gossiping a forged one — their fake
+// fails verification here and is dropped. (The freshly-created record is
+// app-JWK-signed for its first ≤20 s until the owner's publish tick re-signs it
+// with the engine key; clients reject those anyway, so storing them adds nothing.)
+const accountStore = new Map();
+let accountsDirty = false;
+
+async function loadAccounts() {
+  try {
+    for (const r of JSON.parse(await fs.readFile(ACCOUNTS_FILE, 'utf8'))) {
+      if (r && r.pub && r.network) accountStore.set(`${r.network}:${r.pub}`, r);
+    }
+    console.log(`[Archive] Loaded ${accountStore.size} account record(s)`);
+  } catch { /* none yet */ }
+}
+async function saveAccounts() {
+  if (!accountsDirty) return;
+  accountsDirty = false;
+  await atomicWrite(ACCOUNTS_FILE, JSON.stringify([...accountStore.values()]));
+}
+setInterval(() => { saveAccounts().catch(() => {}); }, 5_000);
+
+/** Archive an account record seen on the accounts topic (verified, newest wins). */
+function archiveAccountRecord(acc, network) {
+  if (!ARCHIVE_ENABLED || !acc || !acc.pub || !acc.username) return;
+  const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${acc.faceMapHash}`;
+  try {
+    if (!acc._sig || !engineVerify(String(acc._sig), payload, String(acc.pub))) return;
+  } catch { return; }
+  const key = `${network}:${acc.pub}`;
+  const existing = accountStore.get(key);
+  // Owner-only publishing + per-publisher monotonic _version ⇒ newest wins.
+  if (existing && Number(acc._version ?? 0) < Number(existing._version ?? 0)) return;
+  accountStore.set(key, { ...acc, network });
+  accountsDirty = true;
+  dlog(`[Archive] Stored account record user=${acc.username} acct=${String(acc.pub).slice(0, 12)}…`);
+}
 
 // ── Username uniqueness (Phase 3, attester-enforced) ──────────────────────────
 const usernameRegistry = new Map(); // username (lowercased) → accountId
@@ -512,7 +560,7 @@ async function main() {
   await loadUsernames();
   await loadOperators();
   await loadGeneration();
-  if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); }
+  if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); await loadAccounts(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
   let relayAddrs = [];
@@ -549,6 +597,39 @@ async function main() {
           operators,                    // first-N accountIds allowed to reset
           generation: currentGeneration, // current reset epoch (clients converge to it)
         }));
+
+      } else if (req.url?.startsWith('/resolve?')) {
+        // G1 on-demand directory lookup: GET /resolve?username=<u>|pub=<p>&network=<n>
+        // Plain GET + query params (no custom headers) so browsers need no CORS
+        // preflight against the bare-IP dev relays. The served record is
+        // self-certifying — the client verifies its signature, so this endpoint
+        // is untrusted and needs no auth.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const pub = q.get('pub');
+        const uname = q.get('username')?.trim().toLowerCase();
+        let record = null;
+        if (pub) {
+          record = accountStore.get(`${network}:${pub}`) || null;
+        } else if (uname) {
+          // The attested username registry is the authoritative name→account map
+          // (first-attested wins); fall back to scanning the record archive for
+          // accounts this relay stored but did not itself attest.
+          const claim = usernameRegistry.get(uname);
+          if (claim && claim.accountId) record = accountStore.get(`${network}:${claim.accountId}`) || null;
+          if (!record) {
+            for (const r of accountStore.values()) {
+              if (r.network === network && String(r.username).toLowerCase() === uname) { record = r; break; }
+            }
+          }
+        }
+        res.writeHead(record ? 200 : 404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        if (record) {
+          const { network: _n, ...clean } = record;
+          res.end(JSON.stringify(clean));
+        } else {
+          res.end(JSON.stringify({ error: 'not found' }));
+        }
 
       } else if (req.method === 'POST' && req.url === '/log-reload') {
         let body = '';
@@ -962,6 +1043,12 @@ async function main() {
       try { archiveEngineBlock(JSON.parse(new TextDecoder().decode(msg.data)).blockHex, networkFromTopic(topic)); } catch { /* malformed */ }
       return;
     }
+    // G1 directory tier: archive account records so clients can resolve
+    // usernames on demand (/resolve) instead of ingesting the global topic.
+    if (topic.endsWith('/accounts')) {
+      try { archiveAccountRecord(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
+      return;
+    }
     // Archive key-blobs so recovery works with no peer online (face+PIN-encrypted).
     if (topic.endsWith('/keyblobs')) {
       try { archiveKeyBlob(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
@@ -999,6 +1086,7 @@ async function main() {
         engineBlockStore.clear(); engineStoreDirty = true;
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names
+        accountStore.clear(); accountsDirty = true;           // wipe the directory too
         // Re-elect operators: the wipe destroys every account chain AND every
         // key-blob, so the old operator accountIds can never be recovered by
         // anyone — keeping them as the sole reset authority makes the FIRST

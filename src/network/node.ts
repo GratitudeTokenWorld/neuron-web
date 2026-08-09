@@ -1,6 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
-import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS } from '../ledger/engine-ledger';
-import { Libp2pNetwork } from './libp2p-network';
+import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
+import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub } from './account-resolver';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -846,16 +847,14 @@ export class NeuronNode extends EventEmitter {
 
     for (const [pub, acc] of this.ledger.accounts) {
       const keys = this.localKeys.get(pub);
-      // FOREIGN account: echo the newest record we actually received instead of
-      // rebuilding it from our ledger copy. registerAccount() never updates a
-      // known account, so that copy is frozen at first sight — re-publishing it
-      // would revert the owner's key/PIN rotations for the whole network (the
-      // stale-anchor bug). IDB always holds the latest record we were told about.
-      if (!keys) {
-        const stored = await this.net.loadAccount(pub);
-        if (stored) this.net.saveAccount(pub, stored as Parameters<typeof this.net.saveAccount>[1]);
-        continue;
-      }
+      // FOREIGN account: publish NOTHING (G1). Only the owner republishes its
+      // record; the relay directory archives it durably and everyone else
+      // resolves on demand (resolveAccount). The old "echo the newest received
+      // record" kept the global gossip directory fresh — with on-demand
+      // resolution that directory no longer exists client-side, and not echoing
+      // also kills the stale-anchor risk (re-publishing a frozen copy could
+      // revert the owner's key/PIN rotations) outright.
+      if (!keys) continue;
       const accData: Record<string, unknown> = {
         username: acc.username, pub: acc.pub, balance: acc.balance, nonce: acc.nonce,
         createdAt: acc.createdAt, faceMapHash: acc.faceMapHash,
@@ -1069,6 +1068,55 @@ export class NeuronNode extends EventEmitter {
 
   getKnownRelays() {
     return this.net.getKnownRelays();
+  }
+
+  // ── G1: on-demand account resolution (replaces the global accounts topic) ──
+
+  /** Relay HTTP bases to try for /resolve: known relays + baked bootstraps +
+   *  the same-origin dev relay ('' → relative path via the Vite/nginx proxy). */
+  private relayResolveBases(): string[] {
+    const addrs = new Set<string>();
+    for (const r of this.net.getKnownRelays()) if (r.addr) addrs.add(r.addr);
+    for (const a of bakedBootstrapAddrs()) addrs.add(a);
+    const bases = new Set<string>(['']);
+    for (const a of addrs) bases.add(relayHttpBase(a));
+    return [...bases];
+  }
+
+  /**
+   * Resolve a username or accountId to its account pub, fetching the record on
+   * demand from a relay's directory archive if it is not already known locally.
+   * The fetched record is signature-verified (self-certifying — a relay cannot
+   * forge it), registered in the ledger, and cached in IDB, so the send path's
+   * synchronous resolveToPublicKey() succeeds afterwards. Returns null if no
+   * relay could produce a verifiable record.
+   */
+  async resolveAccount(identifier: string): Promise<string | null> {
+    const local = this.ledger.resolveToPublicKey(identifier);
+    if (local) return local;
+
+    const query = looksLikeAccountPub(identifier)
+      ? { pub: identifier.toLowerCase() }
+      : { username: identifier };
+    const rec = await resolveAccountFromRelays(this.relayResolveBases(), query, this.ledger.network);
+    if (!rec) return null;
+
+    // Same registration path the old gossip handler used — merge into the ledger…
+    const account: LedgerAccount & Record<string, unknown> = {
+      username: String(rec.username), pub: String(rec.pub),
+      balance: Number(rec.balance || 0), nonce: Number(rec.nonce || 0),
+      createdAt: Number(rec.createdAt || 0), faceMapHash: String(rec.faceMapHash || ''),
+      linkedAnchor: rec.linkedAnchor ? String(rec.linkedAnchor) : undefined,
+      pqPub: rec.pqPub ? String(rec.pqPub) : undefined,
+      pqKemPub: rec.pqKemPub ? String(rec.pqKemPub) : undefined,
+      pinSalt: rec.pinSalt ? String(rec.pinSalt) : undefined,
+      pinVerifier: rec.pinVerifier ? String(rec.pinVerifier) : undefined,
+    };
+    this.ledger.registerAccount(account);
+    // …and cache locally (NO gossip re-publish: we are not the owner).
+    await this.net.cacheAccount(rec as unknown as Record<string, unknown>);
+    this.emit('account:synced', rec);
+    return String(rec.pub);
   }
 
   private async checkRelayLiveness(): Promise<void> {

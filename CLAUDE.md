@@ -11,7 +11,9 @@ store. It is the **re-platformed** successor to `../neuronchain` — the same ap
 designed to hold the *scale invariant*:
 
 > For any node, memory/storage/bandwidth/CPU must be `O(own data + followed data)` —
-> never `O(total network)`. Any `O(N)` subsystem fails at 1B users.
+> never `O(total network)`. Any `O(N)` subsystem fails at 10B users (the target,
+> decided 2026-08-09). No role is *required* to hold everything — archival
+> super-nodes included; full mirrors are an opt-in bonus, never load-bearing.
 
 Weigh that invariant on **every** change. Zero common-path overhead, interest-scoped
 propagation, no global indexes.
@@ -38,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **199 tests / 47 files passing**, `npm run build` clean.
+Current baseline: **213 tests / 52 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-09)
@@ -49,9 +51,16 @@ cross-relay sync, transfers both ways incl. offline claim, NFT mint/transfer/
 burn/reload, recovery-after-wipe and the uniqueness+face limits all work.
 
 **Next up is the architecture work, not more app fixes.** Phase status and the
-recommended order live in ARCHITECTURE.md → *Where this stands*. Short version:
-run the `src/engine/sim` harness first to get a measured baseline, then fix
-**G1** (global `accounts` topic), then **G2** (counterparty chain replication).
+recommended order live in ARCHITECTURE.md → *Where this stands*. The
+`src/engine/sim` baseline is **done** (2026-08-09, incl. a 10B projection —
+ARCHITECTURE.md → *Measured baseline*), and **G1 is implemented** the same day:
+clients no longer subscribe to the global `accounts` topic; relays archive
+records (`.relay-accounts.json`) and serve **GET `/resolve`**; clients resolve
+on demand + verify signatures (`src/network/account-resolver.ts`,
+`node.resolveAccount`). ⚠ **Needs a manual TESTPLAN T2/T3/T5 re-run** (face
+flows can't be automated) and a relay deploy to both cloud boxes before that.
+Next: **G2** (counterparty chain replication → proof packets, measured target
+in `sim/counterparty.ts`).
 
 `vitest.config.ts` is deliberately separate from `vite.config.ts` so the test run does
 not load the libp2p plugin (which spawns a relay).
