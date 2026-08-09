@@ -60,6 +60,30 @@ export function stopCamera(stream: MediaStream): void {
   stream.getTracks().forEach((t) => t.stop());
 }
 
+// ──── Capture cues (UI contract) ────
+
+/** Which wireframe animation the UI should overlay on the camera feed. */
+export type CaptureGuide = 'search' | 'turn' | 'blink' | 'smile' | 'hold';
+
+/**
+ * One frame of capture feedback. Structured rather than a pre-baked sentence so
+ * the UI can drive a progress bar and an animation from the same signal — a
+ * string can only be printed, and printing it twice (header + overlay) is what
+ * the old UI did.
+ *
+ * `left`/`right` are independent 0–100 fills for a centre-anchored bar: a
+ * head-turn fills the side being turned toward, everything else fills both
+ * evenly. Feedback therefore mirrors what the user is physically doing.
+ */
+export interface CaptureCue {
+  /** Short imperative, already free of step/sample bookkeeping. */
+  label: string;
+  guide: CaptureGuide;
+  left?: number;
+  right?: number;
+  state?: 'ok' | 'fail';
+}
+
 // ──── Face Descriptor Capture ────
 
 export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
@@ -86,24 +110,34 @@ export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<Fa
  */
 export async function enrollFace(
   video: HTMLVideoElement,
-  onProgress: (step: number, total: number, status: string) => void,
+  onProgress: (step: number, total: number, cue: CaptureCue) => void,
 ): Promise<FaceMap | null> {
   const descriptors: number[][] = [];
   let retries = 0;
+  const pct = (n: number) => Math.round((n / ENROLLMENT_SAMPLES) * 100);
 
   for (let i = 0; i < ENROLLMENT_SAMPLES; i++) {
-    onProgress(i + 1, ENROLLMENT_SAMPLES, `Capturing sample ${i + 1} of ${ENROLLMENT_SAMPLES}...`);
+    onProgress(i + 1, ENROLLMENT_SAMPLES, {
+      label: `Hold still — capturing ${i + 1} of ${ENROLLMENT_SAMPLES}`,
+      guide: 'hold', left: pct(i), right: pct(i),
+    });
     await sleep(800);
 
     const desc = await captureFaceDescriptor(video);
     if (!desc) {
       if (retries++ > 10) return null;
-      onProgress(i + 1, ENROLLMENT_SAMPLES, 'Look at the camera.');
+      onProgress(i + 1, ENROLLMENT_SAMPLES, {
+        label: 'Look at the camera', guide: 'search', left: pct(i), right: pct(i),
+      });
       i--;
       await sleep(1000);
       continue;
     }
     descriptors.push(desc.data);
+    onProgress(i + 1, ENROLLMENT_SAMPLES, {
+      label: `Hold still — captured ${i + 1} of ${ENROLLMENT_SAMPLES}`,
+      guide: 'hold', left: pct(i + 1), right: pct(i + 1),
+    });
   }
 
   if (descriptors.length < ENROLLMENT_SAMPLES) return null;
@@ -161,7 +195,7 @@ export async function detectChallenge(
   video: HTMLVideoElement,
   type: 'blink' | 'look-left' | 'look-right' | 'smile',
   timeoutMs = 12000,
-  onStatus?: (msg: string) => void,
+  onStatus?: (cue: CaptureCue) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   const EAR_THRESHOLD = 0.28;
@@ -182,8 +216,14 @@ export async function detectChallenge(
     type === 'blink' ? 'blink' :
     type === 'smile' ? 'smile' :
     type === 'look-left' ? 'look left' : 'look right';
+  const guide: CaptureGuide = type === 'blink' ? 'blink' : type === 'smile' ? 'smile' : 'turn';
+  // Bar side for a head turn. Landmarks are in RAW video coordinates, so a user
+  // turning to their own left moves the nose toward higher x; the feed is
+  // mirrored for display, which puts that motion on the viewer's left. Hence
+  // "their left" == the bar's left half == the on-screen direction they see.
+  const turnSide: 'left' | 'right' = type === 'look-right' ? 'right' : 'left';
 
-  onStatus?.(`${actionLabel.toUpperCase()} now — keep looking at the camera`);
+  onStatus?.({ label: `${actionLabel.toUpperCase()} — keep looking at the camera`, guide, left: 0, right: 0 });
 
   while (Date.now() < deadline) {
     let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
@@ -209,13 +249,21 @@ export async function detectChallenge(
         // this requires a real open→closed transition, defeating a static photo.
         if (sawEyesOpen) {
           earBelowCount++;
-          if (earBelowCount >= BLINK_FRAMES) { onStatus?.('Blink detected!'); return true; }
+          if (earBelowCount >= BLINK_FRAMES) {
+            onStatus?.({ label: 'Blink detected', guide: 'blink', left: 100, right: 100, state: 'ok' });
+            return true;
+          }
         }
       } else {
         sawEyesOpen = true;
         earBelowCount = 0;
       }
-      onStatus?.(`BLINK — open your eyes, then close them briefly (EAR ${ear.toFixed(2)})`);
+      // Two-stage, so the bar tracks the actual state machine: eyes seen open (50%)
+      // then a closure confirmed (100%). Raw EAR is a debug number, not guidance.
+      onStatus?.({
+        label: sawEyesOpen ? 'Now blink' : 'Open your eyes and look at the camera',
+        guide: 'blink', left: sawEyesOpen ? 50 : 0, right: sawEyesOpen ? 50 : 0,
+      });
 
     } else if (type === 'look-left' || type === 'look-right') {
       const nose = pts[30];
@@ -227,23 +275,40 @@ export async function detectChallenge(
           await sleep(80); continue;
         }
       }
-      const delta = Math.abs(nose.x - baselineNoseX);
+      // Acceptance stays direction-agnostic (|delta|) as before — the anti-replay
+      // value is in "the head moved on demand", and enforcing a sign here would
+      // hard-block enrollment if the camera/mirror convention is ever inverted.
+      // The BAR uses the signed delta, so it always mirrors the real movement.
+      const signed = nose.x - baselineNoseX;
+      const delta = Math.abs(signed);
       const threshold = videoWidth * 0.08;
-      if (delta > threshold * 0.85) { onStatus?.(`${type === 'look-left' ? 'Look-left' : 'Look-right'} detected!`); return true; }
+      if (delta > threshold * 0.85) {
+        onStatus?.({ label: `Turn detected`, guide: 'turn', left: 100, right: 100, state: 'ok' });
+        return true;
+      }
       const pct = Math.min(99, Math.round((delta / threshold) * 100));
-      onStatus?.(`LOOK ${type === 'look-left' ? 'LEFT' : 'RIGHT'} — turn your head (${pct}%)`);
+      const movingLeft = signed > 0;   // raw nose x rises when the user turns to their left
+      onStatus?.({
+        label: `Turn your head ${turnSide}`,
+        guide: 'turn',
+        left: movingLeft ? pct : 0,
+        right: movingLeft ? 0 : pct,
+      });
 
     } else if (type === 'smile') {
       const ratio = smileRatio(pts);
-      if (ratio > SMILE_THRESHOLD) { onStatus?.('Smile detected!'); return true; }
+      if (ratio > SMILE_THRESHOLD) {
+        onStatus?.({ label: 'Smile detected', guide: 'smile', left: 100, right: 100, state: 'ok' });
+        return true;
+      }
       const pct = Math.min(99, Math.round((ratio / SMILE_THRESHOLD) * 100));
-      onStatus?.(`SMILE! (${pct}%)`);
+      onStatus?.({ label: 'Smile', guide: 'smile', left: pct, right: pct });
     }
 
     await sleep(80);
   }
 
-  onStatus?.(`Challenge timed out — ${actionLabel} not detected`);
+  onStatus?.({ label: `Timed out — ${actionLabel} not detected`, guide, state: 'fail', left: 0, right: 0 });
   return false;
 }
 
@@ -259,19 +324,27 @@ export async function detectChallenge(
 export async function detectLiveness(
   video: HTMLVideoElement,
   timeoutMs = 15000,
-  onStatus?: (msg: string) => void,
+  onStatus?: (cue: CaptureCue) => void,
 ): Promise<boolean> {
   const startTime = Date.now();
   let framesWithFace = 0;
   let framesWithoutFace = 0;
   const nosePositions: { x: number; y: number }[] = [];
-  const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
-  const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
+  // Require a genuine excursion to BOTH sides of the resting position, ≥TURN_PX
+  // each. That is at least as strong as the previous "30px total range + 2
+  // direction reversals" (it implies both) while being un-spoofable by jitter,
+  // and — unlike a reversal counter — it maps directly onto a two-sided progress
+  // bar: each half fills with how far that side has actually been turned.
+  const TURN_PX = 15;
+  let leftMax = 0;    // nose x ABOVE baseline → user turned to their left
+  let rightMax = 0;   // nose x BELOW baseline → user turned to their right
+  let baseline: number | null = null;
+  const baselineSamples: number[] = [];
 
   // Don't claim a face was found before we've actually looked — show a neutral prompt until
   // the detection loop confirms one (otherwise "Face detected" flashes before the camera
   // has even produced a frame).
-  onStatus?.('Position your face in the frame...');
+  onStatus?.({ label: 'Position your face in the frame', guide: 'search', left: 0, right: 0 });
 
   while (Date.now() - startTime < timeoutMs) {
     // Skip detection until the camera is actually streaming frames — running face-api on a
@@ -294,43 +367,46 @@ export async function detectLiveness(
       nosePositions.push({ x: nose.x, y: nose.y });
       if (nosePositions.length > 40) nosePositions.shift();
 
-      if (nosePositions.length >= 5) {
-        const xs = nosePositions.map((p) => p.x);
-        const ys = nosePositions.map((p) => p.y);
-        const totalRange = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
-
-        // Count direction changes in X axis (left-right reversals)
-        let dirChanges = 0;
-        for (let i = 2; i < nosePositions.length; i++) {
-          const dx1 = nosePositions[i - 1].x - nosePositions[i - 2].x;
-          const dx2 = nosePositions[i].x - nosePositions[i - 1].x;
-          if ((dx1 > 1 && dx2 < -1) || (dx1 < -1 && dx2 > 1)) dirChanges++;
+      // Resting position from the first frames, then measure each side's excursion.
+      if (baseline === null) {
+        baselineSamples.push(nose.x);
+        if (baselineSamples.length >= 5) {
+          baseline = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
+        } else {
+          onStatus?.({ label: 'Hold still for a moment', guide: 'hold', left: 0, right: 0 });
+          await sleep(100);
+          continue;
         }
-
-        const movementPct = Math.min(50, Math.round((totalRange / MIN_MOVEMENT) * 50));
-        const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
-        const progress = movementPct + dirPct;
-
-        // No "Liveness:" prefix — callers render this under a "Step 1/3: …" label.
-        onStatus?.(`${progress}% - turn head left then right`);
-
-        if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
-          onStatus?.('Liveness confirmed!');
-          return true;
-        }
-      } else {
-        onStatus?.(`Face detected (${framesWithFace}) - slowly move your head...`);
       }
+
+      const signed = nose.x - baseline;
+      if (signed > 0) leftMax = Math.max(leftMax, signed);
+      else rightMax = Math.max(rightMax, -signed);
+
+      const leftPct = Math.min(100, Math.round((leftMax / TURN_PX) * 100));
+      const rightPct = Math.min(100, Math.round((rightMax / TURN_PX) * 100));
+
+      if (leftPct >= 100 && rightPct >= 100) {
+        onStatus?.({ label: 'Liveness confirmed', guide: 'turn', left: 100, right: 100, state: 'ok' });
+        return true;
+      }
+
+      // Prompt only the side still missing, so there is exactly one thing to do.
+      const need = leftPct >= 100 ? 'right' : rightPct >= 100 ? 'left' : 'left and right';
+      onStatus?.({
+        label: need === 'left and right' ? 'Slowly turn your head left, then right' : `Now turn ${need}`,
+        guide: 'turn', left: leftPct, right: rightPct,
+      });
     } else {
       framesWithoutFace++;
       if (framesWithoutFace % 8 === 0) {
-        onStatus?.('No face detected - move closer, ensure good lighting.');
+        onStatus?.({ label: 'Move closer — no face detected', guide: 'search', left: 0, right: 0 });
       }
     }
     await sleep(100);
   }
 
-  onStatus?.(`Liveness failed (${framesWithFace} face frames). Try with better lighting.`);
+  onStatus?.({ label: 'Liveness failed — try again with more head movement', guide: 'search', state: 'fail', left: 0, right: 0 });
   return false;
 }
 

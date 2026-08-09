@@ -48,6 +48,11 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 *must* reach two distinct attesters or fail with "Need 2 independent attesters".
 
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
+   The capture UI runs three stages with a centre-out green bar and a wireframe
+   guide over the (mirrored) feed: **1/3 liveness** — turn your head to *both*
+   sides, each half of the bar fills independently and both must reach full;
+   **2/3 challenge** — the relay-issued action (blink / smile / look left / look
+   right), animated over the feed; **3/3 capture** — hold still for 3 samples.
 2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
    panel then shows `2/2` (or `3/3`) independent attestations.
 3. **Pass:** account opens; balance = 1,000,000 UNIT.

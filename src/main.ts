@@ -839,16 +839,60 @@ function registerLocalKeys() {
 function showCameraModal() {
   $('#cameraModal').classList.add('active');
   $('#cameraStatus').innerHTML = '<span class="spinner"></span> Initializing...';
+  resetCaptureCue();
 }
 
 function hideCameraModal() {
   $('#cameraModal').classList.remove('active');
   if (cameraStream) { stopCamera(cameraStream); cameraStream = null; }
   $('#cameraStatus').textContent = '';
+  resetCaptureCue();
 }
 
 function setCameraStatus(html: string) {
   $('#cameraStatus').innerHTML = html;
+}
+
+/**
+ * Render one capture cue: header line + centre-out progress bar + the wireframe
+ * animation over the feed. Single source of truth, so the three surfaces can
+ * never disagree (and the same sentence is never printed twice).
+ *
+ * `step` is the enrollment stage ("Step 1/3"); the cue supplies the instruction,
+ * already free of counters — "Step 2/3 · Hold still — capturing 2 of 3".
+ */
+function renderCaptureCue(step: string, cue: import('./core/face-verify').CaptureCue): void {
+  const spinner = cue.state ? '' : '<span class="spinner"></span> ';
+  const colour = cue.state === 'ok' ? 'var(--success)' : cue.state === 'fail' ? 'var(--danger)' : '';
+  setCameraStatus(
+    `${spinner}<span${colour ? ` style="color:${colour}"` : ''}>${escHtml(step)} · ${escHtml(cue.label)}</span>`,
+  );
+  const bar = document.getElementById('captureBar');
+  const l = document.getElementById('captureBarL');
+  const r = document.getElementById('captureBarR');
+  if (bar && l && r) {
+    if (cue.state) bar.setAttribute('data-state', cue.state); else bar.removeAttribute('data-state');
+    l.style.transform = `scaleX(${Math.max(0, Math.min(100, cue.left ?? 0)) / 100})`;
+    r.style.transform = `scaleX(${Math.max(0, Math.min(100, cue.right ?? 0)) / 100})`;
+  }
+  const guide = document.getElementById('captureGuide');
+  if (guide) {
+    guide.setAttribute('data-guide', cue.guide);
+    // Point the chevrons at the side still being asked for (both → left first).
+    if (cue.guide === 'turn') {
+      const dir = (cue.right ?? 0) > 0 && (cue.left ?? 0) >= 100 ? 'right' : 'left';
+      guide.setAttribute('data-dir', dir);
+    }
+  }
+}
+
+/** Clear bar + guide between phases so a stale animation never lingers. */
+function resetCaptureCue(): void {
+  const bar = document.getElementById('captureBar');
+  bar?.removeAttribute('data-state');
+  (document.getElementById('captureBarL') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
+  (document.getElementById('captureBarR') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
+  document.getElementById('captureGuide')?.setAttribute('data-guide', '');
 }
 
 // Close modal via X button
@@ -1746,10 +1790,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Step 1: Liveness
     setCameraStatus('<span class="spinner"></span> Step 1/3: Slowly turn your head left and right');
-    // Live progress replaces the step line (one instruction on screen, not two).
-    const isLive = await detectLiveness(video, 15000, (msg: string) => {
-      setCameraStatus(`<span class="spinner"></span> Step 1/3: ${escHtml(msg)}`);
-    });
+    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue('Step 1/3', cue));
     if (!isLive) {
       addLog('FaceID: Liveness FAILED - not enough movement detected', 'error');
       toast('Liveness failed - try moving your head more', 'error');
@@ -1767,9 +1808,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     if (pendingChallenges.length > 0) {
       const challengeType = pendingChallenges[0].type as 'blink' | 'look-left' | 'look-right' | 'smile';
       setCameraStatus(`<span class="spinner"></span> Step 2/3: Challenge — perform the action`);
-      const actionDone = await detectChallenge(video, challengeType, 18000, (msg) => {
-        setCameraStatus(`<span class="spinner"></span> Step 2/3: ${escHtml(msg)}`);
-      });
+      const actionDone = await detectChallenge(video, challengeType, 18000,
+        cue => renderCaptureCue('Step 2/3', cue));
       if (!actionDone) {
         addLog('FaceID: Challenge action not detected — aborting account creation', 'error');
         toast('Challenge failed — please perform the requested action and try again', 'error');
@@ -1779,10 +1819,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     }
 
     // Face enrollment (camera still open, immediately after challenge action)
-    setCameraStatus('<span class="spinner"></span> Step 2/3: Hold still — capturing face map');
-    const faceMap = await enrollFace(video, (step, total, status) => {
-      setCameraStatus(`<span class="spinner"></span> Step 2/3: Sample ${step}/${total} — ${escHtml(status)}`);
-    });
+    setCameraStatus('<span class="spinner"></span> Step 3/3: Hold still — capturing face map');
+    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Step 3/3', cue));
     hideCameraModal();
 
     if (!faceMap) {
@@ -2018,9 +2056,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // Use the same multi-sample enrollment as account creation so the quantized
     // descriptor matches exactly (single-frame capture can differ enough to break
     // the derived AES key).
-    const faceMap = await enrollFace(video, (step, total, status) => {
-      setCameraStatus(`<span class="spinner"></span> ${status} (${step}/${total})`);
-    });
+    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Recovery', cue));
     hideCameraModal();
 
     if (!faceMap) { toast('No face detected', 'error'); statusEl.innerHTML = '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>'; finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return; }
@@ -2388,19 +2424,13 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     await loadModels();
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
-    setCameraStatus('<span class="spinner"></span> Step 1/2: Slowly turn your head left and right');
-    const isLive = await detectLiveness(video, 15000, (msg: string) => {
-      setCameraStatus(`<span class="spinner"></span> Step 1/2: ${escHtml(msg)}`);
-    });
+    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue('Step 1/2', cue));
     if (!isLive) {
       hideCameraModal();
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
       return;
     }
-    setCameraStatus('<span class="spinner"></span> Step 2/2: Hold still - capturing face map');
-    faceMap = await enrollFace(video, (step, total) => {
-      setCameraStatus(`<span class="spinner"></span> Step 2/2: Sample ${step}/${total}`);
-    });
+    faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Step 2/2', cue));
   } catch {
     hideCameraModal();
     statusEl.innerHTML = '<span style="color:var(--danger)">Camera error. Try again.</span>';

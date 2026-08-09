@@ -645,17 +645,87 @@
     }
     .camera-modal-close:hover { background: var(--danger); }
 
+    /* Mirrored: users expect a mirror when following left/right prompts. Detection
+       runs on the raw frames, so the CSS flip changes nothing for face-api. */
     .camera-modal video {
       width: 100%;
       display: block;
       background: #000;
+      transform: scaleX(-1);
     }
+
+    /* ── Centre-anchored capture progress ──────────────────────────────────────
+       Two independent halves growing outward from the middle: a head-turn fills
+       the side actually being turned toward, blink/smile/capture fill both. The
+       bar therefore mirrors the user's own movement instead of abstracting it. */
+    .capture-bar {
+      display: flex;
+      height: 4px;
+      background: rgba(255,255,255,0.07);
+      overflow: hidden;
+    }
+    .capture-bar > i {
+      display: block;
+      flex: 1 1 50%;
+      height: 100%;
+      background: var(--success);
+      transform: scaleX(0);
+      transition: transform 0.12s linear, background 0.2s;
+    }
+    .capture-bar > i.l { transform-origin: right center; }
+    .capture-bar > i.r { transform-origin: left center; }
+    .capture-bar[data-state="fail"] > i { background: var(--danger); }
+
+    /* ── Wireframe capture guides ──────────────────────────────────────────────
+       A single SVG overlay on the feed; `data-guide` reveals one group at a time.
+       Deliberately schematic (no filled shapes) so it reads as a guide over a
+       live face rather than competing with it. */
+    .capture-guide {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .capture-guide svg { width: 100%; height: 100%; display: block; }
+    .capture-guide g { display: none; }
+    .capture-guide[data-guide="turn"]  .cg-turn,
+    .capture-guide[data-guide="blink"] .cg-blink,
+    .capture-guide[data-guide="smile"] .cg-smile { display: block; }
+
+    .cg-oval {
+      fill: none;
+      stroke: rgba(255,255,255,0.35);
+      stroke-width: 1.2;
+      stroke-dasharray: 5 7;
+      animation: cg-drift 14s linear infinite;
+    }
+    .capture-guide[data-guide="search"] .cg-oval { stroke: rgba(255,255,255,0.6); animation: cg-pulse 1.4s ease-in-out infinite; }
+    @keyframes cg-drift { to { stroke-dashoffset: -120; } }
+    @keyframes cg-pulse { 50% { opacity: 0.35; } }
+
+    .capture-guide [stroke] { vector-effect: non-scaling-stroke; }
+    .cg-line { fill: none; stroke: var(--success); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* Turn: chevrons sweep outward on the side being asked for. */
+    .cg-chev { opacity: 0; animation: cg-sweep 1.5s ease-in-out infinite; }
+    .cg-chev:nth-child(2) { animation-delay: 0.18s; }
+    .cg-chev:nth-child(3) { animation-delay: 0.36s; }
+    .capture-guide[data-dir="right"] .cg-turn { transform: scaleX(-1); transform-origin: 100px 75px; }
+    @keyframes cg-sweep { 0%, 70%, 100% { opacity: 0; } 25% { opacity: 1; } }
+
+    /* Blink: the lids close and reopen on a human-ish cadence. */
+    .cg-eye { transform-box: fill-box; transform-origin: center; animation: cg-blink 2.2s ease-in-out infinite; }
+    @keyframes cg-blink { 0%, 82%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.08); } }
+
+    /* Smile: the arc draws itself in, then resets. */
+    .cg-smile-arc { stroke-dasharray: 60; stroke-dashoffset: 60; animation: cg-draw 2s ease-in-out infinite; }
+    @keyframes cg-draw { 0% { stroke-dashoffset: 60; } 45%, 80% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: 60; } }
 
     /* The ONE instruction line, above the feed: every prompt (step, liveness
        progress, challenge, capture) is written here by setCameraStatus(). There is
        deliberately no second overlay on the video — duplicating the same text in
        two places just competes for attention while the user is following it. */
     .camera-modal-header { position: relative; }
+    .camera-modal-video { position: relative; line-height: 0; }
 
     .camera-modal-status {
       padding: 12px 52px;   /* side padding clears the close button */
@@ -896,7 +966,30 @@
         <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
         <button class="camera-modal-close" id="cameraModalClose">&times;</button>
       </div>
-      <video id="faceVideo" autoplay muted playsinline></video>
+      <div class="capture-bar" id="captureBar"><i class="l" id="captureBarL"></i><i class="r" id="captureBarR"></i></div>
+      <div class="camera-modal-video">
+        <video id="faceVideo" autoplay muted playsinline></video>
+        <div class="capture-guide" id="captureGuide" data-guide="" data-dir="left">
+          <svg viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <ellipse class="cg-oval" cx="100" cy="74" rx="44" ry="58"/>
+            <g class="cg-turn">
+              <path class="cg-line cg-chev" d="M52 74 l-9 -9 M52 74 l-9 9"/>
+              <path class="cg-line cg-chev" d="M40 74 l-9 -9 M40 74 l-9 9"/>
+              <path class="cg-line cg-chev" d="M28 74 l-9 -9 M28 74 l-9 9"/>
+              <path class="cg-line" d="M74 34 a44 44 0 0 0 -22 22" opacity="0.5"/>
+            </g>
+            <g class="cg-blink">
+              <path class="cg-line cg-eye" d="M70 66 q10 -11 20 0 q-10 11 -20 0 z"/>
+              <path class="cg-line cg-eye" d="M110 66 q10 -11 20 0 q-10 11 -20 0 z"/>
+            </g>
+            <g class="cg-smile">
+              <path class="cg-line cg-smile-arc" d="M76 96 q24 22 48 0"/>
+              <circle class="cg-line" cx="78" cy="64" r="2.5"/>
+              <circle class="cg-line" cx="122" cy="64" r="2.5"/>
+            </g>
+          </svg>
+        </div>
+      </div>
     </div>
   </div>
 
