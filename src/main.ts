@@ -1460,6 +1460,9 @@ let autoClaimRunning = false;
 async function autoClaimPending(): Promise<void> {
   if (autoClaimRunning) return;
   autoClaimRunning = true;
+  // Claims made off the back of the timer have no UI event behind them, so the
+  // panel would otherwise show the old ownership until the next 60s tab tick.
+  let claimed = false;
   try {
     for (const acc of localAccounts) {
       // Payments
@@ -1467,6 +1470,7 @@ async function autoClaimPending(): Promise<void> {
         const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, engineSigner(acc));
         if (result.block) {
           await node.submitBlock(result.block);
+          claimed = true;
           addLog(`Auto-claimed ${formatUNIT(u.amount)} UNIT from ${resolveNamePlain(u.fromPub)}`, 'success');
         }
       }
@@ -1476,6 +1480,7 @@ async function autoClaimPending(): Promise<void> {
         const result = await node.ledger.createReceiveNft(acc.pub, u.nftSendHash, engineSigner(acc));
         if (result.block) {
           await node.submitBlock(result.block);
+          claimed = true;
           addLog(`Auto-claimed NFT from ${resolveNamePlain(u.fromPub)}`, 'success');
         }
       }
@@ -1483,6 +1488,9 @@ async function autoClaimPending(): Promise<void> {
   } finally {
     autoClaimRunning = false;
   }
+  // Outside the guard: refreshTransfer() calls back into autoClaimPending(),
+  // which would be a no-op while autoClaimRunning is still set.
+  if (claimed && activeTab() === 'transfer') refreshTransfer();
 }
 
 const EXPLORER_PAGE_SIZE = 20;
@@ -1728,6 +1736,7 @@ async function startNode() {
     startKeepAlive(() => refreshTab());
     wireNodeEvents();
     startRefreshInterval();
+    startClaimSweep();
     nodeStartedAt = Date.now();
     lastKnownBlockCount = 0;
     blockCountStableSince = 0;
@@ -1763,6 +1772,7 @@ $('#btnStopNode').addEventListener('click', async () => {
   setNodeDependentTabs(false);
   stopKeepAlive();
   stopRefreshInterval();
+  stopClaimSweep();
   unwireNodeEvents();
   markNodeStopped();
   addLog('Node stopped', 'warn');
@@ -3057,6 +3067,39 @@ function unwireNodeEvents() {
   nodeEventsWired = false;
   node.removeAllListeners();
   node.net.removeAllListeners();
+}
+
+/**
+ * Claiming an inbound transfer must not depend on which TAB is open.
+ *
+ * autoClaimPending() used to have exactly one caller — refreshTransfer() — which
+ * refreshTab() only invokes while the Transfer tab is active, on a 60s tick. The
+ * fast path (node.autoReceiveEngine, 5s challenge window) only covers blocks
+ * that arrive by live gossip with the tab open, so anything that landed while
+ * the browser was closed, backgrounded or still connecting fell to a sweep that
+ * might never run. Observed with an NFT sent back to its original owner: it
+ * stayed invisible until an unrelated payment arrived from the same sender and
+ * triggered a refresh, which then claimed both.
+ *
+ * The sweep is cheap (it walks two in-memory maps) and re-entrancy is already
+ * guarded by autoClaimRunning, so it runs on its own timer regardless of tab.
+ */
+let claimSweepInterval: ReturnType<typeof setInterval> | null = null;
+const CLAIM_SWEEP_MS = 15_000;
+
+function startClaimSweep() {
+  stopClaimSweep();
+  // One shortly after start: the foreign-chain resync lands at ~7.5s, and the
+  // blocks it pulls are exactly the ones that were missed while offline.
+  setTimeout(() => { autoClaimPending(); }, 9_000);
+  claimSweepInterval = setInterval(() => { autoClaimPending(); }, CLAIM_SWEEP_MS);
+}
+
+function stopClaimSweep() {
+  if (claimSweepInterval) {
+    clearInterval(claimSweepInterval);
+    claimSweepInterval = null;
+  }
 }
 
 let refreshInterval: ReturnType<typeof setInterval> | null = null;
