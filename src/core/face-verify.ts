@@ -569,8 +569,8 @@ export async function detectChallenge(
   // Requiring both rejects "mouth open" (widens little, corners don't rise) and
   // a jaw drop. Fractions of inter-eye distance; tightened 15% + 10% after real
   // runs passed too easily.
-  const SMILE_LIFT_DELTA = 0.0152;
-  const SMILE_WIDTH_DELTA = 0.0380;
+  const SMILE_LIFT_DELTA = 0.0175;
+  const SMILE_WIDTH_DELTA = 0.0437;
   // Jaw drop: lip gap / mouth width, over the calibrated neutral. Neutral sits
   // near 0.1, a deliberate open mouth clears 0.4 — enormous margin.
   const MOUTH_OPEN_DELTA = 0.22;
@@ -592,7 +592,7 @@ export async function detectChallenge(
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
-  const BROW_DELTA = 0.035;
+  const BROW_DELTA = 0.040;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
@@ -899,17 +899,25 @@ export async function detectLiveness(
   const startTime = Date.now();
   let framesWithFace = 0;
   let framesWithoutFace = 0;
-  const nosePositions: { x: number; y: number }[] = [];
-  // Require a genuine excursion to BOTH sides of the resting position, ≥TURN_PX
-  // each. That is at least as strong as the previous "30px total range + 2
-  // direction reversals" (it implies both) while being un-spoofable by jitter,
-  // and — unlike a reversal counter — it maps directly onto a two-sided progress
-  // bar: each half fills with how far that side has actually been turned.
-  const TURN_PX = 15;
-  let leftMax = 0;    // nose x ABOVE baseline → user turned to their left
-  let rightMax = 0;   // nose x BELOW baseline → user turned to their right
+  // Require a genuine ROTATION to both sides of the resting pose.
+  //
+  // This used to measure raw nose displacement against a 15px threshold, which
+  // is smaller than the landmark jitter of a motionless face — the bar sat near
+  // full while the user sat still, and any sideways lean completed it. It now
+  // uses the same yaw ratio as the challenge turn (nose position between the jaw
+  // edges): translation moves nose and jaw together and cancels out, so only a
+  // real turn registers. A dead-zone below LIVENESS_NOISE keeps jitter at zero
+  // on the bar instead of showing phantom progress.
+  const LIVENESS_YAW = 0.07;     // per side, in jaw-ratio units (a real turn measured 0.09-0.25)
+  const LIVENESS_NOISE = 0.025;  // measured at-rest jitter
+  const LIVENESS_DRIFT_MAX = 0.06;
+  let leftMax = 0;    // yaw ABOVE baseline → user turned to their left
+  let rightMax = 0;   // yaw BELOW baseline → user turned to their right
   let baseline: number | null = null;
+  let baselineCx = 0;
   const baselineSamples: number[] = [];
+  const baselineCxSamples: number[] = [];
+  const mid = (a: number[]) => { const v = [...a].sort((x, y) => x - y); return v[Math.floor(v.length / 2)]; };
 
   // Don't claim a face was found before we've actually looked — show a neutral prompt until
   // the detection loop confirms one (otherwise "Face detected" flashes before the camera
@@ -933,15 +941,17 @@ export async function detectLiveness(
 
     if (detection) {
       framesWithFace++;
-      const nose = detection.landmarks.positions[30];
-      nosePositions.push({ x: nose.x, y: nose.y });
-      if (nosePositions.length > 40) nosePositions.shift();
+      const pts = detection.landmarks.positions as Point[];
+      const yaw = yawSignals(pts).jawRatio;
+      const cx = frameCentreX(pts, video.videoWidth);
 
-      // Resting position from the first frames, then measure each side's excursion.
+      // Resting pose from the first frames (median, so a stray frame can't skew it).
       if (baseline === null) {
-        baselineSamples.push(nose.x);
-        if (baselineSamples.length >= 5) {
-          baseline = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
+        baselineSamples.push(yaw);
+        baselineCxSamples.push(cx);
+        if (baselineSamples.length >= 6) {
+          baseline = mid(baselineSamples);
+          baselineCx = mid(baselineCxSamples);
         } else {
           onStatus?.({ label: 'Hold still', guide: 'hold', left: 0, right: 0 });
           await sleep(100);
@@ -949,12 +959,23 @@ export async function detectLiveness(
         }
       }
 
-      const signed = nose.x - baseline;
+      // Sliding across the frame is not turning — same rule as the challenge turn.
+      if (Math.abs(cx - baselineCx) > LIVENESS_DRIFT_MAX) {
+        onStatus?.({ label: 'Keep your head in place — turn, not slide', guide: 'turn', left: 0, right: 0 });
+        await sleep(100);
+        continue;
+      }
+
+      const signed = yaw - baseline;
       if (signed > 0) leftMax = Math.max(leftMax, signed);
       else rightMax = Math.max(rightMax, -signed);
+      debugMetrics(`liveness yawD=${signed.toFixed(4)} L=${leftMax.toFixed(4)} R=${rightMax.toFixed(4)} need=${LIVENESS_YAW} drift=${Math.abs(cx - baselineCx).toFixed(4)}`);
 
-      const leftPct = Math.min(100, Math.round((leftMax / TURN_PX) * 100));
-      const rightPct = Math.min(100, Math.round((rightMax / TURN_PX) * 100));
+      // Dead-zone: nothing below the measured jitter floor counts as progress.
+      const span = LIVENESS_YAW - LIVENESS_NOISE;
+      const pctOf = (m: number) => Math.max(0, Math.min(100, Math.round(((m - LIVENESS_NOISE) / span) * 100)));
+      const leftPct = pctOf(leftMax);
+      const rightPct = pctOf(rightMax);
 
       if (leftPct >= 100 && rightPct >= 100) {
         onStatus?.({ label: 'Liveness confirmed', guide: 'turn', left: 100, right: 100, state: 'ok' });

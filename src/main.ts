@@ -862,31 +862,83 @@ function setCameraStatus(html: string) {
  * the user needs one imperative, and the bar + guide already show where they
  * are. Labels stay sentence-case in source (translatable); CSS uppercases them.
  */
-/**
- * Short confirmation tone. The eyes-closed check is the one prompt whose
- * feedback the user physically cannot see, so it gets an audible "done" —
- * without it the only way to know is to open your eyes and break the hold.
- * Best-effort: silently skipped if the browser blocks audio.
- */
-function beepOk(): void {
+// ──── Capture audio ────────────────────────────────────────────────────────
+// The progress bar is useless for the eyes-closed prompt and hard to watch while
+// performing any of the others, so progress is also audible: a quiet tone that
+// rises with the bar, then a short confirmation chime when the action lands.
+// All best-effort — everything still works silently if audio is unavailable.
+
+let toneCtx: AudioContext | null = null;
+let toneOsc: OscillatorNode | null = null;
+let toneGain: GainNode | null = null;
+
+function audioCtx(): AudioContext | null {
   try {
-    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.frequency.value = 880;
-    gain.gain.setValueAtTime(0.06, ctx.currentTime);              // quiet
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
-    osc.connect(gain).connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.2);
-    setTimeout(() => ctx.close().catch(() => {}), 400);
-  } catch { /* audio unavailable — the on-screen confirmation still shows */ }
+    if (!toneCtx) {
+      const Ctx = window.AudioContext
+        ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctx) return null;
+      toneCtx = new Ctx();
+    }
+    if (toneCtx.state === 'suspended') void toneCtx.resume();
+    return toneCtx;
+  } catch { return null; }
+}
+
+/** Map 0–100% onto a rising two-octave sweep (220 Hz → 880 Hz). */
+function setProgressTone(pct: number): void {
+  const ctx = audioCtx();
+  if (!ctx) return;
+  try {
+    if (!toneOsc) {
+      toneOsc = ctx.createOscillator();
+      toneGain = ctx.createGain();
+      toneOsc.type = 'sine';
+      toneGain.gain.value = 0;
+      toneOsc.connect(toneGain).connect(ctx.destination);
+      toneOsc.start();
+    }
+    const t = ctx.currentTime;
+    if (pct <= 0) { toneGain!.gain.setTargetAtTime(0, t, 0.04); return; }
+    // Exponential in pitch so the rise sounds linear to the ear.
+    toneOsc.frequency.setTargetAtTime(220 * Math.pow(4, Math.min(1, pct / 100)), t, 0.05);
+    toneGain!.gain.setTargetAtTime(0.025, t, 0.05);               // quiet
+  } catch { /* ignore */ }
+}
+
+function stopProgressTone(): void {
+  try {
+    if (toneGain && toneCtx) toneGain.gain.setTargetAtTime(0, toneCtx.currentTime, 0.03);
+  } catch { /* ignore */ }
+}
+
+/** Two-note confirmation, clearly distinct from the sweep that precedes it. */
+function beepOk(): void {
+  const ctx = audioCtx();
+  if (!ctx) return;
+  try {
+    [[988, 0], [1319, 0.09]].forEach(([freq, at]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freq;
+      const t0 = ctx.currentTime + at;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.07, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.16);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.18);
+    });
+  } catch { /* ignore */ }
 }
 
 function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
-  if (cue.state === 'ok' && cue.guide === 'eyes') beepOk();
+  // Audio mirrors the bar: sweep up while approaching, chime on success, silence
+  // on failure. Only the action guides get a tone — 'hold'/'search' are waits.
+  const progress = Math.max(cue.left ?? 0, cue.right ?? 0);
+  if (cue.state === 'ok') { stopProgressTone(); beepOk(); }
+  else if (cue.state === 'fail' || cue.guide === 'hold' || cue.guide === 'search') stopProgressTone();
+  else setProgressTone(progress);
   const colour = cue.state === 'ok' ? 'var(--success)' : cue.state === 'fail' ? 'var(--danger)' : '';
   setCameraStatus(
     `<span class="cue-label"${colour ? ` style="color:${colour}"` : ''}>${escHtml(cue.label)}</span>`,
@@ -912,6 +964,7 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
 
 /** Clear bar + guide between phases so a stale animation never lingers. */
 function resetCaptureCue(): void {
+  stopProgressTone();
   const bar = document.getElementById('captureBar');
   bar?.removeAttribute('data-state');
   (document.getElementById('captureBarL') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
