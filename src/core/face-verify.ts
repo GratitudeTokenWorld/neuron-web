@@ -602,6 +602,8 @@ export async function detectChallenge(
   let earBelowCount = 0;
   let sawEyesOpen = false;
   const earWindow: { t: number; ear: number }[] = [];
+  /** Open-eye reference history, fed only by frames that are NOT a closure. */
+  const openRefHist: { t: number; ear: number }[] = [];
   // Every action must be HELD, not merely touched. Jitter crosses a threshold
   // for one frame; a deliberate expression stays there. This is what stops the
   // checks feeling "too sensitive" without making them physically harder — the
@@ -862,9 +864,9 @@ export async function detectChallenge(
       // instantly with your eyes open" case, caught in a real trace at
       // mean=0.311 vs a 0.314 threshold. The 80th percentile of the last few
       // seconds tracks drift while ignoring the closure itself.
-      const openHist = earWindow.filter(e => now - e.t <= OPEN_REF_MS).map(e => e.ear).sort((a, b) => a - b);
-      const openRef = openHist.length >= 6
-        ? openHist[Math.floor(openHist.length * 0.8)]
+      const sortedOpen = openRefHist.map(e => e.ear).sort((a, b) => a - b);
+      const openRef = sortedOpen.length >= 6
+        ? sortedOpen[Math.floor(sortedOpen.length * 0.8)]
         : (earOpen || 0.30);
       const margin = Math.max(3.0 * (earSdNeutral || 0.008), 0.015);
       const closedBelow = openRef - margin;
@@ -873,7 +875,11 @@ export async function detectChallenge(
       // Mean over the LAST CLOSE_HOLD_MS, but only once the buffer actually
       // covers that much history.
       const recent = earWindow.filter(e => now - e.t <= CLOSE_HOLD_MS);
-      const span = recent.length ? now - recent[0].t : 0;
+      // Coverage comes from the FULL buffer, not from `recent`: `recent` only
+      // holds the last CLOSE_HOLD_MS by construction, so its own span can never
+      // reach that value — measuring it there made the hold unsatisfiable and
+      // the bar sat at 100% forever. (Second time; the same trap as before.)
+      const span = earWindow.length ? now - earWindow[0].t : 0;
       const windowMean = recent.reduce((a, b) => a + b.ear, 0) / (recent.length || 1);
       const held = span >= CLOSE_HOLD_MS && recent.length >= 4;
       debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
@@ -887,6 +893,14 @@ export async function detectChallenge(
       // (with a tone) the moment it lands.
       const depth = earOpen > 0 ? (earOpen - windowMean) / margin : 0;
       const pct = Math.max(0, Math.min(99, Math.round(depth * Math.min(1, span / CLOSE_HOLD_MS) * 100)));
+      // Feed the reference ONLY with frames that are not part of a closure —
+      // otherwise a long hold drags the reference down to meet the closure and
+      // the test can never fire (observed: openRef decaying 0.329 -> 0.304 while
+      // the eyes stayed shut).
+      if (windowMean > closedBelow) {
+        openRefHist.push({ t: now, ear });
+        while (openRefHist.length && now - openRefHist[0].t > OPEN_REF_MS) openRefHist.shift();
+      }
       onStatus?.({
         label: sawEyesOpen ? (windowMean <= closedBelow ? 'Keep them closed' : 'Close your eyes') : 'Look at the camera',
         guide: 'eyes', left: pct, right: pct,
