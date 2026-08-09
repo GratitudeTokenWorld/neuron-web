@@ -4,18 +4,28 @@ The features that need a real face + camera cannot be automated; this is the man
 matrix. It exercises everything the 197-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
-**Topology under test:** 2 cloud relays (super-node archive + attester each, IPs
-`RELAY1_IP` / `RELAY2_IP` below) + your local dev relay + 2 browser profiles.
+**Topology under test:** 2 cloud relays (super-node archive + attester each) +
+your local dev relay + 2 browser profiles.
 Provisioning: [CLOUD.md](CLOUD.md); box setup: `scripts/setup-relay-box.sh`.
+
+| Relay | IP | peerId |
+|---|---|---|
+| relay-1 | `80.97.27.224` | `12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh` |
+| relay-2 | `80.97.27.112` | `12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU` |
 
 ## Before you start
 
+Both relays are already the **baked defaults** (bootstrap list in `vite.config.ts`,
+dev-relay federation in `vite-libp2p-plugin.ts`), so plain `npm run dev` is enough.
+The env vars below exist to *override* the targets (e.g. pointing at replacement
+boxes — get peerIds from `curl http://<IP>:9092/relay-info`):
+
 ```powershell
-# dev stack pointed at both cloud relays (replace IPs + peerIds; get peerIds from
-#   curl http://<IP>:9092/relay-info )
-$env:PEER_RELAYS = '/ip4/RELAY1_IP/tcp/9091/p2p/PEERID1,/ip4/RELAY2_IP/tcp/9091/p2p/PEERID2'
-$env:BOOTSTRAP_ADDRS = '/ip4/RELAY1_IP/tcp/9090/ws/p2p/PEERID1,/ip4/RELAY2_IP/tcp/9090/ws/p2p/PEERID2'
-npm run dev
+npm run dev    # defaults already point at both relays above
+
+# only to override:
+$env:PEER_RELAYS = '/ip4/<IP1>/tcp/9091/p2p/<PEERID1>,/ip4/<IP2>/tcp/9091/p2p/<PEERID2>'
+$env:BOOTSTRAP_ADDRS = '/ip4/<IP1>/tcp/9090/ws/p2p/<PEERID1>,/ip4/<IP2>/tcp/9090/ws/p2p/<PEERID2>'
 ```
 
 Rules that will save you a debugging session:
@@ -45,7 +55,7 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    The nullifier from attester #1 is what the open block commits.
 5. **Fail signatures to watch for** (the old bugs):
    - `1/2 attestations` → the client couldn't reach attester #2. Check
-     `http://RELAY2_IP:9092/relay-info` returns `signingPub`, and that the browser
+     `http://80.97.27.112:9092/relay-info` returns `signingPub`, and that the browser
      console shows no CORS error on `/face-verify/challenge` (needs `x-network` in
      `Access-Control-Allow-Headers` — fixed in `624d0d8`).
    - Attestation succeeds but account invisible in Browser B → see T2.
@@ -58,7 +68,7 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    (close B's tab first for a stricter test: A must get bob's chain from a relay
    archive, not from B).
 3. Reload Browser A (F5). **Pass:** alice persists, balance intact, no re-enrollment.
-4. `curl http://RELAY1_IP:9092/relay-info` and RELAY2: same `generation`, and both
+4. `curl http://80.97.27.224:9092/relay-info` and RELAY2: same `generation`, and both
    relays' logs show bob's open block archived (`[Archive] Stored open …`).
 
 ## T3 — Transfer (the "transfers did not work" bug)
@@ -113,7 +123,7 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 
 The first 3 accounts attested by a fresh relay become its operators (`.relay-operators.json`).
 
-1. `curl http://RELAY1_IP:9092/relay-info` → `operators` contains alice (first 3).
+1. `curl http://80.97.27.224:9092/relay-info` → `operators` contains alice (first 3).
 2. From a *non*-operator profile: Reset Testnet. **Pass:** relays ignore it (only
    that browser clears + resyncs).
 3. From alice (first account in that browser): Reset Testnet. **Pass:** both relays

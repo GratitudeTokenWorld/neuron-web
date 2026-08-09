@@ -40,14 +40,18 @@ $RELAY_USER  soft  nofile  65535
 $RELAY_USER  hard  nofile  65535
 EOF
 
-# clone / update + install as the relay user
+# clone / update + install as the relay user.
+# checkout -- package-lock.json first: a locally-rewritten lockfile silently
+# aborts `git pull` (bit us 2026-08-09); `npm ci` instead of `npm install` so the
+# lockfile is never rewritten on the box (exact reproducible tree, prunes removed deps).
 if [ ! -d "$REPO_DIR/.git" ]; then
   sudo -u "$RELAY_USER" -H git clone https://github.com/GratitudeTokenWorld/neuron-web.git "$REPO_DIR"
 else
-  sudo -u "$RELAY_USER" -H git -C "$REPO_DIR" pull
+  sudo -u "$RELAY_USER" -H git -C "$REPO_DIR" checkout -- package-lock.json 2>/dev/null || true
+  sudo -u "$RELAY_USER" -H git -C "$REPO_DIR" pull --ff-only
 fi
 cd "$REPO_DIR"
-sudo -u "$RELAY_USER" -H npm install
+sudo -u "$RELAY_USER" -H npm ci
 
 # relay env: PEER_RELAYS is added to ~/.relay-env AFTER both boxes exist
 # (needs the other box's peerId). Sourced by .profile so pm2 inherits it.

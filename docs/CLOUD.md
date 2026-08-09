@@ -70,14 +70,20 @@ their public IPs must stay stable (baked into the app's bootstrap list).
 
 ## Live relay boxes (created 2026-08-09)
 
-| Box | Public IP | Private | Flavor / image |
+| Box | Public IP | Private | peerId |
 |---|---|---|---|
-| `neuron-relay-1` | **80.97.27.224** | 10.10.0.214 | `b2i.2c-2g` / Ubuntu 26.04 |
-| `neuron-relay-2` | **80.97.27.112** | 10.10.0.55 | `b2i.2c-2g` / Ubuntu 26.04 |
+| `neuron-relay-1` | **80.97.27.224** | 10.10.0.214 | `12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh` |
+| `neuron-relay-2` | **80.97.27.112** | 10.10.0.55 | `12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU` |
 
-SSH: `ssh -i ~/.ssh/neuron-ops ubuntu@<IP>`; relay software via
-`scripts/setup-relay-box.sh`; roles: archive super-node + attester each
-(see [SUPERNODE.md](SUPERNODE.md), dev-relay variant).
+Both: `b2i.2c-2g`, Ubuntu 26.04, **Node 26**, pm2-managed, archive super-node +
+attester each ([SUPERNODE.md](SUPERNODE.md) dev-relay variant), reciprocally
+federated via `PEER_RELAYS` in `~/.relay-env`. SSH:
+`ssh -i ~/.ssh/neuron-ops ubuntu@<IP>`; software: `scripts/setup-relay-box.sh`.
+npm on the boxes and locally enforces `min-release-age=30` days (repo `.npmrc`)
+and the tree audits at **0 vulnerabilities** (react-native-webrtc peer tree
+stubbed out via package.json `overrides` — it's never executed).
+**peerId identity lives in `~/neuron-web/.relay-peer-id.json` — back it up; the
+baked bootstrap list in `vite.config.ts` embeds these peerIds.**
 
 ## Account state (2026-08-08, after the attempt)
 
