@@ -963,6 +963,14 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
     l.style.transform = `scaleX(${Math.max(0, Math.min(100, cue.left ?? 0)) / 100})`;
     r.style.transform = `scaleX(${Math.max(0, Math.min(100, cue.right ?? 0)) / 100})`;
   }
+  // Sub-step progress fills the ACTIVE step's box a third at a time (steps 0 and
+  // 6 — the depth legs and the capture samples). Applied to whichever box is
+  // active, so the phases stay the single source of "which step am I in".
+  if (cue.sub) {
+    const active = document.querySelector<HTMLElement>('#captureSteps > i.active');
+    const frac = cue.sub.total > 0 ? Math.max(0, Math.min(1, cue.sub.done / cue.sub.total)) : 0;
+    active?.style.setProperty('--fill', frac.toFixed(3));
+  }
   const guide = document.getElementById('captureGuide');
   if (guide) {
     guide.setAttribute('data-guide', cue.guide);
@@ -985,13 +993,19 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
 
 /**
  * Step tracker: `done` boxes go green with a checkmark, `active` is the one in
- * progress. Steps are 0 = setup, 1-5 = the five challenge actions, so `done`
- * runs 0-6 and `active` is -1 once nothing is outstanding.
+ * progress. Steps are 0 = setup, 1-5 = the five challenge actions, 6 = capture,
+ * so `done` runs 0-7 and `active` is -1 once nothing is outstanding.
+ *
+ * Clearing `--fill` on every box each time matters: a box that is fully `done`
+ * paints solid green from its own rule, and a box that becomes active again
+ * (a retried phase) must start empty rather than inherit the previous run's
+ * thirds.
  */
 function setCaptureSteps(done: number, active = -1): void {
   document.querySelectorAll<HTMLElement>('#captureSteps > i').forEach((el, i) => {
     el.classList.toggle('done', i < done);
     el.classList.toggle('active', i === active);
+    el.style.removeProperty('--fill');
   });
 }
 
@@ -1090,8 +1104,8 @@ async function challengeAndCapture(
       return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
     }
     // Step 0 was setup, so action i completes step i+1; the next one becomes
-    // active. After the last action `done` is 6 and nothing is active.
-    setCaptureSteps(i + 2, i + 2 < 6 ? i + 2 : -1);
+    // active. After the last action `done` is 6 and step 6 (capture) is next.
+    setCaptureSteps(i + 2, i + 2);
     // Watched pause — a blind sleep here would be a free window to swap faces —
     // and a beat for the user to drop the previous expression before the next
     // prompt (the baseline itself is now immune, measured once up front).
@@ -1107,9 +1121,11 @@ async function challengeAndCapture(
     addLog(`FaceID: ${presence.lost ? 'out of frame or too dark during capture' : 'capture failed'}`, 'error');
     return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
   }
-  // Let the completed bar be SEEN. enrollFace's terminal 100% cue used to paint
-  // in the same tick the caller tore the modal down, so the last state a user
-  // actually saw was 2/3 — the bar looked like it never reached the edges.
+  // Tick the capture box, and let the completed bar be SEEN. enrollFace's
+  // terminal 100% cue used to paint in the same tick the caller tore the modal
+  // down, so the last state a user actually saw was 2/3 — the bar looked like
+  // it never reached the edges.
+  setCaptureSteps(7);
   await new Promise(resolve => setTimeout(resolve, CAPTURE_DONE_DWELL_MS));
   return { faceMap };
 }

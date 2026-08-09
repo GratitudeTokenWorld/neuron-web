@@ -676,30 +676,43 @@
     }
 
     /* ── Step tracker ──────────────────────────────────────────────────────────
-       Six boxes above the progress bar: 0 is setup (framing, depth sweep,
-       baseline), 1-5 are the five challenge actions. Numbered rather than named
-       because the action order is drawn fresh each run — a fixed label list would
-       misdescribe the sequence the user is actually being given. Each turns
-       green with a checkmark as it completes, so the user can see how much of
-       the enrollment is left instead of facing an open-ended series of prompts. */
+       Seven boxes above the progress bar: 0 is setup (framing, depth sweep,
+       baseline), 1-5 are the five challenge actions, 6 is the capture. Numbered
+       rather than named because the action order is drawn fresh each run — a
+       fixed label list would misdescribe the sequence the user is actually being
+       given. Each turns green with a checkmark as it completes, so the user can
+       see how much of the enrollment is left instead of facing an open-ended
+       series of prompts.
+
+       Steps 0 and 6 are the two phases made of THREE sub-steps (the three depth
+       legs; the three capture samples), and each sub-step fills a third of the
+       box left-to-right via `--fill`. Those two phases otherwise looked stalled:
+       one box sat un-ticked while the user completed three separate things. The
+       one-shot actions (1-5) have nothing to subdivide, so they stay binary. */
     .capture-steps {
       display: flex;
       justify-content: center;
-      gap: 4px;
-      padding: 0 10px 8px;
+      gap: 5px;
+      padding: 0 10px 10px;
       background: var(--surface);   /* same ground as the header above it */
     }
     .capture-steps > i {
-      flex: 0 1 44px;
-      height: 20px;
+      flex: 0 1 52px;
+      height: 26px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-style: normal;
-      font-size: 11px;
+      font-size: 13px;
       font-weight: 600;
       color: var(--text-muted);
-      background: var(--surface);
+      /* Partial fill: green up to --fill (0-1) of the width, surface beyond it.
+         A hard colour stop, not a gradient blend — thirds must read as discrete
+         completed sub-steps, not as a smooth meter. */
+      background:
+        linear-gradient(to right,
+          var(--success) calc(var(--fill, 0) * 100%),
+          var(--surface) calc(var(--fill, 0) * 100%));
       border: 1px solid var(--border);
       border-radius: 3px;
       transition: background 0.2s, color 0.2s, border-color 0.2s;
@@ -711,7 +724,7 @@
       color: #fff;
       font-size: 0;               /* hides the numeral, keeps the box size */
     }
-    .capture-steps > i.done::after { content: '\2713'; font-size: 12px; }
+    .capture-steps > i.done::after { content: '\2713'; font-size: 14px; }
 
     /* ── Centre-anchored capture progress ──────────────────────────────────────
        Two independent halves growing outward from the middle: a head-turn fills
@@ -834,8 +847,8 @@
     .camera-modal-video { position: relative; line-height: 0; }
 
     .camera-modal-status {
-      padding: 12px 52px;   /* side padding clears the close button */
-      font-size: 13px;
+      padding: 14px 52px;   /* side padding clears the close button */
+      font-size: 17px;      /* the one instruction the user must read mid-action */
       color: var(--text-dim);
       text-align: center;
       min-height: 44px;
@@ -1074,7 +1087,7 @@
       </div>
       <!-- Step tracker: 0 = setup, 1-5 = the five challenge actions. -->
       <div class="capture-steps" id="captureSteps">
-        <i>0</i><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i>
+        <i>0</i><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i><i>6</i>
       </div>
       <div class="capture-bar" id="captureBar"><i class="l" id="captureBarL"></i><i class="r" id="captureBarR"></i></div>
       <div class="camera-modal-video">

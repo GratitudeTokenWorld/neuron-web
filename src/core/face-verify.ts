@@ -117,6 +117,14 @@ export interface CaptureCue {
    */
   depth?: 'in' | 'out';
   state?: 'ok' | 'fail';
+  /**
+   * Sub-step progress for the phases built from several discrete parts — the
+   * three depth legs (step 0) and the three capture samples (step 6). The step
+   * tracker fills that phase's box a third at a time, so a box that stays
+   * un-ticked across three separate user actions still shows movement. Phases
+   * with nothing to subdivide simply omit it.
+   */
+  sub?: { done: number; total: number };
 }
 
 // ──── Presence continuity (anti-swap) ────
@@ -251,6 +259,7 @@ export async function enrollFace(
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
       label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i), right: pct(i),
+      sub: { done: i, total: ENROLLMENT_SAMPLES },
     });
     // Watched pause, not a blind sleep: the window between samples is the last
     // place a swapped face could slip in unnoticed.
@@ -280,6 +289,7 @@ export async function enrollFace(
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
       label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i + 1), right: pct(i + 1),
+      sub: { done: i + 1, total: ENROLLMENT_SAMPLES },
     });
   }
 
@@ -295,6 +305,7 @@ export async function enrollFace(
   // (see CAPTURE_DONE_DWELL_MS) long enough to be seen.
   onProgress(ENROLLMENT_SAMPLES, ENROLLMENT_SAMPLES, {
     label: 'Captured', guide: 'hold', state: 'ok', left: 100, right: 100,
+    sub: { done: ENROLLMENT_SAMPLES, total: ENROLLMENT_SAMPLES },
   });
 
   // Average descriptors
@@ -763,7 +774,10 @@ export async function calibrateNeutral(
         // completed action from the user's side, so it gets the same audible
         // confirmation as a challenge. Without it the setup stage was the one
         // part of the flow that gave no feedback for doing the right thing.
-        onStatus?.({ label: 'Good', guide: 'depth', depth: goIn ? 'in' : 'out', state: 'ok', left: 100, right: 100 });
+        onStatus?.({
+          label: 'Good', guide: 'depth', depth: goIn ? 'in' : 'out', state: 'ok',
+          left: 100, right: 100, sub: { done: leg, total: LEGS.length },
+        });
         await sleep(150);
         continue;
       }
@@ -773,7 +787,10 @@ export async function calibrateNeutral(
         return fail('flat');
       }
       const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
-      onStatus?.({ label, guide: 'depth', depth: goIn ? 'in' : 'out', left: pct, right: pct });
+      onStatus?.({
+        label, guide: 'depth', depth: goIn ? 'in' : 'out', left: pct, right: pct,
+        sub: { done: leg, total: LEGS.length },
+      });
       await sleep(50);
       continue;
     }

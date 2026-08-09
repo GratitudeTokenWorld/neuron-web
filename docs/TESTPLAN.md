@@ -50,9 +50,14 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 *must* reach two distinct attesters or fail with "Need 2 independent attesters".
 
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
-   The capture UI shows a **six-box step tracker** (0 = setup, 1–5 = the five
-   actions; each turns green with a checkmark as it completes), a centre-out
-   green bar, a rising tone, and a wireframe guide over the (mirrored) feed.
+   The capture UI shows a **seven-box step tracker** (0 = setup, 1–5 = the five
+   actions, 6 = capture; each turns green with a checkmark as it completes), a
+   centre-out green bar, a rising tone, and a wireframe guide over the
+   (mirrored) feed. Boxes **0 and 6 are the two phases made of three sub-steps**
+   (the three depth legs; the three capture samples) and fill a third of the box
+   at a time, left to right, so neither looks stalled while you complete three
+   separate things. The run ends with box 6 ticked and the bar full at both
+   edges (plus the confirmation chime) — held briefly so it can be seen.
    The feed is 90% of viewport width on mobile and 50% of viewport height on PC. It runs a **setup stage** first — frame your
    head ("move closer" / "move back" / "hold your head level"), then a
    **three-leg depth sweep: closer → back → closer** — a white inner ring tracks
