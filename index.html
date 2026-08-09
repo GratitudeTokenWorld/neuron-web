@@ -691,7 +691,7 @@
        one-shot actions (1-5) have nothing to subdivide, so they stay binary. */
     .capture-steps {
       display: flex;
-      gap: 5px;
+      gap: 0;                       /* sections abut: this reads as ONE bar */
       padding: 0 10px 10px;
       background: var(--surface);   /* same ground as the header above it */
     }
@@ -719,8 +719,22 @@
           var(--success) calc(var(--fill, 0) * 100%),
           var(--surface) calc(var(--fill, 0) * 100%));
       border: 1px solid var(--border);
-      border-radius: 3px;
+      /* Segmented-bar geometry: only the two OUTER ends are rounded, and each
+         section drops its left border so neighbours share a single 1px divider
+         (never a 2px seam). box-sizing is border-box globally, so dropping that
+         border does not make the sections unequal. */
+      border-radius: 0;
+      border-left-width: 0;
       transition: background 0.2s, color 0.2s, border-color 0.2s;
+    }
+    .capture-steps > i:first-child {
+      border-left-width: 1px;
+      border-top-left-radius: 3px;
+      border-bottom-left-radius: 3px;
+    }
+    .capture-steps > i:last-child {
+      border-top-right-radius: 3px;
+      border-bottom-right-radius: 3px;
     }
     .capture-steps > i.active { color: var(--text); border-color: var(--text-dim); }
     .capture-steps > i.done {
@@ -730,6 +744,11 @@
       font-size: 0;               /* hides the numeral, keeps the box size */
     }
     .capture-steps > i.done::after { content: '\2713'; font-size: 14px; }
+    /* Dividers stay neutral whatever the section's state — LAST, so it wins over
+       .done/.active recolouring. Without it a run of completed sections merges
+       into one green block and the segmentation disappears exactly when the
+       user most wants to count what is finished. */
+    .capture-steps > i:not(:last-child) { border-right-color: var(--border); }
 
     /* ── Centre-anchored capture progress ──────────────────────────────────────
        Two independent halves growing outward from the middle: a head-turn fills
