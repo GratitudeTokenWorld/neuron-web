@@ -1037,6 +1037,13 @@ function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
 }
 
 /**
+ * How long the completed capture bar stays on screen before the modal closes.
+ * Long enough to read as "done" (and to hear the confirmation chime), short
+ * enough not to feel like a stall.
+ */
+const CAPTURE_DONE_DWELL_MS = 450;
+
+/**
  * The anti-spoofing half of every face flow: all three challenge actions in a
  * per-run random order, then the capture samples, under ONE presence guard so
  * the face that passes the checks is provably the face that gets captured.
@@ -1100,6 +1107,10 @@ async function challengeAndCapture(
     addLog(`FaceID: ${presence.lost ? 'out of frame or too dark during capture' : 'capture failed'}`, 'error');
     return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
   }
+  // Let the completed bar be SEEN. enrollFace's terminal 100% cue used to paint
+  // in the same tick the caller tore the modal down, so the last state a user
+  // actually saw was 2/3 — the bar looked like it never reached the edges.
+  await new Promise(resolve => setTimeout(resolve, CAPTURE_DONE_DWELL_MS));
   return { faceMap };
 }
 

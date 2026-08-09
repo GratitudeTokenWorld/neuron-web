@@ -286,6 +286,17 @@ export async function enrollFace(
   if (guard?.lost) return null;
   if (descriptors.length < ENROLLMENT_SAMPLES) return null;
 
+  // Terminal cue: the bar reaches BOTH edges and turns confirmed-green (plus the
+  // chime, via state 'ok'). Without it the last thing drawn was the third
+  // "Hold still 3/3" at 2/3 fill — the bar advances only once a sample is
+  // banked, so it always trailed the label by one step and visibly stopped
+  // short of the feed edges on both sides. Emitted before the averaging /
+  // hashing below so it paints while that runs; the caller holds it on screen
+  // (see CAPTURE_DONE_DWELL_MS) long enough to be seen.
+  onProgress(ENROLLMENT_SAMPLES, ENROLLMENT_SAMPLES, {
+    label: 'Captured', guide: 'hold', state: 'ok', left: 100, right: 100,
+  });
+
   // Average descriptors
   const canonical = new Array(128).fill(0);
   for (const d of descriptors) {
