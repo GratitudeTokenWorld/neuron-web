@@ -725,6 +725,15 @@
        deliberately no second overlay on the video — duplicating the same text in
        two places just competes for attention while the user is following it. */
     .camera-modal-header { position: relative; }
+    /* Capture instructions read as a command, not prose: uppercase + tracking,
+       brighter than the surrounding dim status text. Source strings stay
+       sentence-case so they remain translatable. */
+    .cue-label {
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      font-weight: 600;
+      color: var(--text);
+    }
     .camera-modal-video { position: relative; line-height: 0; }
 
     .camera-modal-status {

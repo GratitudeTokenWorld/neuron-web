@@ -858,14 +858,14 @@ function setCameraStatus(html: string) {
  * animation over the feed. Single source of truth, so the three surfaces can
  * never disagree (and the same sentence is never printed twice).
  *
- * `step` is the enrollment stage ("Step 1/3"); the cue supplies the instruction,
- * already free of counters — "Step 2/3 · Hold still — capturing 2 of 3".
+ * Just the instruction — no spinner, no "Step 1/3": while performing an action
+ * the user needs one imperative, and the bar + guide already show where they
+ * are. Labels stay sentence-case in source (translatable); CSS uppercases them.
  */
-function renderCaptureCue(step: string, cue: import('./core/face-verify').CaptureCue): void {
-  const spinner = cue.state ? '' : '<span class="spinner"></span> ';
+function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
   const colour = cue.state === 'ok' ? 'var(--success)' : cue.state === 'fail' ? 'var(--danger)' : '';
   setCameraStatus(
-    `${spinner}<span${colour ? ` style="color:${colour}"` : ''}>${escHtml(step)} · ${escHtml(cue.label)}</span>`,
+    `<span class="cue-label"${colour ? ` style="color:${colour}"` : ''}>${escHtml(cue.label)}</span>`,
   );
   const bar = document.getElementById('captureBar');
   const l = document.getElementById('captureBarL');
@@ -1790,7 +1790,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Step 1: Liveness
     setCameraStatus('<span class="spinner"></span> Step 1/3: Slowly turn your head left and right');
-    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue('Step 1/3', cue));
+    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
     if (!isLive) {
       addLog('FaceID: Liveness FAILED - not enough movement detected', 'error');
       toast('Liveness failed - try moving your head more', 'error');
@@ -1803,24 +1803,42 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
     const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
 
-    // Active challenge: detect the relay-issued action before face capture.
-    // This blocks enrollment until the user performs the action (blink/smile/look-left/right).
+    // Active challenge: ALL THREE actions, in a fresh random order every time.
+    // A single fixed action is cheap to pre-record; demanding blink + smile + a
+    // head turn in an order the attacker can't predict means a replayed video has
+    // to contain all three in exactly the drawn sequence. The relay's issued type
+    // picks the turn direction (and is the anti-replay nonce for the attestation).
+    //
+    // Honest limit: detection runs in the CLIENT, so a patched client can skip it.
+    // This raises the bar against presentation attacks (a photo or a recording held
+    // up to a real camera), not against a modified app — closing that needs
+    // server-side verification of the captured frames.
     if (pendingChallenges.length > 0) {
-      const challengeType = pendingChallenges[0].type as 'blink' | 'look-left' | 'look-right' | 'smile';
-      setCameraStatus(`<span class="spinner"></span> Step 2/3: Challenge — perform the action`);
-      const actionDone = await detectChallenge(video, challengeType, 18000,
-        cue => renderCaptureCue('Step 2/3', cue));
-      if (!actionDone) {
-        addLog('FaceID: Challenge action not detected — aborting account creation', 'error');
-        toast('Challenge failed — please perform the requested action and try again', 'error');
-        statusEl.innerHTML = '<span style="color:var(--danger)">Challenge timed out. Try again.</span>';
-        hideCameraModal(); restoreCreateBtn(); return;
+      const issued = pendingChallenges.map(c => c.type);
+      const turn = (issued.find(t => t === 'look-left' || t === 'look-right')
+        ?? (Math.random() < 0.5 ? 'look-left' : 'look-right')) as 'look-left' | 'look-right';
+      const sequence: ('blink' | 'smile' | 'look-left' | 'look-right')[] = ['blink', 'smile', turn];
+      for (let i = sequence.length - 1; i > 0; i--) {           // Fisher–Yates
+        const j = Math.floor(Math.random() * (i + 1));
+        [sequence[i], sequence[j]] = [sequence[j], sequence[i]];
+      }
+      addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
+
+      for (const action of sequence) {
+        const actionDone = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue));
+        if (!actionDone) {
+          addLog(`FaceID: challenge "${action}" not detected — aborting account creation`, 'error');
+          toast('Challenge failed — please perform each requested action and try again', 'error');
+          statusEl.innerHTML = `<span style="color:var(--danger)">Challenge timed out on "${escHtml(action)}". Try again.</span>`;
+          hideCameraModal(); restoreCreateBtn(); return;
+        }
+        await new Promise(r => setTimeout(r, 700));  // let the ✓ land before the next prompt
       }
     }
 
     // Face enrollment (camera still open, immediately after challenge action)
     setCameraStatus('<span class="spinner"></span> Step 3/3: Hold still — capturing face map');
-    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Step 3/3', cue));
+    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
     hideCameraModal();
 
     if (!faceMap) {
@@ -2056,7 +2074,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // Use the same multi-sample enrollment as account creation so the quantized
     // descriptor matches exactly (single-frame capture can differ enough to break
     // the derived AES key).
-    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Recovery', cue));
+    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
     hideCameraModal();
 
     if (!faceMap) { toast('No face detected', 'error'); statusEl.innerHTML = '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>'; finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return; }
@@ -2424,13 +2442,13 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     await loadModels();
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
-    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue('Step 1/2', cue));
+    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
     if (!isLive) {
       hideCameraModal();
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
       return;
     }
-    faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue('Step 2/2', cue));
+    faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
   } catch {
     hideCameraModal();
     statusEl.innerHTML = '<span style="color:var(--danger)">Camera error. Try again.</span>';

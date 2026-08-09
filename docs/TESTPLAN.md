@@ -49,10 +49,12 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
    The capture UI runs three stages with a centre-out green bar and a wireframe
-   guide over the (mirrored) feed: **1/3 liveness** — turn your head to *both*
-   sides, each half of the bar fills independently and both must reach full;
-   **2/3 challenge** — the relay-issued action (blink / smile / look left / look
-   right), animated over the feed; **3/3 capture** — hold still for 3 samples.
+   guide over the (mirrored) feed: **liveness** — turn your head to *both* sides,
+   each half of the bar fills independently and both must reach full;
+   **challenge** — **all three** actions (blink, smile, head turn) in a random
+   order drawn per enrollment, each animated over the feed, each with a 12 s
+   budget; **capture** — hold still for 3 samples. The drawn order is written to
+   the app log (`challenge sequence …`) — check it differs between runs.
 2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
    panel then shows `2/2` (or `3/3`) independent attestations.
 3. **Pass:** account opens; balance = 1,000,000 UNIT.

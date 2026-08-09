@@ -94,7 +94,11 @@ const dlog = (...args: unknown[]) => { if (DEBUG_ARCHIVE) console.log(...args); 
 const PROTOCOL_VERSION = 'v1';
 
 // ── Face-verify session store ─────────────────────────────────────────────────
-const CHALLENGE_TYPES = ['look-left', 'look-right', 'smile'];
+// The client performs ALL of blink + smile + a head turn, in a random order, per
+// enrollment; this list only decides which DIRECTION the turn is asked in (and
+// serves as the per-attestation nonce). 'blink' stays out so the draw is always
+// a turn direction — the client adds blink and smile itself.
+const CHALLENGE_TYPES = ['look-left', 'look-right'];
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const IP_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Per-IP verification cap per 24h, by network. Local/loopback IPs are exempt

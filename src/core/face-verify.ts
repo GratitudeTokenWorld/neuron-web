@@ -118,7 +118,7 @@ export async function enrollFace(
 
   for (let i = 0; i < ENROLLMENT_SAMPLES; i++) {
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
-      label: `Hold still — capturing ${i + 1} of ${ENROLLMENT_SAMPLES}`,
+      label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i), right: pct(i),
     });
     await sleep(800);
@@ -135,7 +135,7 @@ export async function enrollFace(
     }
     descriptors.push(desc.data);
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
-      label: `Hold still — captured ${i + 1} of ${ENROLLMENT_SAMPLES}`,
+      label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i + 1), right: pct(i + 1),
     });
   }
@@ -222,8 +222,12 @@ export async function detectChallenge(
   // mirrored for display, which puts that motion on the viewer's left. Hence
   // "their left" == the bar's left half == the on-screen direction they see.
   const turnSide: 'left' | 'right' = type === 'look-right' ? 'right' : 'left';
+  // Opening prompt, in the same wording the in-progress cues use.
+  const prompt =
+    type === 'blink' ? 'Blink' :
+    type === 'smile' ? 'Smile' : `Turn head ${turnSide}`;
 
-  onStatus?.({ label: `${actionLabel.toUpperCase()} — keep looking at the camera`, guide, left: 0, right: 0 });
+  onStatus?.({ label: prompt, guide, left: 0, right: 0 });
 
   while (Date.now() < deadline) {
     let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
@@ -261,7 +265,7 @@ export async function detectChallenge(
       // Two-stage, so the bar tracks the actual state machine: eyes seen open (50%)
       // then a closure confirmed (100%). Raw EAR is a debug number, not guidance.
       onStatus?.({
-        label: sawEyesOpen ? 'Now blink' : 'Open your eyes and look at the camera',
+        label: sawEyesOpen ? 'Blink now' : 'Open your eyes',
         guide: 'blink', left: sawEyesOpen ? 50 : 0, right: sawEyesOpen ? 50 : 0,
       });
 
@@ -283,13 +287,13 @@ export async function detectChallenge(
       const delta = Math.abs(signed);
       const threshold = videoWidth * 0.08;
       if (delta > threshold * 0.85) {
-        onStatus?.({ label: `Turn detected`, guide: 'turn', left: 100, right: 100, state: 'ok' });
+        onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
         return true;
       }
       const pct = Math.min(99, Math.round((delta / threshold) * 100));
       const movingLeft = signed > 0;   // raw nose x rises when the user turns to their left
       onStatus?.({
-        label: `Turn your head ${turnSide}`,
+        label: `Turn head ${turnSide}`,
         guide: 'turn',
         left: movingLeft ? pct : 0,
         right: movingLeft ? 0 : pct,
@@ -308,7 +312,7 @@ export async function detectChallenge(
     await sleep(80);
   }
 
-  onStatus?.({ label: `Timed out — ${actionLabel} not detected`, guide, state: 'fail', left: 0, right: 0 });
+  onStatus?.({ label: 'Timed out — try again', guide, state: 'fail', left: 0, right: 0 });
   return false;
 }
 
@@ -344,7 +348,7 @@ export async function detectLiveness(
   // Don't claim a face was found before we've actually looked — show a neutral prompt until
   // the detection loop confirms one (otherwise "Face detected" flashes before the camera
   // has even produced a frame).
-  onStatus?.({ label: 'Position your face in the frame', guide: 'search', left: 0, right: 0 });
+  onStatus?.({ label: 'Show your face', guide: 'search', left: 0, right: 0 });
 
   while (Date.now() - startTime < timeoutMs) {
     // Skip detection until the camera is actually streaming frames — running face-api on a
@@ -373,7 +377,7 @@ export async function detectLiveness(
         if (baselineSamples.length >= 5) {
           baseline = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
         } else {
-          onStatus?.({ label: 'Hold still for a moment', guide: 'hold', left: 0, right: 0 });
+          onStatus?.({ label: 'Hold still', guide: 'hold', left: 0, right: 0 });
           await sleep(100);
           continue;
         }
@@ -394,19 +398,19 @@ export async function detectLiveness(
       // Prompt only the side still missing, so there is exactly one thing to do.
       const need = leftPct >= 100 ? 'right' : rightPct >= 100 ? 'left' : 'left and right';
       onStatus?.({
-        label: need === 'left and right' ? 'Slowly turn your head left, then right' : `Now turn ${need}`,
+        label: need === 'left and right' ? 'Turn head left, then right' : `Turn head ${need}`,
         guide: 'turn', left: leftPct, right: rightPct,
       });
     } else {
       framesWithoutFace++;
       if (framesWithoutFace % 8 === 0) {
-        onStatus?.({ label: 'Move closer — no face detected', guide: 'search', left: 0, right: 0 });
+        onStatus?.({ label: 'Move closer', guide: 'search', left: 0, right: 0 });
       }
     }
     await sleep(100);
   }
 
-  onStatus?.({ label: 'Liveness failed — try again with more head movement', guide: 'search', state: 'fail', left: 0, right: 0 });
+  onStatus?.({ label: 'Liveness failed — try again', guide: 'search', state: 'fail', left: 0, right: 0 });
   return false;
 }
 
