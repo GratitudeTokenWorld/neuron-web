@@ -110,11 +110,15 @@ const IP_WINDOW_MS = 24 * 60 * 60 * 1000;
 // NOTE: the counter is in-memory on the RELAY (per IP) — a browser reload does
 // NOT reset it; restarting the relay does.
 const IP_MAX_PER_DAY = { testnet: 24, mainnet: 12 };
-/** Max accounts per face: testnet=3, mainnet=1 */
-// Max accounts per face. Mainnet = 1 (true one-human-one-account). Testnet is
-// generous for dev testing (each create/retry consumes a slot per relay) and
-// tunable via FACE_MAX_TESTNET.
-const FACE_MAX = { testnet: Number(process.env.FACE_MAX_TESTNET) || 25, mainnet: 1 };
+// Max accounts per face. Mainnet = 1 (true one-human-one-account); testnet = 3
+// so one tester can hold a couple of accounts without weakening the model.
+//
+// This was briefly 25: abandoned attempts used to burn a slot forever, so real
+// testing hit the cap without ever creating that many accounts. Slots are now
+// provisional and released after FACE_USE_TTL_MS, so the inflated cap is no
+// longer needed. FACE_MAX_TESTNET still overrides it — set it to 2 to make the
+// limit testable in 3 enrollments instead of 4.
+const FACE_MAX = { testnet: Number(process.env.FACE_MAX_TESTNET) || 3, mainnet: 1 };
 /**
  * Euclidean distance threshold for "same face" — must match client MATCH_THRESHOLD.
  * Below this distance = same person; above = different person.
