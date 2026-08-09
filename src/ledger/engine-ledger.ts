@@ -177,6 +177,35 @@ export class EngineLedger extends EventEmitter {
     }
   }
 
+  /**
+   * Merge rotated fields into the in-memory account record — **local key/PIN/face
+   * rotations only**, never gossip.
+   *
+   * registerAccount() ignores accounts it already knows, so without this the
+   * ledger keeps the ORIGINAL linkedAnchor/pinSalt/pinVerifier forever. Since
+   * publishLocalData() rebuilds every gossiped account record from this map every
+   * 20 s, a rotation was silently reverted — locally and on every peer — within
+   * seconds of being written. Face recovery then compared a *current* key-blob
+   * against a *stale* anchor and failed its integrity check (hit after a PIN
+   * change, 2026-08-09).
+   *
+   * Not a gossip entry point on purpose: the account `_sig` covers only
+   * pub/username/createdAt/faceMapHash, so a peer must never be able to rotate
+   * these fields on us. Verifiable multi-node rotation arrives with the on-chain
+   * account-update block.
+   */
+  updateAccountFields(pub: string, fields: Record<string, unknown>): void {
+    const acc = this.accountsByPub.get(pub) as (LedgerAccount & Record<string, unknown>) | undefined;
+    if (!acc) return;
+    const nextUsername = typeof fields.username === 'string' ? fields.username : undefined;
+    if (nextUsername && nextUsername !== acc.username) {
+      this.usernameToPub.delete(acc.username);
+      this.usernameToPub.set(nextUsername, pub);
+    }
+    Object.assign(acc, fields);
+    this.emit('account:updated', { pub, updates: fields });
+  }
+
   getAccountByUsername(username: string): LedgerAccount | undefined {
     const pub = this.usernameToPub.get(username);
     return pub ? this.accountsByPub.get(pub) : undefined;

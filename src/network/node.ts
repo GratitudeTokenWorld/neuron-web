@@ -846,6 +846,16 @@ export class NeuronNode extends EventEmitter {
 
     for (const [pub, acc] of this.ledger.accounts) {
       const keys = this.localKeys.get(pub);
+      // FOREIGN account: echo the newest record we actually received instead of
+      // rebuilding it from our ledger copy. registerAccount() never updates a
+      // known account, so that copy is frozen at first sight — re-publishing it
+      // would revert the owner's key/PIN rotations for the whole network (the
+      // stale-anchor bug). IDB always holds the latest record we were told about.
+      if (!keys) {
+        const stored = await this.net.loadAccount(pub);
+        if (stored) this.net.saveAccount(pub, stored as Parameters<typeof this.net.saveAccount>[1]);
+        continue;
+      }
       const accData: Record<string, unknown> = {
         username: acc.username, pub: acc.pub, balance: acc.balance, nonce: acc.nonce,
         createdAt: acc.createdAt, faceMapHash: acc.faceMapHash,
@@ -855,7 +865,7 @@ export class NeuronNode extends EventEmitter {
         pinSalt: acc.pinSalt ?? undefined,
         pinVerifier: acc.pinVerifier ?? undefined,
       };
-      this.net.saveAccount(pub, keys ? await this.signAccountData(accData, keys) : accData);
+      this.net.saveAccount(pub, await this.signAccountData(accData, keys));
     }
 
     // Phase 1: re-broadcast engine blocks (hex-encoded). Receivers dedup on hash,

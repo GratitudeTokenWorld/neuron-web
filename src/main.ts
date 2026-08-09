@@ -2211,6 +2211,10 @@ async function syncAccountRecord(
     merged._sig = await signData(payload, acc.keys);
   }
   await node.net.saveAccount(acc.pub, merged as Parameters<typeof node.net.saveAccount>[1]);
+  // Keep the ledger's in-memory copy in step: publishLocalData() rebuilds the
+  // gossiped record from it every 20s and would otherwise revert what we just
+  // wrote, orphaning the rotated key-blob (recovery integrity check would fail).
+  node.ledger.updateAccountFields(acc.pub, changed);
 }
 
 // ──── Update PIN ────
