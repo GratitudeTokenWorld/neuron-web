@@ -195,11 +195,19 @@ const engineHeightIndex = new Map();
 // Set in main() once pubsub exists: (network, shard, aHex, bHex) => void.
 let publishConflict = null;
 
+// Heights whose conflict was already announced — one evidence publish per
+// (network, account, index) fork, not one per sibling variant (a looping
+// client can mint dozens of siblings; the first pair freezes the account
+// everywhere, the rest is noise).
+const conflictAnnounced = new Set();
+
 /** Height-index a stored row; publish conflict evidence if a sibling exists. */
 function indexEngineRow(row) {
   const hkey = `${row.network}:${row.accountId}:${row.index}`;
   const prior = engineHeightIndex.get(hkey);
   if (prior && prior !== row.hash) {
+    if (conflictAnnounced.has(hkey)) return;
+    conflictAnnounced.add(hkey);
     const sibling = engineBlockStore.get(prior);
     console.log(`[Archive] CONFLICT acct=${row.accountId.slice(0, 12)}… idx=${row.index} — publishing evidence`);
     if (sibling && publishConflict) publishConflict(row.network, row.shard, sibling.blockHex, row.blockHex);
@@ -722,10 +730,17 @@ async function main() {
         const q = new URL(req.url, 'http://localhost').searchParams;
         const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
         const pub = q.get('pub');
-        const out = [];
+        const sends = [];
+        // The archive's highest index for the ASKING account. The client must
+        // not claim (append to its own chain) while its local head is behind
+        // this — claiming on a stale head forks the claimant's own chain into
+        // self-signed equivocation evidence (bob's idx-5/6 fork, 2026-08-09:
+        // a wiped-recovery claimed before its own chain finished syncing).
+        let headIndex = -1;
         if (pub) {
           for (const r of engineBlockStore.values()) {
             if (r.network !== network) continue;
+            if (r.accountId === pub && r.index > headIndex) headIndex = r.index;
             let type = r.type;
             let recipient = r.recipient;
             if (type === undefined) {
@@ -738,12 +753,12 @@ async function main() {
               } catch { continue; }
             }
             if ((type === 'send' || type === 'nft-send') && recipient === pub) {
-              out.push({ sender: r.accountId, blockHash: r.hash, shard: r.shard, type });
+              sends.push({ sender: r.accountId, blockHash: r.hash, shard: r.shard, type });
             }
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(JSON.stringify(out));
+        res.end(JSON.stringify({ headIndex, sends }));
 
       } else if (req.method === 'POST' && req.url === '/log-reload') {
         let body = '';
@@ -1205,7 +1220,7 @@ async function main() {
           engineVerify(String(m.signature || ''), `reset:${m.generation}:${m.resetAt}`, m.operatorPub);
         if (!ok) { console.log('[Archive] Ignored reset — not an authorized operator'); return; }
         engineBlockStore.clear(); engineStoreDirty = true;
-        engineHeightIndex.clear();                            // conflict index follows the archive
+        engineHeightIndex.clear(); conflictAnnounced.clear(); // conflict index follows the archive
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names
         accountStore.clear(); accountsDirty = true;           // wipe the directory too

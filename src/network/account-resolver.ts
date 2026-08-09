@@ -130,6 +130,18 @@ export interface PendingSendHint {
   type: 'send' | 'nft-send';
 }
 
+export interface PendingSendsResult {
+  /**
+   * The archives' highest index for the asking account (max across relays; −1
+   * if unknown). SAFETY GATE: a client whose local head is BEHIND this must
+   * finish syncing its own chain before claiming anything — a receive built on
+   * a stale head forks the claimant's own chain, which is indistinguishable
+   * from a deliberate double-spend and freezes the account network-wide.
+   */
+  headIndex: number;
+  sends: PendingSendHint[];
+}
+
 /**
  * G1 follow-up — offline-transfer discovery. Ask the relays' block archives
  * which send/nft-send blocks are addressed to `pub` (GET /pending-sends), so a
@@ -148,25 +160,29 @@ export async function fetchPendingSends(
   network: string,
   fetchFn: typeof fetch = (...args) => fetch(...args),
   timeoutMs = 5_000,
-): Promise<PendingSendHint[]> {
+): Promise<PendingSendsResult> {
   const results = await Promise.allSettled(
     bases.map(async (base) => {
       const res = await fetchFn(`${base}/pending-sends?pub=${encodeURIComponent(pub)}&network=${encodeURIComponent(network)}`, {
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) throw new Error(`pending-sends ${res.status}`);
-      return (await res.json()) as PendingSendHint[];
+      return (await res.json()) as { headIndex?: number; sends?: PendingSendHint[] } | PendingSendHint[];
     }),
   );
   const byHash = new Map<string, PendingSendHint>();
+  let headIndex = -1;
   for (const r of results) {
-    if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue;
-    for (const hint of r.value) {
+    if (r.status !== 'fulfilled' || !r.value) continue;
+    // Tolerate the pre-headIndex relay shape (bare array) during rollout.
+    const body = Array.isArray(r.value) ? { headIndex: -1, sends: r.value } : r.value;
+    headIndex = Math.max(headIndex, Number(body.headIndex ?? -1));
+    for (const hint of body.sends ?? []) {
       if (!hint || typeof hint.sender !== 'string' || typeof hint.blockHash !== 'string') continue;
       byHash.set(hint.blockHash, hint);
     }
   }
-  return [...byHash.values()];
+  return { headIndex, sends: [...byHash.values()] };
 }
 
 /**

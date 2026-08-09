@@ -459,6 +459,10 @@ export class NeuronNode extends EventEmitter {
     // same way payments do (block-lattice send → receive).
     setTimeout(async () => {
       if (this.ledger.isEquivocated(block.accountId)) return; // sender double-spent → don't honor
+      // Safety gate: never claim on a stale own-head (forks our own chain —
+      // see ownChainIsCurrent). The unclaimed entry survives, so the gated
+      // 20 s sweep claims once our chain is current.
+      if (!(await this.ownChainIsCurrent(block.recipient!))) return;
       const result = isNft
         ? await this.ledger.createReceiveNft(block.recipient!, block.hash, signer)
         : await this.ledger.createReceive(block.recipient!, block.hash, signer);
@@ -521,6 +525,13 @@ export class NeuronNode extends EventEmitter {
   private async sweepUnclaimedReceives(): Promise<void> {
     for (const [pub, keys] of this.localKeys) {
       const signer = engineKeysFromAppPrivate(keys.priv); // localKeys holds app keys; the engine needs engine keys
+      // Safety gate: only claim on a current own-head (see ownChainIsCurrent —
+      // a stale-head claim forks our own chain into double-spend evidence).
+      // Checked only when there IS something to claim, so the common empty
+      // sweep costs nothing.
+      const hasWork = this.ledger.getUnclaimedForAccount(pub).length > 0
+        || this.ledger.getUnclaimedNftsForAccount(pub).length > 0;
+      if (hasWork && !(await this.ownChainIsCurrent(pub))) continue;
       // Payments
       for (const { sendBlockHash, fromPub, amount } of this.ledger.getUnclaimedForAccount(pub)) {
         const result = await this.ledger.createReceive(pub, sendBlockHash, signer);
@@ -1158,8 +1169,21 @@ export class NeuronNode extends EventEmitter {
    */
   private async checkPendingInbound(pub: string): Promise<void> {
     try {
-      const hints = await fetchPendingSends(this.relayResolveBases(), pub, this.ledger.network);
-      for (const h of hints) {
+      const { headIndex, sends } = await fetchPendingSends(this.relayResolveBases(), pub, this.ledger.network);
+      // SAFETY GATE — never claim while our own chain is behind the archive's
+      // view of it. A receive built on a stale head forks OUR OWN chain, which
+      // is cryptographically indistinguishable from a deliberate double-spend:
+      // the archive publishes the two siblings as evidence and the account is
+      // frozen network-wide. This is exactly what happened to bob on
+      // 2026-08-09 — a wiped-recovery claimed at +1.5 s, before its own chain
+      // had finished syncing (idx-5 fork, then one new idx-6 sibling per
+      // reload). Resync and let the 60 s backstop claim once we're current.
+      const localHead = this.ledger.getAccountHead(pub)?.index ?? -1;
+      if (headIndex > localHead) {
+        this.engineResyncAccount(pub);
+        return;
+      }
+      for (const h of sends) {
         // Already holding the send block ⇒ claimed (or about to be) — skip.
         if (this.ledger.allBlocks.has(h.blockHash)) continue;
         // G2: payments claim via a compact proof packet — no sender chain held.
@@ -1183,6 +1207,11 @@ export class NeuronNode extends EventEmitter {
    */
   private async claimViaProof(recipientPub: string, senderId: string, sendBlockHash: string): Promise<boolean> {
     try {
+      // Safety gate (see ownChainIsCurrent): claiming on a stale own-head forks
+      // our own chain into double-spend evidence. Report "handled" so the
+      // caller does NOT fall back to the chain pull — the retry comes from the
+      // 60 s backstop after our own chain has caught up.
+      if (!(await this.ownChainIsCurrent(recipientPub))) return true;
       const packet = await fetchHeadProof(this.relayResolveBases(), senderId, sendBlockHash, this.ledger.network);
       if (!packet || packet.sendBlock.hash !== sendBlockHash) return false;
       const reg = this.ledger.registerVerifiedSend(packet, recipientPub);
@@ -1191,6 +1220,29 @@ export class NeuronNode extends EventEmitter {
       await this.autoReceiveEngine(packet.sendBlock);
       return true;
     } catch { return false; }
+  }
+
+  /**
+   * SAFETY GATE for every claim path. True iff our local head for `pub` is at
+   * least as fresh as the archives' view of it. Claiming (appending a receive)
+   * while behind forks OUR OWN chain — two self-signed blocks at one height —
+   * which is exactly the evidence that freezes an account as a double-spender.
+   * That is what broke bob on 2026-08-09: a wiped-recovery claimed at +1.5 s,
+   * before its own chain finished syncing, and every later reload minted
+   * another sibling. When behind: trigger an own-chain resync and refuse.
+   * If NO relay answers (isolated dev network), stay permissive — there is no
+   * archive view to be behind, and blocking claims forever would deadlock.
+   */
+  private async ownChainIsCurrent(pub: string): Promise<boolean> {
+    try {
+      const { headIndex } = await fetchPendingSends(this.relayResolveBases(), pub, this.ledger.network);
+      const localHead = this.ledger.getAccountHead(pub)?.index ?? -1;
+      if (headIndex > localHead) {
+        this.engineResyncAccount(pub);
+        return false;
+      }
+      return true;
+    } catch { return true; }
   }
 
   private async checkRelayLiveness(): Promise<void> {

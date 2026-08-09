@@ -104,27 +104,31 @@ describe('G1 — on-demand account resolution', () => {
     ).toBeNull();
   });
 
-  it('pending-send discovery: unions relays, dedups by hash, survives dead relays', async () => {
+  it('pending-send discovery: unions relays, dedups by hash, reports the freshest head', async () => {
     const hintA: PendingSendHint = { sender: '02' + 'a'.repeat(64), blockHash: 'h1', shard: 7, type: 'send' };
     const hintB: PendingSendHint = { sender: '02' + 'b'.repeat(64), blockHash: 'h2', shard: 9, type: 'nft-send' };
-    const hints = await fetchPendingSends(
+    const result = await fetchPendingSends(
       ['http://r1:9092', 'http://r2:9092', 'http://dead:9092'],
       '02' + 'c'.repeat(64),
       'testnet',
       fakeFetch({
-        'http://r1:9092': () => ({ status: 200, body: [hintA, hintB] }),
+        'http://r1:9092': () => ({ status: 200, body: { headIndex: 4, sends: [hintA, hintB] } }),
+        // r2: pre-headIndex relay shape (bare array) still accepted mid-rollout
         'http://r2:9092': () => ({ status: 200, body: [hintA, { garbage: true }] }), // overlap + junk row
         // http://dead:9092 unreachable
       }),
     );
-    expect(hints.map((h) => h.blockHash).sort()).toEqual(['h1', 'h2']);
+    expect(result.sends.map((h) => h.blockHash).sort()).toEqual(['h1', 'h2']);
+    // The freshest archive view of OUR chain wins — the claim safety gate.
+    expect(result.headIndex).toBe(4);
 
-    // All relays down / empty ⇒ empty list, never a throw.
-    expect(await fetchPendingSends(['http://dead:9092'], 'x', 'testnet', fakeFetch({}))).toEqual([]);
+    // All relays down / empty ⇒ empty result, never a throw.
+    expect(await fetchPendingSends(['http://dead:9092'], 'x', 'testnet', fakeFetch({})))
+      .toEqual({ headIndex: -1, sends: [] });
     expect(
       await fetchPendingSends(['http://r1:9092'], 'x', 'testnet',
-        fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: [] }) })),
-    ).toEqual([]);
+        fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: { headIndex: -1, sends: [] } }) })),
+    ).toEqual({ headIndex: -1, sends: [] });
   });
 
   it('block lookup: verifies the served block and rejects forgeries', async () => {

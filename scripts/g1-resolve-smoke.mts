@@ -116,14 +116,22 @@ console.log(`published ${chain.blocks.length}-block sender chain (send @2 → of
 await sleep(3000); // relay ingest + federation
 
 for (const r of RELAYS) {
-  const hints = await fetchPendingSends([r.http], recipient, 'testnet');
+  const { headIndex, sends } = await fetchPendingSends([r.http], recipient, 'testnet');
   check(
-    hints.length === 1 && hints[0]!.sender === chain.blocks[0]!.accountId && hints[0]!.blockHash === chain.blocks[2]!.hash,
+    sends.length === 1 && sends[0]!.sender === chain.blocks[0]!.accountId && sends[0]!.blockHash === chain.blocks[2]!.hash,
     `${r.name} reports exactly the pending send addressed to the offline recipient`,
   );
+  // The recipient has no chain, so the claim safety gate must see headIndex −1
+  // for them (nothing to be behind of).
+  check(headIndex === -1, `${r.name} reports headIndex −1 for a chainless recipient`);
 }
 const none = await fetchPendingSends(RELAYS.map((r) => r.http), generateKeyPair().pub, 'testnet');
-check(none.length === 0, 'an account with no inbound sends gets an empty pending list');
+check(none.sends.length === 0, 'an account with no inbound sends gets an empty pending list');
+// The claim safety gate's other half: the archive's head index for the SENDER
+// must match its real chain head (a recovering sender must sync to here
+// before it may claim anything).
+const senderView = await fetchPendingSends(RELAYS.map((r) => r.http), chain.blocks[0]!.accountId, 'testnet');
+check(senderView.headIndex === chain.blocks.length - 1, 'archive reports the sender chain head index');
 
 // ── G2: counterparty proof packet (/head-proof) ─────────────────────────────
 // The recipient claims from a compact packet the archive builds — verified
