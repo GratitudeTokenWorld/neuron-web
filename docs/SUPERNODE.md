@@ -284,8 +284,16 @@ nuking the shared network while letting a founder reset it.
   (with an empty operators file) become the operators. Back up `.relay-operators.json`.
 - **Authorized reset:** an operator clicks Reset Testnet from a browser whose
   *first* local account is that operator account; the client signs the reset and
-  the relay wipes (`[Archive] WIPED by operator …`). The operators list itself is
-  kept across the wipe (so founders stay founders; they recover via their keys).
+  the relay wipes (`[Archive] WIPED by operator …`). The operators list is
+  **cleared too**, so the next 3 accounts attested after the wipe become the new
+  operators. (It used to be kept — but a wipe destroys every account chain *and*
+  every key-blob, so the old operator accounts are unrecoverable by anyone;
+  keeping them made the first reset a one-way door with no live account able to
+  authorize the next one.)
+- **A non-operator reset clears only that browser** — the relays and other
+  clients ignore it, and the device keeps the network's current generation so it
+  simply re-syncs. (Before 2026-08-09 it also bumped its own generation, which
+  silently made the device deaf to all inbound gossip; see `clearAll`.)
 - **Bootstrap / manual wipe** (no operators yet, or you want to force one):
   ```bash
   pm2 stop neuron-relay

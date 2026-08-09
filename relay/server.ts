@@ -945,7 +945,14 @@ async function main() {
         if (!ok) { console.log('[Archive] Ignored reset — not an authorized operator'); return; }
         engineBlockStore.clear(); engineStoreDirty = true;
         keyBlobStore.clear(); keyBlobDirty = true;
-        usernameRegistry.clear(); usernameDirty = true;       // free the names; operators list is kept
+        usernameRegistry.clear(); usernameDirty = true;       // free the names
+        // Re-elect operators: the wipe destroys every account chain AND every
+        // key-blob, so the old operator accountIds can never be recovered by
+        // anyone — keeping them as the sole reset authority makes the FIRST
+        // network reset a one-way door (no live account can authorize the next
+        // one; only SSH can). The next OPERATOR_COUNT accounts attested after a
+        // wipe become the operators, exactly as on a fresh relay.
+        operators = []; atomicWrite(OPERATORS_FILE, JSON.stringify(operators));
         currentGeneration = Number(m.generation) || currentGeneration + 1;
         atomicWrite(GENERATION_FILE, JSON.stringify(currentGeneration));
         console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}… → generation ${currentGeneration}`);
