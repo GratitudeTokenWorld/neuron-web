@@ -717,13 +717,15 @@
     @keyframes cg-sweep { 0%, 70%, 100% { opacity: 0; } 25% { opacity: 1; } }
 
     /* Blink: the lids close and reopen on a human-ish cadence. */
+    /* Closed state keeps a visible lid line — scaling to 0.08 collapsed the shape
+       to nothing, which reads as a rendering glitch rather than a closed eye. */
     .cg-eye { transform-box: fill-box; transform-origin: center; animation: cg-blink 2.2s ease-in-out infinite; }
-    @keyframes cg-blink { 0%, 82%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.08); } }
+    @keyframes cg-blink { 0%, 82%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.22); } }
 
     /* Close eyes: same eye shapes as blink, but a slow close-and-HOLD, which is
        what is actually being asked for (a held state, not a 100ms flick). */
     .capture-guide[data-guide="eyes"] .cg-eye { animation: cg-eyes-hold 2.8s ease-in-out infinite; }
-    @keyframes cg-eyes-hold { 0%, 12% { transform: scaleY(1); } 26%, 72% { transform: scaleY(0.08); } 88%, 100% { transform: scaleY(1); } }
+    @keyframes cg-eyes-hold { 0%, 12% { transform: scaleY(1); } 26%, 72% { transform: scaleY(0.22); } 88%, 100% { transform: scaleY(1); } }
 
     /* Raise eyebrows: the brow arcs lift away from the eyes and settle back. */
     .cg-brow-arc { animation: cg-brow 2s ease-in-out infinite; }

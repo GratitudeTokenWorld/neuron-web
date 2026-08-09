@@ -72,16 +72,19 @@ export type ChallengeAction = 'blink' | 'close-eyes' | 'smile' | 'mouth-open' | 
  * The expressions demanded per enrollment, drawn in a random order alongside a
  * head turn.
  *
- * `blink` is NOT here, and `close-eyes` is why it isn't needed. Measured on real
- * hardware, a blink barely moves the eye-aspect-ratio in this landmark model:
- * open ≈ 0.32, deepest blink ≈ 0.29, with idle jitter spanning 0.29–0.35 — the
- * signal sits inside the noise, because a ~100ms closure mostly falls BETWEEN
- * detection frames. Holding the eyes shut turns that transient into a state:
- * sampled many times over, so depth *and* duration can both be required. Same
- * anti-photo property (the eyes must be seen open first), far better signal.
+ * NO EYE-BASED ACTION IS POSSIBLE with this landmark model, and both were tried
+ * with real measurements:
+ *   blink       open EAR 0.32, deepest blink 0.29, idle jitter 0.29-0.35
+ *   close-eyes  eyes shut and HELD: EAR 0.272-0.311 vs an open baseline of 0.314
+ * Holding the closure removed the sampling problem and the numbers still did not
+ * move — faceLandmark68Net places eyelid points in an open-eye configuration
+ * whatever the eye is doing, so EAR is not measuring eyelids at all. No
+ * threshold can separate closed from open; any value is either unpassable or
+ * free. Eye actions need a different model (an eye-state classifier), not a
+ * different threshold. The detectors are kept but are not gating enrollment.
  */
 export const CHALLENGE_EXPRESSIONS: readonly ChallengeAction[] =
-  ['smile', 'mouth-open', 'raise-brows', 'close-eyes'];
+  ['smile', 'mouth-open', 'raise-brows'];
 
 /**
  * How many expressions are demanded per enrollment (plus the head turn).
@@ -572,13 +575,13 @@ export async function detectChallenge(
   // Max allowed movement of the face across the frame while turning, as a
   // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
   // slide big enough to fake that yaw moves it 15-20%.
-  const CENTRE_DRIFT_MAX = 0.07;
+  const CENTRE_DRIFT_MAX = 0.045;
   // Yaw that a pure sideways move explains on its own: apparent rotation grows
   // ~0.35 of jaw-ratio per unit of frame-width drift (60-degree lens, arm's
   // length). Demanding the observed yaw be several times that is what makes a
   // slide fail even when it drifts less than the cap above.
   const TRANSLATION_YAW_GAIN = 0.35;
-  const ROTATION_MARGIN = 2.5;
+  const ROTATION_MARGIN = 3.0;
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
   const BROW_DELTA = 0.028;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
