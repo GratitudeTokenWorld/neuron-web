@@ -31,7 +31,7 @@ function fakeFetch(routes: Record<string, () => { status: number; body: unknown 
   return (async (input: RequestInfo | URL) => {
     const url = String(input);
     for (const [prefix, handler] of Object.entries(routes)) {
-      if (url.startsWith(`${prefix}/resolve?`) || url.startsWith(`${prefix}/pending-sends?`)) {
+      if (url.startsWith(`${prefix}/resolve?`) || url.startsWith(`${prefix}/pending-sends?`) || url.startsWith(`${prefix}/block?`)) {
         const { status, body } = handler();
         return new Response(JSON.stringify(body), { status });
       }
@@ -125,6 +125,32 @@ describe('G1 — on-demand account resolution', () => {
       await fetchPendingSends(['http://r1:9092'], 'x', 'testnet',
         fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: [] }) })),
     ).toEqual([]);
+  });
+
+  it('block lookup: verifies the served block and rejects forgeries', async () => {
+    const { buildSenderChain } = await import('../engine/sim/counterparty.js');
+    const { encodeBlock } = await import('../engine/core/block.js');
+    const { bytesToHex } = await import('../engine/core/hash.js');
+    const { fetchBlockByHash } = await import('./account-resolver.js');
+    const chain = buildSenderChain(4, 2, 'cafe01');
+    const target = chain.blocks[2]!;
+    const hex = bytesToHex(encodeBlock(target));
+
+    const ok = await fetchBlockByHash(['http://r1:9092'], target.hash, 'testnet',
+      fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: { blockHex: hex } }) }));
+    expect(ok?.hash).toBe(target.hash);
+    expect(ok?.recipient).toBe('cafe01');
+
+    // Wrong block served for the asked hash → rejected.
+    const other = bytesToHex(encodeBlock(chain.blocks[1]!));
+    expect(await fetchBlockByHash(['http://r1:9092'], target.hash, 'testnet',
+      fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: { blockHex: other } }) }))).toBeNull();
+    // Tampered payload → content hash breaks → rejected.
+    const tampered = bytesToHex(encodeBlock({ ...target, amount: 999n }));
+    expect(await fetchBlockByHash(['http://r1:9092'], target.hash, 'testnet',
+      fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: { blockHex: tampered } }) }))).toBeNull();
+    // 404 / dead relay → null.
+    expect(await fetchBlockByHash(['http://dead:9092'], target.hash, 'testnet', fakeFetch({}))).toBeNull();
   });
 
   it('prefers the freshest record when relays disagree (owner _version wins)', async () => {

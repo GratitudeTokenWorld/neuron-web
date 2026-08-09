@@ -1,7 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash } from './account-resolver';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -1135,6 +1135,18 @@ export class NeuronNode extends EventEmitter {
     await this.net.cacheAccount(rec as unknown as Record<string, unknown>);
     this.emit('account:synced', rec);
     return String(rec.pub);
+  }
+
+  /**
+   * Explorer support: fetch one block by hash from the relays' archive when the
+   * local interest-scoped view doesn't hold it. Verified (content hash +
+   * signature) before being returned; display-only — never applied to the
+   * ledger (it has no chain context here).
+   */
+  async fetchNetworkBlock(hash: string): Promise<EngineBlock | null> {
+    try {
+      return await fetchBlockByHash(this.relayResolveBases(), hash, this.ledger.network);
+    } catch { return null; }
   }
 
   /**

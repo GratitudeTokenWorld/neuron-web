@@ -1,4 +1,6 @@
 import { verify as engineVerify } from '../engine/core/keys';
+import { decodeBlock, verifyBlock, type Block } from '../engine/core/block';
+import { hexToBytes } from '../engine/core/hash';
 
 /**
  * G1 fix — on-demand account/username resolution (client side).
@@ -164,4 +166,36 @@ export async function fetchPendingSends(
     }
   }
   return [...byHash.values()];
+}
+
+/**
+ * Explorer block lookup by hash from the relays' archive (GET /block) — for
+ * blocks the local interest-scoped view does not hold. The returned block is
+ * verified here (content hash + account signature), so a relay can serve it
+ * but cannot forge it; a hash mismatch with what was asked for is rejected too.
+ */
+export async function fetchBlockByHash(
+  bases: readonly string[],
+  hash: string,
+  network: string,
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<Block | null> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(`${base}/block?hash=${encodeURIComponent(hash)}&network=${encodeURIComponent(network)}`, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`block ${res.status}`);
+      return (await res.json()) as { blockHex?: string };
+    }),
+  );
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !r.value?.blockHex) continue;
+    try {
+      const block = decodeBlock(hexToBytes(r.value.blockHex));
+      if (block.hash === hash && verifyBlock(block)) return block;
+    } catch { /* malformed — try the next relay */ }
+  }
+  return null;
 }

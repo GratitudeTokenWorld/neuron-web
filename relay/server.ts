@@ -634,6 +634,19 @@ async function main() {
           res.end(JSON.stringify({ error: 'not found' }));
         }
 
+      } else if (req.url?.startsWith('/block?')) {
+        // Explorer block lookup by hash from the archive. Post-G1/G2 a node's
+        // local view is interest-scoped, so a searched TX is often not held
+        // locally — the archive tier answers instead. The block is
+        // self-certifying (account-signed, content-hashed): the client
+        // re-verifies it, so this endpoint is untrusted display data.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const row = engineBlockStore.get(String(q.get('hash') || ''));
+        const found = row && row.network === network;
+        res.writeHead(found ? 200 : 404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(found ? { blockHex: row.blockHex } : { error: 'not found' }));
+
       } else if (req.url?.startsWith('/pending-sends?')) {
         // G1 follow-up — offline-transfer discovery. A recipient that was
         // offline (or fully wiped + recovered) asks the archive which send /

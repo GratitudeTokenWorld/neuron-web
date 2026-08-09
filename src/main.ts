@@ -2914,9 +2914,32 @@ $('#btnExplorerSearch').addEventListener('click', async () => {
 
   if (node.ledger.contracts.has(query)) { showContractDetail(query); return; }
 
-  // G1: not known locally — try on-demand resolution from the relay directory
-  // (username or accountId). The record is signature-verified before use.
+  // Not known locally — ask the network. The local view is interest-scoped
+  // (G1/G2), so misses here are normal, not exceptional.
   detail.innerHTML = '<div class="card" style="color:var(--text-muted);text-align:center;">Searching the network…</div>';
+
+  // A 64-hex query is a block hash → the relays' archive holds every block.
+  // The result is signature+hash verified client-side; display-only.
+  if (/^[0-9a-f]{64}$/.test(query)) {
+    const nb = await node.fetchNetworkBlock(query);
+    if (nb) {
+      const eb = nb as unknown as AnyBlock;
+      detail.innerHTML = `<div class="card"><div class="card-title">Block Detail <span class="badge badge-verify">network archive</span></div><div class="stats-grid">
+        <div class="stat-item"><div class="stat-label">Hash</div><div class="stat-value small">${cpBtn(String(nb.hash))}${nb.hash}</div></div>
+        <div class="stat-item"><div class="stat-label">Type</div><div class="stat-value small">${nb.type}</div></div>
+        <div class="stat-item"><div class="stat-label">Account</div><div class="stat-value small">${cpBtn(blockAccount(eb))}${resolveName(blockAccount(eb))}</div></div>
+        <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${formatUNIT(Number(nb.balance))} UNIT</div></div>
+        <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small">archived</div></div>
+        <div class="stat-item"><div class="stat-label">Index</div><div class="stat-value">${nb.index}</div></div>
+        <div class="stat-item"><div class="stat-label">Shard</div><div class="stat-value">${nb.shard}</div></div>
+        <div class="stat-item"><div class="stat-label">Time</div><div class="stat-value small">${fmtTime(nb.timestamp)}</div></div>
+      </div></div>`;
+      return;
+    }
+  }
+
+  // G1: otherwise resolve as a username/accountId from the relay directory.
+  // The record is signature-verified before use.
   const resolved = await node.resolveAccount(query);
   if (resolved) { showAccountDetail(resolved); return; }
 
