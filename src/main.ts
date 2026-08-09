@@ -5,7 +5,7 @@ import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
@@ -858,7 +858,7 @@ function setCameraStatus(html: string) {
  * animation over the feed. Single source of truth, so the three surfaces can
  * never disagree (and the same sentence is never printed twice).
  *
- * Just the instruction — no spinner, no "Step 1/3": while performing an action
+ * Just the instruction — no spinner, no step counter: while performing an action
  * the user needs one imperative, and the bar + guide already show where they
  * are. Labels stay sentence-case in source (translatable); CSS uppercases them.
  */
@@ -1941,19 +1941,10 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
 
-    // Step 1: Liveness
-    setCameraStatus('<span class="spinner"></span> Step 1/3: Slowly turn your head left and right');
-    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
-    if (!isLive) {
-      addLog('FaceID: Liveness FAILED - not enough movement detected', 'error');
-      toast('Liveness failed - try moving your head more', 'error');
-      statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
-      hideCameraModal(); restoreCreateBtn(); return;
-    }
 
     // Step 2: Pre-fetch relay challenges BEFORE face capture, then show the challenge
     // instruction during enrollment so the user performs the action on camera.
-    setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
+    setCameraStatus('<span class="spinner"></span> Contacting relay nodes...');
     const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
 
     // Challenges + capture under one presence guard (see challengeAndCapture).
@@ -2196,16 +2187,8 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // Recovery gets the SAME anti-spoofing as enrollment. It is the flow that
     // hands over the keys, and the key-blob is public by design (gossiped for
     // peer-independent recovery), so the attacker needs only a username, the PIN
-    // and a photo. Without liveness + challenges + continuity the face factor
-    // collapses in exactly the case it exists for: a leaked/shoulder-surfed PIN.
-    const isLiveR = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
-    if (!isLiveR) {
-      hideCameraModal();
-      toast('Liveness failed - try moving your head more', 'error');
-      statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
-      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
-    }
-
+    // and a photo — without the challenges the face factor collapses in exactly
+    // the case it exists for: a leaked/shoulder-surfed PIN.
     // Same multi-sample enrollment as account creation so the quantized
     // descriptor matches exactly (single-frame capture can differ enough to break
     // the derived AES key).
@@ -2581,12 +2564,6 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     await loadModels();
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
-    const isLive = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
-    if (!isLive) {
-      hideCameraModal();
-      statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
-      return;
-    }
     // Full challenge + continuity: this flow REBINDS the account's biometric, so
     // a swapped face here silently re-points the identity at someone else.
     const captured = await challengeAndCapture(video);
