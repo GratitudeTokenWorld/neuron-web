@@ -1771,7 +1771,7 @@ function getCount() { return state.counter; }"></textarea>
             <a class="help-nav-sub" href="#help-contracts-sandbox">Sandbox Environment</a>
             <a class="help-nav-sub" href="#help-contracts-state">State &amp; Variables</a>
             <a class="help-nav-sub" href="#help-contracts-token">Token Example</a>
-            <a class="help-nav-sub" href="#help-contracts-nft">NFT Example</a>
+            <a class="help-nav-sub" href="#help-contracts-nft">NFTs (native)</a>
             <a class="help-nav-link" href="#help-api">Content API</a>
             <a class="help-nav-sub" href="#help-api-store">Storing Content</a>
             <a class="help-nav-sub" href="#help-api-retrieve">Retrieving Content</a>
@@ -2247,69 +2247,18 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
             </div>
 
             <div id="help-contracts-nft">
-              <h3>NFT Contract - Full Example</h3>
-              <p>A non-fungible token collection where each token carries a <strong>content CID</strong> pointing to media stored on NeuronChain's content layer. Upload media via the Storage tab to get a CID, then pass it to <code>mint</code>.</p>
-<pre class="help-pre"><span class="hp-cmt">// ── STATE SHAPE ────────────────────────────────────────────────</span>
-<span class="hp-cmt">// state.initialized  boolean</span>
-<span class="hp-cmt">// state.owner        string  (collection creator)</span>
-<span class="hp-cmt">// state.name, state.symbol  string</span>
-<span class="hp-cmt">// state.nextId       number  (auto-incrementing)</span>
-<span class="hp-cmt">// state.tokens       { [id]: { owner, metadata, cid, mintedAt } }</span>
-
-<span class="hp-cmt">// Step 1 - call once: init("My Art", "MART")</span>
-<span class="hp-kw">function</span> <span class="hp-fn">init</span>(name, symbol) {
-  <span class="hp-kw">if</span> (state.initialized) <span class="hp-kw">return</span> { error: <span class="hp-str">'already initialized'</span> };
-  state.name = name; state.symbol = symbol;
-  state.owner = caller; state.nextId = 1; state.tokens = {};
-  state.initialized = <span class="hp-kw">true</span>;
-  <span class="hp-kw">return</span> { name, symbol };
-}
-
-<span class="hp-cmt">// Mint a token - cid = SHA-256 CID from the Storage tab</span>
-<span class="hp-cmt">// Call: mint("&lt;recipient&gt;", "Artwork #1", "bafkrei...")</span>
-<span class="hp-kw">function</span> <span class="hp-fn">mint</span>(to, metadata, cid) {
-  <span class="hp-kw">if</span> (caller !== state.owner) <span class="hp-kw">return</span> { error: <span class="hp-str">'not authorized'</span> };
-  <span class="hp-kw">const</span> id = state.nextId++;
-  state.tokens[id] = { owner: to, metadata, cid, mintedAt: Date.now() };
-  <span class="hp-kw">return</span> { tokenId: id, owner: to, cid };
-}
-
-<span class="hp-cmt">// Transfer token ownership</span>
-<span class="hp-cmt">// Call: transfer(1, "&lt;new-owner&gt;")</span>
-<span class="hp-kw">function</span> <span class="hp-fn">transfer</span>(tokenId, to) {
-  <span class="hp-kw">const</span> token = state.tokens[tokenId];
-  <span class="hp-kw">if</span> (!token)               <span class="hp-kw">return</span> { error: <span class="hp-str">'token not found'</span> };
-  <span class="hp-kw">if</span> (token.owner !== caller) <span class="hp-kw">return</span> { error: <span class="hp-str">'not owner'</span> };
-  token.owner = to;
-  <span class="hp-kw">return</span> { success: <span class="hp-kw">true</span>, tokenId, newOwner: to };
-}
-
-<span class="hp-cmt">// Queries</span>
-<span class="hp-kw">function</span> <span class="hp-fn">ownerOf</span>(tokenId) { <span class="hp-kw">return</span> state.tokens[tokenId]?.owner ?? <span class="hp-kw">null</span>; }
-<span class="hp-kw">function</span> <span class="hp-fn">tokenInfo</span>(tokenId) { <span class="hp-kw">return</span> state.tokens[tokenId] ?? <span class="hp-kw">null</span>; }
-
-<span class="hp-cmt">// Returns all tokens owned by the caller</span>
-<span class="hp-kw">function</span> <span class="hp-fn">myTokens</span>() {
-  <span class="hp-kw">return</span> Object.entries(state.tokens)
-    .filter(([, t]) =&gt; t.owner === caller)
-    .map(([id, t]) =&gt; ({ tokenId: Number(id), ...t }));
-}
-
-<span class="hp-kw">function</span> <span class="hp-fn">allTokens</span>() {
-  <span class="hp-kw">return</span> Object.entries(state.tokens)
-    .map(([id, t]) =&gt; ({ tokenId: Number(id), ...t }));
-}</pre>
-              <h4>Workflow with Content API</h4>
+              <h3>NFTs - native, no contract needed</h3>
+              <div class="help-callout warn">This section used to document an NFT <em>contract</em> (deploy, then call <code>init</code>/<code>mint</code>). That workflow does not exist: there is no contract VM, and <code>Deploy</code>/<code>Call</code> are deferred stubs that return &quot;not available&quot;. NFTs are a <strong>native block type</strong> instead - the same block-lattice mechanics as a payment, with no code to write or audit.</div>
+              <p>An NFT is an ownership key: a token id, a <strong>content reference</strong> (typically a CID from the Storage tab, but any string works), and free-form metadata. Ownership lives on-chain; the content bytes live in the content layer and are served by any peer holding them.</p>
+              <h4>Workflow</h4>
               <ol>
-                <li><strong>Upload media</strong> - Storage tab &#8594; upload image &#8594; get CID (e.g. <code>bafkreiabc&#8230;</code>)</li>
-                <li><strong>Distribute</strong> - Storage tab &#8594; Distribute &#8594; sends the CID to up to 10 providers</li>
-                <li><strong>Deploy contract</strong> - Contracts tab &#8594; paste code &#8594; Deploy</li>
-                <li><strong>Init collection</strong> - Call &#8594; method: <code>init</code> &#8594; args: <code>"My Art", "MART"</code></li>
-                <li><strong>Mint NFT</strong> - Call &#8594; method: <code>mint</code> &#8594; args: <code>"&lt;owner-address&gt;", "Artwork #1", "bafkreiabc&#8230;"</code></li>
-                <li><strong>Transfer NFT</strong> - Call (as token owner) &#8594; method: <code>transfer</code> &#8594; args: <code>1, "&lt;new-owner&gt;"</code></li>
-                <li><strong>View collection</strong> - Call &#8594; method: <code>allTokens</code> &#8594; returns all tokens with their CIDs</li>
+                <li><strong>Upload media</strong> (optional) - Storage tab &#8594; upload &#8594; get a CID (e.g. <code>bafkreiabc&#8230;</code>). Skip this if you just want to point at a URL or a label.</li>
+                <li><strong>Mint</strong> - Transfer tab &#8594; <em>My NFTs</em> &#8594; <code>+ Mint NFT</code> &#8594; name, then the content reference.</li>
+                <li><strong>Transfer</strong> - the token&#39;s <code>Transfer</code> button &#8594; recipient username or public key.</li>
+                <li><strong>Receive</strong> - nothing to do. A transfer is send + receive, and the recipient&#39;s node claims automatically. If it arrived while that browser was closed, the token appears as <em>Incoming - unclaimed</em> with a <code>Claim</code> button.</li>
+                <li><strong>Burn</strong> - the token&#39;s <code>Burn</code> button. Permanent.</li>
               </ol>
-              <div class="help-callout ok">The <code>cid</code> field in each token is a permanent content address - any peer holding the media can serve it via smoke Http. Token ownership and media ownership are separate: the contract records who owns the NFT; the CID points to the content bytes.</div>
+              <div class="help-callout ok">Token ownership and media ownership are separate: the chain records who owns the token; the content reference points at the bytes. Burning a token does not delete the content, and holding the content does not grant ownership.</div>
             </div>
           </div>
 

@@ -190,13 +190,13 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 
 | # | Test | Result | Notes |
 |---|------|--------|-------|
-| T1 | 2-attester account creation | ☐ | |
-| T2 | Cross-relay account sync | ☐ | |
-| T3 | Transfers + offline claim | ☐ | |
-| T4 | NFT mint/transfer/burn | ☐ | |
-| T5 | Recovery after wipe (1 relay down) | ☐ | |
-| T6 | Username uniqueness + face limit | ☐ | |
-| T7 | Operator-gated reset | ☐ | |
+| T1 | 2-attester account creation | ☑ | |
+| T2 | Cross-relay account sync | ☑ | |
+| T3 | Transfers + offline claim | ☑ | |
+| T4 | NFT mint/transfer/burn | ☑ | Reload loss fixed in `482ac05` — replay order across accounts |
+| T5 | Recovery after wipe (1 relay down) | ☑ | |
+| T6 | Username uniqueness + face limit | ☑ | |
+| T7 | Operator-gated reset | ☐ | Skipped by decision — reset is a dev-mode affordance |
 
 File failures with: browser console log, `pm2 logs` from both relays, and which
 browser/profile was which account.
