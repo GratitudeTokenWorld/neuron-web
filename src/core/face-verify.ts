@@ -321,10 +321,15 @@ export async function detectChallenge(
   // RELAXED face, so the baseline can't accidentally capture the action itself.
   const CALIBRATION_MS = 800;
   const calibrationEnds = Date.now() + CALIBRATION_MS;
-  // Blink: a real closure drops EAR far below the user's own open-eye value.
-  // Relative (0.62×) rather than absolute 0.28 — eye shape, glasses and camera
-  // angle move the absolute number more than a blink does.
-  const BLINK_DROP = 0.62;
+  // Blink: EAR must fall to this fraction of the user's own open-eye value.
+  //
+  // 0.62 was far too deep and broke blink entirely: face-api's 68-point model is
+  // trained mostly on open eyes, so a real closure only pulls EAR down to
+  // ~0.70-0.80 of its open value — it never reaches 0.62, and every blink was
+  // rejected. (The old absolute 0.28 against a ~0.30 open EAR was effectively a
+  // 7% drop, which is why it fired at all.) 0.80 = a 20% drop: deeper than
+  // landmark jitter, shallower than a genuine blink.
+  const BLINK_DROP = 0.80;
   // A single sub-threshold frame counts. A blink's closed phase is ~100ms and
   // detection costs ~60-150ms per frame, so demanding two consecutive frames
   // (the old rule) missed most ordinary blinks. The open→closed transition
@@ -333,9 +338,10 @@ export async function detectChallenge(
   const BLINK_FRAMES = 1;
   // Smile: corners must rise AND the mouth widen, vs. this user's neutral.
   // Requiring both rejects "mouth open" (widens little, corners don't rise) and
-  // a jaw drop. Values are fractions of inter-eye distance.
-  const SMILE_LIFT_DELTA = 0.012;
-  const SMILE_WIDTH_DELTA = 0.030;
+  // a jaw drop. Values are fractions of inter-eye distance, tightened 15% after
+  // a real run passed too easily.
+  const SMILE_LIFT_DELTA = 0.0138;
+  const SMILE_WIDTH_DELTA = 0.0345;
   let earBelowCount = 0;
   let sawEyesOpen = false;
   let baselineNoseX: number | null = null;
@@ -345,6 +351,8 @@ export async function detectChallenge(
   const liftSamples: number[] = [];
   const widthSamples: number[] = [];
   let earOpen = 0, liftNeutral = 0, widthNeutral = 0;
+  /** Deepest closure seen — reported on timeout so a near-miss is tunable. */
+  let earMin = Infinity;
   const mean = (a: number[]) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
 
   const actionLabel =
@@ -409,7 +417,14 @@ export async function detectChallenge(
       await sleep(40);
       continue;
     }
-    if (!earOpen && earOpenSamples.length) earOpen = mean(earOpenSamples);
+    // 70th percentile, not the mean: if the user happens to blink during the
+    // 800ms calibration those frames drag a mean down, lowering the trigger
+    // threshold and making the real blink undetectable. A high percentile
+    // represents a solidly-open eye.
+    if (!earOpen && earOpenSamples.length) {
+      const sorted = [...earOpenSamples].sort((a, b) => a - b);
+      earOpen = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.7))];
+    }
     if (!widthNeutral && widthSamples.length) {
       liftNeutral = mean(liftSamples);
       widthNeutral = mean(widthSamples);
@@ -420,8 +435,9 @@ export async function detectChallenge(
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
       const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
       const ear = (rightEAR + leftEAR) / 2;
-      const closedBelow = (earOpen || 0.28) * BLINK_DROP;
-      debugMetrics(`blink ear=${ear.toFixed(3)} threshold=${closedBelow.toFixed(3)} open=${earOpen.toFixed(3)}`);
+      const closedBelow = (earOpen || 0.30) * BLINK_DROP;
+      earMin = Math.min(earMin, ear);
+      debugMetrics(`blink ear=${ear.toFixed(3)} min=${earMin.toFixed(3)} threshold=${closedBelow.toFixed(3)} open=${earOpen.toFixed(3)}`);
       if (ear < closedBelow) {
         // Only count a closure as a blink once we've confirmed the eyes were open —
         // this requires a real open→closed transition, defeating a static photo.
@@ -500,6 +516,11 @@ export async function detectChallenge(
     await sleep(type === 'blink' ? 20 : 60);
   }
 
+  // Always log the near-miss on timeout: without the deepest value reached there
+  // is no way to tell "the user did nothing" from "the threshold is too tight".
+  if (type === 'blink') {
+    debugMetrics(`blink TIMEOUT deepest=${earMin === Infinity ? 'n/a' : earMin.toFixed(3)} needed<${((earOpen || 0.30) * BLINK_DROP).toFixed(3)} open=${earOpen.toFixed(3)}`);
+  }
   onStatus?.({ label: 'Timed out — try again', guide, state: 'fail', left: 0, right: 0 });
   return false;
 }

@@ -693,12 +693,13 @@
 
     .cg-oval {
       fill: none;
-      stroke: rgba(255,255,255,0.35);
+      stroke: var(--success);
+      stroke-opacity: 0.5;
       stroke-width: 1.2;
       stroke-dasharray: 5 7;
       animation: cg-drift 14s linear infinite;
     }
-    .capture-guide[data-guide="search"] .cg-oval { stroke: rgba(255,255,255,0.6); animation: cg-pulse 1.4s ease-in-out infinite; }
+    .capture-guide[data-guide="search"] .cg-oval { stroke-opacity: 0.9; animation: cg-pulse 1.4s ease-in-out infinite; }
     @keyframes cg-drift { to { stroke-dashoffset: -120; } }
     @keyframes cg-pulse { 50% { opacity: 0.35; } }
 
