@@ -709,7 +709,7 @@ export async function detectChallenge(
     type === 'mouth-open' ? 'Open your mouth' :
     type === 'raise-brows' ? 'Raise your eyebrows' :
     type === 'close-eyes' ? 'Close your eyes' :
-    type === 'move-depth' ? (neutral && neutral.frac > 0.25 ? 'Move further away' : 'Move closer') :
+    type === 'move-depth' ? (neutral && neutral.frac > 0.25 ? 'Move away' : 'Move closer') :
     `Turn head ${turnSide}`;
 
   onStatus?.({ label: prompt, guide, dir: guide === 'turn' ? turnSide : undefined, left: 0, right: 0 });
@@ -944,7 +944,7 @@ export async function detectChallenge(
       }
       const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
       onStatus?.({
-        label: wantCloser ? 'Move closer' : 'Move further away',
+        label: wantCloser ? 'Move closer' : 'Move away',
         guide: 'depth', left: pct, right: pct,
       });
 
