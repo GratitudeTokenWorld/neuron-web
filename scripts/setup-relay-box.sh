@@ -60,7 +60,7 @@ sudo -u "$RELAY_USER" -H grep -q '.relay-env' "$RELAY_HOME/.profile" || \
   sudo -u "$RELAY_USER" -H bash -c "echo '[ -f ~/.relay-env ] && . ~/.relay-env' >> $RELAY_HOME/.profile"
 
 # start under pm2 + survive reboot (2 GB box → 1.5G leak backstop)
-sudo -u "$RELAY_USER" -H bash -c "cd $REPO_DIR && . $RELAY_HOME/.relay-env; RELAY_MAX_MEMORY=1500M pm2 start ecosystem.config.cjs || pm2 restart neuron-relay --update-env; pm2 save"
+sudo -u "$RELAY_USER" -H bash -c "cd $REPO_DIR && . $RELAY_HOME/.relay-env; RELAY_MAX_MEMORY=1500M pm2 start relay/ecosystem.config.cjs || pm2 restart neuron-relay --update-env; pm2 save"
 env PATH="$PATH" pm2 startup systemd -u "$RELAY_USER" --hp "$RELAY_HOME" | tail -1 | bash || true
 
 # log rotation backstop (SUPERNODE.md → Operational hardening #1)

@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite';
-import { libp2pRelay } from './vite-libp2p-plugin';
+import { libp2pRelay } from './relay/vite-plugin';
 
 export default defineConfig({
   root: '.',
@@ -9,7 +9,8 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     watch: {
-      ignored: ['**/.relay-peer-id.json', '**/.relay-signing-key.json', '**/.relay-face-db.json'],
+      // Relay runtime state lives in .relay-data/ — never restart Vite over it.
+      ignored: ['**/.relay-data/**', '**/.relay-*.json'],
     },
     proxy: {
       // Proxy relay WebSocket through Vite so the tunnel URL (port 5173/443)

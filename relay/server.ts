@@ -1,7 +1,7 @@
 /**
  * NeuronChain libp2p relay server
  *
- * Run with:  node relay-server.js
+ * Run with:  npm run relay   (tsx relay/server.ts)
  *
  * This server provides three services:
  *   1. WebSocket listener at /p2p on port 9090 - browser entry point
@@ -41,14 +41,14 @@ import { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { randomBytes, randomUUID } from 'crypto';
 // Engine identity: this server is the ATTESTER — it signs engine attestations
 // (imported directly, run via tsx) instead of old face-hash credentials.
-import { createAttestation } from './src/engine/core/attestation.js';
-import { deriveCommitment } from './src/engine/core/identity.js';
-import { publicKeyFromPrivate as enginePublicKeyFromPrivate, verify as engineVerify } from './src/engine/core/keys.js';
-import { bytesToHex, hexToBytes } from './src/engine/core/hash.js';
+import { createAttestation } from '../src/engine/core/attestation.js';
+import { deriveCommitment } from '../src/engine/core/identity.js';
+import { publicKeyFromPrivate as enginePublicKeyFromPrivate, verify as engineVerify } from '../src/engine/core/keys.js';
+import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // Super-node archival (Slice 4a): the relay persists every engine block it sees
 // (via topic mirroring) and serves delta requests, so account chains are durably
 // held even when light clients holding a shard go offline.
-import { decodeBlock, verifyBlock } from './src/engine/core/block.js';
+import { decodeBlock, verifyBlock } from '../src/engine/core/block.js';
 
 // ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
 // New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
@@ -110,27 +110,62 @@ GossipSub.prototype.onIncomingStream = function(streamOrObj, connection) {
 };
 
 const PORT = parseInt(process.env.PORT || '9090', 10);
-const PEER_ID_FILE = process.env.PEER_ID_FILE || '.relay-peer-id.json';
+// All runtime state (identity keys, face DB, archives, logs) lives under one
+// gitignored directory instead of littering the repo root. Filenames are
+// unchanged so explicit *_FILE env overrides keep working, and migrateDataDir()
+// moves any pre-existing root-level files here on startup (identity preserved).
+const DATA_DIR = process.env.RELAY_DATA_DIR || '.relay-data';
+const inData = (name: string) => `${DATA_DIR}/${name}`;
+const PEER_ID_FILE = process.env.PEER_ID_FILE || inData('.relay-peer-id.json');
 // Comma-separated list of peer relay multiaddrs (must include /p2p/<peerId> suffix).
 // Example: PEER_RELAYS=/dns4/relay2.example.com/tcp/9090/ws/p2p/<peerId2>
 const PEER_RELAYS = (process.env.PEER_RELAYS || '').split(',').filter(Boolean);
-const SIGNING_KEY_FILE = process.env.SIGNING_KEY_FILE || '.relay-signing-key.json';
-const FACE_DB_FILE = process.env.FACE_DB_FILE || '.relay-face-db.json';
-const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || '.relay-attester-key.json';
+const SIGNING_KEY_FILE = process.env.SIGNING_KEY_FILE || inData('.relay-signing-key.json');
+const FACE_DB_FILE = process.env.FACE_DB_FILE || inData('.relay-face-db.json');
+const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || inData('.relay-attester-key.json');
 // Slice 4a: super-node archival store of engine blocks. ARCHIVE=0 disables it
 // (pure relay). NOTE: JSON file is fine for the first super-node / testing; swap
 // for LevelDB/SQLite when chains grow (see docs/SUPERNODE.md).
-const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || '.relay-engine-blocks.json';
+const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || inData('.relay-engine-blocks.json');
 // Key-blob archive: lets a fully-wiped device recover without any peer online
 // (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
-const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || '.relay-keyblobs.json';
+const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || inData('.relay-keyblobs.json');
 // Username uniqueness registry (attester-enforced, Phase 3): the first account
 // attested for a username owns it; a later different-account claim is rejected.
-const USERNAMES_FILE = process.env.USERNAMES_FILE || '.relay-usernames.json';
+const USERNAMES_FILE = process.env.USERNAMES_FILE || inData('.relay-usernames.json');
 // The first OPERATOR_COUNT accounts attested become "operators" — the only
 // accounts allowed to wipe this relay's archive (a signed network reset). All
 // other accounts' resets are ignored. Survives wipes (kept like identity keys).
-const OPERATORS_FILE = process.env.OPERATORS_FILE || '.relay-operators.json';
+const OPERATORS_FILE = process.env.OPERATORS_FILE || inData('.relay-operators.json');
+const RELOAD_LOG_FILE = process.env.RELOAD_LOG_FILE || inData('reload.log');
+
+/**
+ * One-time layout migration: earlier deployments kept every .relay-* file (and
+ * reload.log) in the repo root. Move them into DATA_DIR so a `git pull` deploy
+ * of this change preserves relay identity (peer-id, attester key) with zero
+ * manual steps on the boxes. Files with explicit env overrides are untouched
+ * (their constant doesn't point into DATA_DIR). `.bak`/`.tmp` sidecars ride along.
+ */
+async function migrateDataDir(): Promise<void> {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const legacy = [
+    '.relay-peer-id.json', '.relay-signing-key.json', '.relay-face-db.json',
+    '.relay-attester-key.json', '.relay-engine-blocks.json', '.relay-keyblobs.json',
+    '.relay-usernames.json', '.relay-operators.json', '.relay-generation.json',
+    'reload.log',
+  ];
+  for (const base of legacy) {
+    for (const name of [base, `${base}.bak`, `${base}.tmp`]) {
+      try {
+        await fs.access(name);                       // exists in root?
+        await fs.access(inData(name)).then(
+          () => console.warn(`[Migrate] ${name}: both root and ${DATA_DIR} copies exist — keeping ${DATA_DIR}, root copy left in place`),
+          async () => { await fs.rename(name, inData(name)); console.log(`[Migrate] ${name} → ${DATA_DIR}/`); },
+        );
+      } catch { /* not in root — nothing to migrate */ }
+    }
+  }
+}
 const OPERATOR_COUNT = 3;
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 // Per-block/per-request archive logs are verbose; gate them behind DEBUG_ARCHIVE=1.
@@ -307,7 +342,7 @@ setInterval(() => { saveUsernames().catch(() => {}); }, 5_000);
 let operators = []; // ordered accountIds; only these can wipe the relay
 // Current reset epoch — bumped only by an operator-signed reset; served in
 // /relay-info so clients (incl. late/offline ones) converge + wipe when behind.
-const GENERATION_FILE = process.env.GENERATION_FILE || '.relay-generation.json';
+const GENERATION_FILE = process.env.GENERATION_FILE || inData('.relay-generation.json');
 let currentGeneration = 0;
 async function loadGeneration() {
   try { currentGeneration = Number(JSON.parse(await fs.readFile(GENERATION_FILE, 'utf8'))) || 0; } catch { currentGeneration = 0; }
@@ -498,6 +533,7 @@ async function loadOrCreatePrivKey() {
 // ── Start relay ───────────────────────────────────────────────────────────────
 
 async function main() {
+  await migrateDataDir();
   const privKey = await loadOrCreatePrivKey();
   const peerId = peerIdFromPrivateKey(privKey);
   const signingKey = await loadOrCreateSigningKey();
@@ -550,7 +586,7 @@ async function main() {
         req.on('data', chunk => body += chunk);
         req.on('end', async () => {
           const line = `[${new Date().toISOString()}] ${body.trim()}\n`;
-          await fs.appendFile('reload.log', line).catch(() => {});
+          await fs.appendFile(RELOAD_LOG_FILE, line).catch(() => {});
           res.writeHead(204);
           res.end();
         });

@@ -9,7 +9,7 @@
 > Everything below (nginx/TLS/domain) is the *production* deployment shape.
 > Manual test matrix for the dev pair: [TESTPLAN.md](TESTPLAN.md).
 
-The same process (`relay-server.ts`) plays three roles. From Phase 1 it is also the
+The same process (`relay/server.ts`) plays three roles. From Phase 1 it is also the
 network's first **archival super-node**.
 
 | Role | What it does |
@@ -34,10 +34,14 @@ Keep 9090/9092 **localhost-only** (firewalled); only nginx (443) is public.
 
 ---
 
-## Runtime files (in the relay's working directory)
+## Runtime files (in `.relay-data/` under the repo root)
 
-All are **gitignored — never commit them**, and **back them up** (losing the peer-id
-or attester key changes the node's identity and breaks the baked bootstrap address).
+All relay runtime state lives in the gitignored **`.relay-data/`** directory
+(override with `RELAY_DATA_DIR`; per-file `*_FILE` env overrides still win). On
+first boot after this change the relay **auto-migrates** any legacy root-level
+`.relay-*.json` files into it — identity is preserved. **Never commit these; back
+them up** (losing the peer-id or attester key changes the node's identity and
+breaks the baked bootstrap address).
 
 | File | Contents | If lost |
 |------|----------|---------|
@@ -70,8 +74,8 @@ standalone `npm run relay` ignores it. **Do not set it on the server.**
 ## First-time setup / cutover (replacing an old relay)
 
 The pre-engine deployment ran a self-contained `node relay-server.js` (often as root).
-The current relay is **`relay-server.ts`, run via `tsx`**, and needs `src/engine/` +
-`node_modules`.
+The current relay is **`relay/server.ts`, run via `tsx`** (`npm run relay`), and needs
+`src/engine/` + `node_modules`.
 
 ```bash
 
@@ -158,11 +162,9 @@ behind a `DEBUG`-style flag once traffic grows.
 
 Cron a copy of the identity + archive off-box:
 ```bash
-tar czf relay-backup-$(date +%F).tgz .relay-peer-id.json .relay-attester-key.json \
-  .relay-signing-key.json .relay-face-db.json .relay-engine-blocks.json \
-  .relay-keyblobs.json .relay-usernames.json
+tar czf relay-backup-$(date +%F).tgz .relay-data/
 ```
-The first two are the ones you cannot regenerate.
+The peer-id and attester-key files are the ones you cannot regenerate.
 
 ---
 
@@ -223,14 +225,14 @@ pm2 set pm2-logrotate:compress true
 ```
 (Per-block/per-request archive logging is already quiet unless `DEBUG_ARCHIVE=1`.)
 
-**2. Memory backstop via the ecosystem file** (`ecosystem.config.cjs`, committed).
+**2. Memory backstop via the ecosystem file** (`relay/ecosystem.config.cjs`, committed).
 `max_memory_restart` is a runaway/leak backstop, **not** a throughput cap — it
 never throttles requests/connections. Migrate from the bare `pm2 start npm …` to it:
 ```bash
 export PEER_RELAYS="/dns4/<other-relay>/tcp/443/wss/http-path/relay-ws/p2p/<id>"
 export RELAY_MAX_MEMORY=1G        # tune to ≈70–80% of box RAM
 pm2 delete neuron-relay
-pm2 start ecosystem.config.cjs && pm2 save
+pm2 start relay/ecosystem.config.cjs && pm2 save
 ```
 The real fix for memory-at-scale is the on-disk LSM store (Tier 3 / *Scaling*), not
 a tighter cap.
@@ -289,7 +291,7 @@ nuking the shared network while letting a founder reset it.
 - **Bootstrap / manual wipe** (no operators yet, or you want to force one):
   ```bash
   pm2 stop neuron-relay
-  rm -f .relay-engine-blocks.json .relay-keyblobs.json .relay-usernames.json
+  rm -f .relay-data/.relay-engine-blocks.json .relay-data/.relay-keyblobs.json .relay-data/.relay-usernames.json
   # also rm .relay-operators.json to re-elect operators from the next 3 accounts
   pm2 start neuron-relay
   ```
@@ -359,9 +361,9 @@ lands (Bucket B), copy the archive once:
 ```bash
 # from neuronweb.org → akashicrecords.dev (relay stopped on the target)
 pm2 stop neuron-relay   # on akashicrecords.dev
-scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-engine-blocks.json  ./
-scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-keyblobs.json       ./
-scp neuronweb.org:/home/admin/domains/neuronweb.org/.relay-usernames.json      ./
+scp <source-relay>:<repo>/.relay-data/.relay-engine-blocks.json  .relay-data/
+scp <source-relay>:<repo>/.relay-data/.relay-keyblobs.json       .relay-data/
+scp <source-relay>:<repo>/.relay-data/.relay-usernames.json      .relay-data/
 pm2 start neuron-relay  # archives merge on load
 ```
 (If the network is still early/empty, skip this — there's nothing to backfill.)

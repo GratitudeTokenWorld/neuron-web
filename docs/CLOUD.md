@@ -82,8 +82,8 @@ federated via `PEER_RELAYS` in `~/.relay-env`. SSH:
 npm on the boxes and locally enforces `min-release-age=30` days (repo `.npmrc`)
 and the tree audits at **0 vulnerabilities** (react-native-webrtc peer tree
 stubbed out via package.json `overrides` — it's never executed).
-**peerId identity lives in `~/neuron-web/.relay-peer-id.json` — back it up; the
-baked bootstrap list in `vite.config.ts` embeds these peerIds.**
+**peerId identity lives in `~/neuron-web/.relay-data/.relay-peer-id.json` — back
+it up; the baked bootstrap list in `vite.config.ts` embeds these peerIds.**
 
 ## Account state (2026-08-08, after the attempt)
 

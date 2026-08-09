@@ -6,7 +6,7 @@
   "main": "src/main.ts",
   "scripts": {
     "dev": "vite",
-    "relay": "tsx relay-server.ts",
+    "relay": "tsx relay/server.ts",
     "tunnel": "npx untun@latest tunnel http://localhost:5173",
     "build": "vite build",
     "preview": "vite preview",

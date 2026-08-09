@@ -1,12 +1,12 @@
 /**
  * pm2 process config for the super-node relay.
  *
- * Start with:  pm2 start ecosystem.config.cjs   (then `pm2 save`)
+ * Start with:  pm2 start relay/ecosystem.config.cjs   (from the repo root; then `pm2 save`)
  *
  * Per-box env (notably PEER_RELAYS, which differs on each relay) is INHERITED from
  * the shell — export it before starting, or set it in the user's profile, e.g.:
  *   export PEER_RELAYS="/dns4/<other-relay>/tcp/443/wss/http-path/relay-ws/p2p/<id>"
- *   pm2 start ecosystem.config.cjs && pm2 save
+ *   pm2 start relay/ecosystem.config.cjs && pm2 save
  *
  * SCALING NOTE: `max_memory_restart` here is a runaway/leak BACKSTOP, not a
  * throughput cap — it does not throttle requests or connections, so it never

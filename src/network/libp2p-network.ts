@@ -8,7 +8,7 @@
  *  - WebRTC + circuit-relay-v2 for browser-to-browser connections (no central relay on data path)
  *  - WebSocket transport to connect to bootstrap relay node(s)
  *
- * The relay server (relay-server.js) only assists with NAT traversal and
+ * The relay server (relay/server.ts) only assists with NAT traversal and
  * initial peer discovery - no application data passes through it.
  */
 

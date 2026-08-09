@@ -16,7 +16,7 @@ Provisioning: [CLOUD.md](CLOUD.md); box setup: `scripts/setup-relay-box.sh`.
 ## Before you start
 
 Both relays are already the **baked defaults** (bootstrap list in `vite.config.ts`,
-dev-relay federation in `vite-libp2p-plugin.ts`), so plain `npm run dev` is enough.
+dev-relay federation in `relay/vite-plugin.ts`), so plain `npm run dev` is enough.
 The env vars below exist to *override* the targets (e.g. pointing at replacement
 boxes — get peerIds from `curl http://<IP>:9092/relay-info`):
 

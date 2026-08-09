@@ -26,13 +26,14 @@ npm test             # engine test suite (vitest)
 npm run typecheck    # strict typecheck of the engine
 ```
 
-Deploy = serve `dist/` as static files behind your host, and run `node relay-server.js`
-(`npm run relay`) on a reachable server — same model as neuronchain.
+Deploy = serve `dist/` as static files behind your host, and run `npm run relay`
+on a reachable server (pm2: `pm2 start relay/ecosystem.config.cjs`).
 
 ## Layout
 
 ```
-index.html, vite.config.ts, relay-server.js   app shell + relay (from neuronchain)
+index.html, vite.config.ts    app shell (from neuronchain)
+relay/                        relay / super-node (server.ts, vite-plugin.ts, pm2 config)
 public/models/                                face-api model weights
 src/
   main.ts                 app entry / UI logic

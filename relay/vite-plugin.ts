@@ -1,9 +1,9 @@
 /**
- * Vite plugin: starts the libp2p relay server (relay-server.js) as a
+ * Vite plugin: starts the libp2p relay server (relay/server.ts) as a
  * child process alongside the Vite dev server, then stops it on close.
  *
- * In production, run relay-server.js separately:
- *   node relay-server.js
+ * In production, run the relay separately: `npm run relay`
+ * (pm2 config: relay/ecosystem.config.cjs).
  */
 
 import type { Plugin, ViteDevServer } from 'vite';
@@ -51,7 +51,7 @@ export function libp2pRelay(): Plugin {
     name: 'libp2p-relay',
 
     configureServer(server: ViteDevServer) {
-      const relayPath = join(process.cwd(), 'relay-server.ts');
+      const relayPath = join(process.cwd(), 'relay', 'server.ts');
       stopping = false;
       startRelay(relayPath);
 

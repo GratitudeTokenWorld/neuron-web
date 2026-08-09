@@ -25,7 +25,7 @@ Cloud provisioning: [docs/CLOUD.md](docs/CLOUD.md).
 
 ```sh
 npm run dev          # Vite dev server + auto-spawned relay
-npm run relay        # standalone relay (tsx relay-server.ts) — production entry
+npm run relay        # standalone relay (tsx relay/server.ts) — production entry
 npm run build        # → dist/ (static bundle)
 npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
@@ -58,8 +58,11 @@ src/
     economy/       capped reward inflation
     net/           relay federation (rendezvous hashing)
     sim/           scale-invariant simulation harness
-relay-server.ts    relay / super-node (PORT 9090 ws, +1 tcp, +2 http/face-verify)
-ecosystem.config.cjs  pm2 config for the relay
+relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2
+                   http/face-verify), vite-plugin.ts (dev auto-spawn),
+                   ecosystem.config.cjs (pm2). Runtime state (identity keys,
+                   face DB, archives) lives in gitignored .relay-data/ —
+                   auto-migrated from the old root-level .relay-*.json on boot
 ```
 
 ## The migration seam — read before editing app code
