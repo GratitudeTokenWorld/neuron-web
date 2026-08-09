@@ -622,10 +622,13 @@
       animation: fadeIn 0.2s ease;
     }
 
+    /* Centred against the header row, not a fixed offset from the modal top —
+       the header grows to two lines on long prompts and a fixed `top` drifts. */
     .camera-modal-close {
       position: absolute;
-      top: 10px;
+      top: 50%;
       right: 10px;
+      transform: translateY(-50%);
       width: 32px;
       height: 32px;
       border-radius: 50%;
@@ -648,11 +651,14 @@
       background: #000;
     }
 
-    /* Step/status line sits ABOVE the video (see .camera-modal-inner order):
-       instructions belong where the eyes already are, not below the feed.
-       Side padding clears the absolutely-positioned close button. */
+    /* The ONE instruction line, above the feed: every prompt (step, liveness
+       progress, challenge, capture) is written here by setCameraStatus(). There is
+       deliberately no second overlay on the video — duplicating the same text in
+       two places just competes for attention while the user is following it. */
+    .camera-modal-header { position: relative; }
+
     .camera-modal-status {
-      padding: 12px 52px;
+      padding: 12px 52px;   /* side padding clears the close button */
       font-size: 13px;
       color: var(--text-dim);
       text-align: center;
@@ -661,26 +667,6 @@
       align-items: center;
       justify-content: center;
       gap: 8px;
-    }
-
-    .camera-modal-video { position: relative; line-height: 0; }
-
-    /* Live guidance ("Look at the camera", challenge prompts) overlays the TOP of
-       the feed — closest to the webcam, and never hidden behind the chin/face. */
-    .camera-modal-overlay {
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      text-align: center;
-      color: var(--accent);
-      font-size: 13px;
-      line-height: 1.4;
-      font-family: var(--mono);
-      text-shadow: 0 1px 4px rgba(0,0,0,0.9);
-      padding: 10px 12px;
-      background: linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0));
-      pointer-events: none;
     }
 
     /* Confirm dialog overlay */
@@ -903,14 +889,14 @@
 
   <div class="camera-modal" id="cameraModal">
     <div class="camera-modal-inner">
-      <button class="camera-modal-close" id="cameraModalClose">&times;</button>
-      <!-- Status first, then the feed with its overlay pinned to the top edge:
-           every instruction the user must follow is above/at the top of the video. -->
-      <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
-      <div class="camera-modal-video">
-        <video id="faceVideo" autoplay muted playsinline></video>
-        <div class="camera-modal-overlay" id="cameraOverlay"></div>
+      <!-- Single instruction line, above the feed. The close button is a SIBLING of
+           #cameraStatus (never a child): setCameraStatus() replaces that element's
+           innerHTML, which would delete a nested button. -->
+      <div class="camera-modal-header">
+        <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
+        <button class="camera-modal-close" id="cameraModalClose">&times;</button>
       </div>
+      <video id="faceVideo" autoplay muted playsinline></video>
     </div>
   </div>
 

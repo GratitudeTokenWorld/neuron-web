@@ -838,14 +838,12 @@ function registerLocalKeys() {
 
 function showCameraModal() {
   $('#cameraModal').classList.add('active');
-  $('#cameraOverlay').textContent = '';
   $('#cameraStatus').innerHTML = '<span class="spinner"></span> Initializing...';
 }
 
 function hideCameraModal() {
   $('#cameraModal').classList.remove('active');
   if (cameraStream) { stopCamera(cameraStream); cameraStream = null; }
-  $('#cameraOverlay').textContent = '';
   $('#cameraStatus').textContent = '';
 }
 
@@ -1733,7 +1731,6 @@ $('#btnCreateAccount').addEventListener('click', async () => {
   if (localAccounts.find((a) => a.username === username)) { toast('Username taken', 'error'); return; }
 
   const statusEl = $('#createStatus');
-  const overlay = $('#cameraOverlay');
   const video = $<HTMLVideoElement>('#faceVideo');
 
   $('#btnCreateAccount').setAttribute('disabled', '');
@@ -1749,8 +1746,9 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Step 1: Liveness
     setCameraStatus('<span class="spinner"></span> Step 1/3: Slowly turn your head left and right');
+    // Live progress replaces the step line (one instruction on screen, not two).
     const isLive = await detectLiveness(video, 15000, (msg: string) => {
-      overlay.textContent = msg;
+      setCameraStatus(`<span class="spinner"></span> Step 1/3: ${escHtml(msg)}`);
     });
     if (!isLive) {
       addLog('FaceID: Liveness FAILED - not enough movement detected', 'error');
@@ -1762,7 +1760,6 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Step 2: Pre-fetch relay challenges BEFORE face capture, then show the challenge
     // instruction during enrollment so the user performs the action on camera.
     setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
-    overlay.textContent = 'Contacting relay nodes...';
     const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
 
     // Active challenge: detect the relay-issued action before face capture.
@@ -1771,8 +1768,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       const challengeType = pendingChallenges[0].type as 'blink' | 'look-left' | 'look-right' | 'smile';
       setCameraStatus(`<span class="spinner"></span> Step 2/3: Challenge — perform the action`);
       const actionDone = await detectChallenge(video, challengeType, 18000, (msg) => {
-        overlay.textContent = msg;
-        setCameraStatus(`<span class="spinner"></span> Step 2/3: ${msg}`);
+        setCameraStatus(`<span class="spinner"></span> Step 2/3: ${escHtml(msg)}`);
       });
       if (!actionDone) {
         addLog('FaceID: Challenge action not detected — aborting account creation', 'error');
@@ -1784,10 +1780,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Face enrollment (camera still open, immediately after challenge action)
     setCameraStatus('<span class="spinner"></span> Step 2/3: Hold still — capturing face map');
-    overlay.textContent = 'Hold still — capturing face map';
     const faceMap = await enrollFace(video, (step, total, status) => {
-      overlay.textContent = `[${step}/${total}] ${status}`;
-      setCameraStatus(`<span class="spinner"></span> Step 2/3: Sample ${step}/${total}`);
+      setCameraStatus(`<span class="spinner"></span> Step 2/3: Sample ${step}/${total} — ${escHtml(status)}`);
     });
     hideCameraModal();
 
@@ -2395,7 +2389,9 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
     setCameraStatus('<span class="spinner"></span> Step 1/2: Slowly turn your head left and right');
-    const isLive = await detectLiveness(video, 15000, (msg: string) => { $('#cameraOverlay').textContent = msg; });
+    const isLive = await detectLiveness(video, 15000, (msg: string) => {
+      setCameraStatus(`<span class="spinner"></span> Step 1/2: ${escHtml(msg)}`);
+    });
     if (!isLive) {
       hideCameraModal();
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';

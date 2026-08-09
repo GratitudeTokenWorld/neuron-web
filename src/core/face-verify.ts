@@ -311,7 +311,8 @@ export async function detectLiveness(
         const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
         const progress = movementPct + dirPct;
 
-        onStatus?.(`Liveness: ${progress}% - turn head left then right`);
+        // No "Liveness:" prefix — callers render this under a "Step 1/3: …" label.
+        onStatus?.(`${progress}% - turn head left then right`);
 
         if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
           onStatus?.('Liveness confirmed!');
