@@ -862,7 +862,31 @@ function setCameraStatus(html: string) {
  * the user needs one imperative, and the bar + guide already show where they
  * are. Labels stay sentence-case in source (translatable); CSS uppercases them.
  */
+/**
+ * Short confirmation tone. The eyes-closed check is the one prompt whose
+ * feedback the user physically cannot see, so it gets an audible "done" —
+ * without it the only way to know is to open your eyes and break the hold.
+ * Best-effort: silently skipped if the browser blocks audio.
+ */
+function beepOk(): void {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.06, ctx.currentTime);              // quiet
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.2);
+    setTimeout(() => ctx.close().catch(() => {}), 400);
+  } catch { /* audio unavailable — the on-screen confirmation still shows */ }
+}
+
 function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
+  if (cue.state === 'ok' && cue.guide === 'eyes') beepOk();
   const colour = cue.state === 'ok' ? 'var(--success)' : cue.state === 'fail' ? 'var(--danger)' : '';
   setCameraStatus(
     `<span class="cue-label"${colour ? ` style="color:${colour}"` : ''}>${escHtml(cue.label)}</span>`,
