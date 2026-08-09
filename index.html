@@ -972,11 +972,13 @@
         <div class="capture-guide" id="captureGuide" data-guide="" data-dir="left">
           <svg viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
             <ellipse class="cg-oval" cx="100" cy="74" rx="44" ry="58"/>
+            <!-- Chevrons POINT the way to turn: vertex on the outside, arms opening
+                 back toward the face ("<<<" on the left). data-dir="right" mirrors
+                 the group, so they sit on the right pointing right. -->
             <g class="cg-turn">
-              <path class="cg-line cg-chev" d="M52 74 l-9 -9 M52 74 l-9 9"/>
-              <path class="cg-line cg-chev" d="M40 74 l-9 -9 M40 74 l-9 9"/>
-              <path class="cg-line cg-chev" d="M28 74 l-9 -9 M28 74 l-9 9"/>
-              <path class="cg-line" d="M74 34 a44 44 0 0 0 -22 22" opacity="0.5"/>
+              <path class="cg-line cg-chev" d="M52 74 l9 -9 M52 74 l9 9"/>
+              <path class="cg-line cg-chev" d="M40 74 l9 -9 M40 74 l9 9"/>
+              <path class="cg-line cg-chev" d="M28 74 l9 -9 M28 74 l9 9"/>
             </g>
             <g class="cg-blink">
               <path class="cg-line cg-eye" d="M70 66 q10 -11 20 0 q-10 11 -20 0 z"/>
