@@ -770,7 +770,14 @@ export async function detectChallenge(
   // Max allowed movement of the face across the frame while turning, as a
   // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
   // slide big enough to fake that yaw moves it 15-20%.
-  const CENTRE_DRIFT_MAX = 0.035;
+  //
+  // This was 0.035 — BELOW the 5-7% a genuine turn produces, so honest turns hit
+  // "keep your head in place" and the hold kept resetting. 0.08 clears a real
+  // neck pivot with margin and still sits far under a slide. The cap is not what
+  // stops a slide anyway: rotationDominates below is drift-RELATIVE, and for a
+  // slide to fake YAW_DELTA it would have to travel ~0.37 of the frame, which
+  // this cap rejects many times over.
+  const CENTRE_DRIFT_MAX = 0.08;
   // Yaw that a pure sideways move explains on its own: apparent rotation grows
   // ~0.35 of jaw-ratio per unit of frame-width drift (60-degree lens, arm's
   // length). Demanding the observed yaw be several times that is what makes a
@@ -804,9 +811,18 @@ export async function detectChallenge(
   // bar to clear is unchanged, it just has to be sustained.
   const SUSTAIN_MS = 320;
   let metSince = 0;
-  const sustained = (met: boolean): boolean => {
+  /**
+   * Hysteresis: `met` ARMS the hold, `holding` (when given) KEEPS it. Landmark
+   * noise makes a signal sitting just over the line dip below it for the odd
+   * frame, and without this a single dip restarts the whole 320ms — which is
+   * what made holding a turn feel like balancing rather than posing. Arming
+   * still costs full threshold, so the bar to clear is unchanged.
+   */
+  const HOLD_FRACTION = 0.75;
+  const sustained = (met: boolean, holding?: boolean): boolean => {
     const t = Date.now();
-    if (!met) { metSince = 0; return false; }
+    const keep = metSince ? (holding ?? met) : met;
+    if (!keep) { metSince = 0; return false; }
     if (!metSince) metSince = t;
     return t - metSince >= SUSTAIN_MS;
   };
@@ -976,7 +992,14 @@ export async function detectChallenge(
       const rotationDominates = delta >= ROTATION_MARGIN * explained;
       const agree = Math.sign(signed) === Math.sign(skewΔ);
       debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} explains=${explained.toFixed(4)} agree=${agree}`);
-      if (sustained(delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree && stayedPut && rotationDominates)) {
+      // Safety terms (direction agreement, no slide, rotation dominates) are
+      // required throughout; only the magnitudes get the hysteresis, so a held
+      // turn survives landmark jitter but a slide never sneaks through the hold.
+      const safe = agree && stayedPut && rotationDominates;
+      const armTurn = delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && safe;
+      const holdTurn = delta >= YAW_DELTA * HOLD_FRACTION
+        && Math.abs(skewΔ) >= SKEW_DELTA * HOLD_FRACTION && safe;
+      if (sustained(armTurn, holdTurn)) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', dir: turnSide, left: 100, right: 100, state: 'ok' });
         return true;
       }
