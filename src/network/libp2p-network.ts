@@ -195,6 +195,24 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
 // Injected at build time via vite.config.ts define; empty array when not set.
 declare const __BOOTSTRAP_ADDRS__: string[] | undefined;
 
+/**
+ * The relays baked into this build (vite.config.ts `__BOOTSTRAP_ADDRS__`).
+ *
+ * These ARE the attesters, so identity flows must be able to reach them without
+ * waiting for gossip: a fresh browser knows no relays yet, and attester
+ * discovery that depends on the gossiped relay table fails with "0 attesters
+ * responded" while the relays sit there perfectly healthy.
+ */
+export function bakedBootstrapAddrs(): string[] {
+  return (typeof __BOOTSTRAP_ADDRS__ !== 'undefined' && Array.isArray(__BOOTSTRAP_ADDRS__))
+    ? [...__BOOTSTRAP_ADDRS__] : [];
+}
+
+/** Extract `/p2p/<peerId>` from a multiaddr, or '' when absent. */
+export function peerIdFromMultiaddr(addr: string): string {
+  return addr.match(/\/p2p\/([A-Za-z0-9]+)/)?.[1] ?? '';
+}
+
 /** Bootstrap relay multiaddresses - always includes /p2p/<peerId> suffix. */
 function buildBootstrapList(relayInfo: RelayInfo | null): string[] {
   if (typeof window !== 'undefined') {

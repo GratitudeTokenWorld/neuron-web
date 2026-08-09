@@ -5,6 +5,7 @@ import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
+import { bakedBootstrapAddrs, peerIdFromMultiaddr } from './network/libp2p-network';
 import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
@@ -1807,6 +1808,25 @@ function relayFaceVerifyBase(relay: import('./network/libp2p-network').KnownRela
 }
 
 /**
+ * Candidate attesters: everything gossip has taught us PLUS the relays baked
+ * into the build. The baked ones are the attesters, so identity must not depend
+ * on the gossiped relay table having populated — a fresh browser knows nothing
+ * yet, and a momentarily-restarting local relay used to leave the list empty,
+ * producing "0 attesters responded" while both cloud relays were healthy.
+ */
+function attesterCandidates(): import('./network/libp2p-network').KnownRelayRecord[] {
+  const known = node.getKnownRelays();
+  const seen = new Set(known.map(r => r.peerId).filter(Boolean));
+  const extra = bakedBootstrapAddrs()
+    .filter(addr => { const id = peerIdFromMultiaddr(addr); return id && !seen.has(id); })
+    .map(addr => ({
+      addr, peerId: peerIdFromMultiaddr(addr),
+      lastSeen: 0, failCount: 0, announcerPub: '',
+    })) as import('./network/libp2p-network').KnownRelayRecord[];
+  return [...known, ...extra];
+}
+
+/**
  * Fill in missing `signingPub` on known-relay records by asking each relay's
  * `/relay-info` (CORS `*`) directly. Baked bootstrap relays are registered
  * addr-only ([libp2p-network] upsertKnownRelay(addr, '')), and their signingPub
@@ -1957,7 +1977,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Step 2: Pre-fetch relay challenges BEFORE face capture, then show the challenge
     // instruction during enrollment so the user performs the action on camera.
     setCameraStatus('<span class="spinner"></span> Contacting relay nodes...');
-    const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
+    const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(attesterCandidates()), 5));
 
     // Challenges + capture under one presence guard (see challengeAndCapture).
     // The relay-issued type fixes the turn direction and is the attestation nonce.
