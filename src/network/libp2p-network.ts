@@ -14,6 +14,7 @@
 
 import { createLibp2p } from 'libp2p';
 import { applyGossipsubCompat } from './gossipsub-compat.js';
+import { relayHttpBase } from './account-resolver.js';
 import { webRTC } from '@libp2p/webrtc';
 import { webSockets } from '@libp2p/websockets';
 import { WebSockets as WsMatcher, WebSocketsSecure as WssMatcher } from '@multiformats/multiaddr-matcher';
@@ -211,6 +212,32 @@ export function bakedBootstrapAddrs(): string[] {
 /** Extract `/p2p/<peerId>` from a multiaddr, or '' when absent. */
 export function peerIdFromMultiaddr(addr: string): string {
   return addr.match(/\/p2p\/([A-Za-z0-9]+)/)?.[1] ?? '';
+}
+
+/**
+ * The NETWORK's reset epoch: the max generation across the same-origin dev
+ * relay and the baked cloud relays. One number, because relying on the local
+ * relay alone splits the brain — a reset applied on the cloud boxes while the
+ * dev relay lagged left every client on the old epoch, holding (and resolving
+ * from) records of accounts the reset had destroyed (2026-08-09). Returns −1
+ * when NO relay answered, so callers can distinguish "network says 0" from
+ * "network unreachable" and skip snap-down decisions entirely.
+ */
+async function fetchNetworkGeneration(primaryGeneration?: number): Promise<number> {
+  let max = typeof primaryGeneration === 'number' ? primaryGeneration : -1;
+  const results = await Promise.allSettled(
+    bakedBootstrapAddrs().map(async (addr) => {
+      const base = relayHttpBase(addr);
+      if (!base) throw new Error('same-origin (already covered by primary)');
+      const res = await fetch(`${base}/relay-info`, { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const json = await res.json() as { generation?: number };
+      if (typeof json.generation !== 'number') throw new Error('no generation');
+      return json.generation;
+    }),
+  );
+  for (const r of results) if (r.status === 'fulfilled') max = Math.max(max, r.value);
+  return max;
 }
 
 /** Bootstrap relay multiaddresses - always includes /p2p/<peerId> suffix. */
@@ -598,10 +625,15 @@ export class Libp2pNetwork extends EventEmitter {
     const relayInfo = await fetchRelayInfo();
     if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
     if (relayInfo?.operators) this.operators = relayInfo.operators;
-    // Catch up to the relay's reset epoch (covers a device that missed a reset
-    // while offline): adopt + wipe if we're behind. Testnet-only.
-    if (this.network === 'testnet' && typeof relayInfo?.generation === 'number' && relayInfo.generation > this.generation) {
-      await this.applyReset(relayInfo.generation);
+    // Catch up to the NETWORK's reset epoch (covers a device that missed a reset
+    // while offline): adopt + wipe if we're behind. Testnet-only. The epoch is
+    // the MAX across the same-origin dev relay AND the baked cloud relays — the
+    // local dev relay lags when a reset was applied on the cloud boxes only
+    // (2026-08-09: cloud at gen 8, local at 7 ⇒ no browser ever wiped, and a
+    // stale cached record misrouted a transfer to a destroyed account).
+    const networkGeneration = await fetchNetworkGeneration(relayInfo?.generation);
+    if (this.network === 'testnet' && networkGeneration > this.generation) {
+      await this.applyReset(networkGeneration);
     }
     // Self-heal a device stranded ABOVE the network's generation (an unauthorized
     // reset used to bump it locally — see clearAll). Such a device drops all
@@ -609,9 +641,9 @@ export class Libp2pNetwork extends EventEmitter {
     // No wipe: we are not behind, just mis-numbered. Testnet-only, like all reset
     // logic, and no worse than trusting the relay to RAISE the generation (which
     // already triggers a full local wipe on the same signal).
-    if (this.network === 'testnet' && typeof relayInfo?.generation === 'number' && relayInfo.generation < this.generation) {
-      console.warn(`[Libp2p] Local generation ${this.generation} > network ${relayInfo.generation} — snapping down (was dropping all inbound gossip)`);
-      this.generation = relayInfo.generation;
+    if (this.network === 'testnet' && networkGeneration >= 0 && networkGeneration < this.generation) {
+      console.warn(`[Libp2p] Local generation ${this.generation} > network ${networkGeneration} — snapping down (was dropping all inbound gossip)`);
+      this.generation = networkGeneration;
       this.saveGeneration();
     }
     const bootstrapList = buildBootstrapList(relayInfo);
@@ -781,8 +813,11 @@ export class Libp2pNetwork extends EventEmitter {
     this.relayInfoTimer = setInterval(async () => {
       const info = await fetchRelayInfo(1, 0);
       if (info?.operators) this.operators = info.operators;
-      if (this.network === 'testnet' && typeof info?.generation === 'number' && info.generation > this.generation) {
-        await this.applyReset(info.generation);
+      // Same max-across-relays epoch as start() — a cloud-side reset must reach
+      // clients even when the same-origin dev relay lags behind it.
+      const gen = await fetchNetworkGeneration(info?.generation);
+      if (this.network === 'testnet' && gen > this.generation) {
+        await this.applyReset(gen);
         this.emit('generation:changed', true);
       }
     }, 120_000);

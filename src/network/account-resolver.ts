@@ -117,7 +117,18 @@ export async function resolveAccountFromRelays(
     // answer "alice" with a valid record for "mallory").
     if ('username' in query && String(rec.username).toLowerCase() !== query.username.trim().toLowerCase()) continue;
     if ('pub' in query && rec.pub !== query.pub) continue;
-    if (!best || Number(rec._version ?? 0) > Number(best._version ?? 0)) best = rec;
+    if (!best) { best = rec; continue; }
+    if (rec.pub === best.pub) {
+      // Same account from two relays → the owner's monotonic counter ranks them.
+      if (Number(rec._version ?? 0) > Number(best._version ?? 0)) best = rec;
+    } else if (Number(rec.createdAt ?? 0) > Number(best.createdAt ?? 0)) {
+      // DIFFERENT accounts claiming one username — a relay still serving a
+      // pre-reset registration vs the account that re-registered the name.
+      // `_version` is a per-BROWSER counter and meaningless across accounts
+      // (comparing them once routed a payment to generation-7 bob). The later
+      // registration is the live one: newest `createdAt` wins.
+      best = rec;
+    }
   }
   return best;
 }

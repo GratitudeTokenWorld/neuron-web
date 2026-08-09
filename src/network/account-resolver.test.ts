@@ -157,6 +157,24 @@ describe('G1 — on-demand account resolution', () => {
     expect(await fetchBlockByHash(['http://dead:9092'], target.hash, 'testnet', fakeFetch({}))).toBeNull();
   });
 
+  it('two ACCOUNTS claiming one username: the later registration wins, not _version', async () => {
+    // The 2026-08-09 misroute: a relay still serving the pre-reset "bob"
+    // (huge per-browser _version) vs the re-registered bob (small _version).
+    // _version is meaningless across accounts — newest createdAt must win.
+    const oldBob = signedRecord({ username: 'bob', createdAt: 1_000, _version: 31_000 });
+    const newBob = signedRecord({ username: 'bob', createdAt: 2_000, _version: 5 });
+    const got = await resolveAccountFromRelays(
+      ['http://stale:9092', 'http://fresh:9092'],
+      { username: 'bob' },
+      'testnet',
+      fakeFetch({
+        'http://stale:9092': () => ({ status: 200, body: oldBob }),
+        'http://fresh:9092': () => ({ status: 200, body: newBob }),
+      }),
+    );
+    expect(got?.pub).toBe(newBob.pub);
+  });
+
   it('prefers the freshest record when relays disagree (owner _version wins)', async () => {
     const keys = generateKeyPair();
     const make = (version: number, faceMapHash: string): AccountRecord => {
