@@ -1932,6 +1932,11 @@ async function collectAttestation(
         const err = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
         if (res.status === 429 && /face limit/i.test(String(err.error))) faceLimitError = String(err.error);
         if (res.status === 409 || /username taken/i.test(String(err.error))) usernameTakenError = String(err.error);
+        // Also to the app log + console: the status line is transient and a
+        // rejection reason ("challenge expired", "faceMapHash does not match")
+        // is the only thing that explains an otherwise silent HTTP 400.
+        addLog(`FaceID: attester ${ch.peerId.slice(0, 8)} rejected (${res.status}): ${err.error}`, 'error');
+        console.warn(`[face] attester ${ch.peerId.slice(0, 8)} rejected ${res.status}:`, err.error);
         onStatus(`Attester ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
         continue;
       }

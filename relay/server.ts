@@ -99,7 +99,11 @@ const PROTOCOL_VERSION = 'v1';
 // serves as the per-attestation nonce). 'blink' stays out so the draw is always
 // a turn direction — the client adds blink and smile itself.
 const CHALLENGE_TYPES = ['look-left', 'look-right'];
-const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+// 15 minutes, not 5. The challenge is issued BEFORE the capture flow, which now
+// runs a framing gate, a three-leg depth sweep, five held actions and three
+// samples — a careful or retried run passes 5 minutes easily, and the attestation
+// then fails with an opaque HTTP 400 after the user has done all the work.
+const CHALLENGE_TTL_MS = 15 * 60 * 1000;
 const IP_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Per-IP verification cap per 24h, by network. Local/loopback IPs are exempt
 // entirely (see checkIpLimit), so local dev testing is never throttled.

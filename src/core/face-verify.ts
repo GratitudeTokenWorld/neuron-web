@@ -498,7 +498,15 @@ export async function calibrateNeutral(
   ];
   const LEG_SIZE_RATIO = 1.25;   // per leg, inverted when receding
   const SHAPE_DELTA = 0.022;     // relative change in eye-span / jaw-width, per leg
-  const FLAT_SHAPE_MAX = 0.35;   // fraction of SHAPE_DELTA that reads as "flat"
+  // "Flat" must be egregious before we reject: the shape signal rides on the jaw
+  // silhouette, the least reliable landmarks in the model, so a real approach can
+  // legitimately register a weak response (measured: the SAME face gave 0.007 on
+  // one approach and 0.030 on the next). A false "flat image" locks a real person
+  // out of the network, which is far worse than a spoof needing another attempt —
+  // so this only fires when the face moved MUCH further than asked with virtually
+  // no perspective response at all.
+  const FLAT_SIZE_MIN = 2.5;     // multiples of the required size change
+  const FLAT_SHAPE_MAX = 0.12;   // fraction of SHAPE_DELTA that still reads as "flat"
   const deadline = Date.now() + 60000;
 
   type Phase = 'frame' | 'sweep' | 'baseline';
@@ -622,7 +630,7 @@ export async function calibrateNeutral(
         continue;
       }
       // Moved a long way with no perspective response ⇒ the surface is flat.
-      if (sizeProgress >= 1.15 && shapeProgress < FLAT_SHAPE_MAX) {
+      if (sizeProgress >= FLAT_SIZE_MIN && shapeProgress < FLAT_SHAPE_MAX) {
         onStatus?.({ label: 'Flat image detected — use your real face', guide: 'depth', state: 'fail', left: 0, right: 0 });
         return fail('flat');
       }
@@ -752,13 +760,13 @@ export async function detectChallenge(
   // Jaw drop: lip gap / mouth width, over the calibrated neutral. Neutral sits
   // near 0.1, a deliberate open mouth clears 0.4 — enormous margin.
   const MOUTH_OPEN_DELTA = 0.22;
-  // Head turn. Measured: at rest the jaw-ratio jitters ±0.03, and a deliberate
-  // turn reached 0.12 — so 0.055 sat only ~2x above noise, which is why leaning
-  // sideways could clear it. 0.085 keeps a real turn comfortable while putting
-  // ~3x the noise band between them. The skew corroborator must move too: body
-  // translation barely changes it, a rotation changes it a lot.
-  const YAW_DELTA = 0.085;
-  const SKEW_DELTA = 0.05;
+  // Head turn. Measured on real runs: at rest the jaw-ratio jitters up to 0.028,
+  // a SLIGHT turn of the head reaches 0.045-0.084, and a deliberate turn reaches
+  // 0.105-0.33. 0.085 sat at the top of the "slight" band, which is why a small
+  // movement filled the bar immediately. 0.13 sits below every deliberate turn
+  // measured and above every slight one.
+  const YAW_DELTA = 0.13;
+  const SKEW_DELTA = 0.09;
   // Max allowed movement of the face across the frame while turning, as a
   // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
   // slide big enough to fake that yaw moves it 15-20%.
@@ -769,8 +777,13 @@ export async function detectChallenge(
   // slide fail even when it drifts less than the cap above.
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
-  // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
-  const BROW_DELTA = 0.025;
+  // Eyebrow raise over the rolling relaxed reference, measured as a WINDOWED
+  // MEAN. Per frame the signal is hopeless: at rest it swings ±0.013 while a
+  // real raise averages only 0.028, so the bar lurched between 0 and 50% on a
+  // motionless face. Averaging ~400ms shrinks the resting noise to sd 0.003
+  // while leaving the raise at 0.028 — an 8-sigma separation instead of 2.
+  const BROW_DELTA = 0.020;
+  const BROW_WINDOW_MS = 400;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
@@ -784,6 +797,7 @@ export async function detectChallenge(
   const openRefHist: { t: number; ear: number }[] = [];
   /** Relaxed-brow reference history, fed only by frames that are NOT a raise. */
   const browRefHist: { t: number; v: number }[] = [];
+  const browWindow: { t: number; v: number }[] = [];
   // Every action must be HELD, not merely touched. Jitter crosses a threshold
   // for one frame; a deliberate expression stays there. This is what stops the
   // checks feeling "too sensitive" without making them physically harder — the
@@ -1024,12 +1038,16 @@ export async function detectChallenge(
       const browRef = sortedBrow.length >= 6
         ? sortedBrow[Math.floor(sortedBrow.length * 0.3)]
         : browNeutral;
-      const browΔ = browNow - browRef;
-      if (browΔ < BROW_DELTA * 0.5) {
+      const nowMs = Date.now();
+      browWindow.push({ t: nowMs, v: browNow });
+      while (browWindow.length && nowMs - browWindow[0].t > BROW_WINDOW_MS) browWindow.shift();
+      const browMean = browWindow.reduce((a, b) => a + b.v, 0) / (browWindow.length || 1);
+      const browΔ = browMean - browRef;
+      if (browNow - browRef < BROW_DELTA * 0.5) {
         browRefHist.push({ t: Date.now(), v: browNow });
         while (browRefHist.length && Date.now() - browRefHist[0].t > OPEN_REF_MS) browRefHist.shift();
       }
-      debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA} ref=${browRef.toFixed(4)} raw=${browNow.toFixed(4)}`);
+      debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA} ref=${browRef.toFixed(4)} raw=${browNow.toFixed(4)} n=${browWindow.length}`);
       if (sustained(browΔ >= BROW_DELTA)) {
         onStatus?.({ label: 'Eyebrows detected', guide: 'brow', left: 100, right: 100, state: 'ok' });
         return true;
