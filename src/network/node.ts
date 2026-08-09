@@ -732,6 +732,20 @@ export class NeuronNode extends EventEmitter {
     // balance without waiting for a periodic re-broadcast. Delayed so relay/peer
     // connections + shard meshes form first.
     setTimeout(() => { for (const pub of this.localKeys.keys()) this.engineResyncAccount(pub); }, 6000);
+    // ALSO refresh every held FOREIGN chain (counterparties we verified before).
+    // A send made while this node was OFFLINE lives on the sender's chain; inbox
+    // gossip is not replayed, so without this pull the new send block never
+    // arrives and the unclaimed-receive sweep has nothing to claim (the
+    // "offline recipient misses transfers" bug, found in TESTPLAN T3). Cost is
+    // O(held accounts) = own + counterparties — scale-invariant-safe. Arriving
+    // blocks flow through handleIncomingEngineBlock → autoReceiveEngine, which
+    // claims pending sends automatically.
+    setTimeout(() => {
+      const own = new Set(this.localKeys.keys());
+      const held = new Set<string>();
+      for (const b of this.ledger.allBlocks.values()) if (!own.has(b.accountId)) held.add(b.accountId);
+      for (const id of held) this.engineResyncAccount(id);
+    }, 7500);
 
     this.status = 'running';
     this.startTime = Date.now();
