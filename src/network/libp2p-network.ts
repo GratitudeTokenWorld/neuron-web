@@ -1421,10 +1421,23 @@ export class Libp2pNetwork extends EventEmitter {
     });
   }
 
+  /**
+   * A cached account record from an EARLIER network generation describes an
+   * account that a reset destroyed. Serving it is how alice's transfer got
+   * signed to generation-7 bob's pub after the generation-8 reset (2026-08-09)
+   * — the username looked valid, the account no longer existed, the funds were
+   * unroutable. Records without a `_gen` stamp are treated as current (legacy).
+   */
+  private isCurrentGeneration(acc: Record<string, unknown>): boolean {
+    return !(typeof acc._gen === 'number' && acc._gen < this.generation);
+  }
+
   async loadAccount(pub: string): Promise<Record<string, unknown> | null> {
     try {
       const result = await this.db.get('accounts', pub);
-      return result ? (result as Record<string, unknown>) : null;
+      if (!result) return null;
+      const acc = result as Record<string, unknown>;
+      return this.isCurrentGeneration(acc) ? acc : null;
     } catch { return null; }
   }
 
@@ -1435,7 +1448,7 @@ export class Libp2pNetwork extends EventEmitter {
       for (const acc of all) {
         // P8: strip plaintext face descriptor on load so old IDB records don't re-gossip it
         const { faceDescriptor: _fd, ...a } = acc as Record<string, unknown> & { faceDescriptor?: unknown };
-        if (a.pub && a.username) map.set(String(a.pub), a);
+        if (a.pub && a.username && this.isCurrentGeneration(a)) map.set(String(a.pub), a);
       }
     } catch { /* empty db is fine */ }
     return map;
@@ -1454,7 +1467,7 @@ export class Libp2pNetwork extends EventEmitter {
       );
       for (const acc of all as Record<string, unknown>[]) {
         const { faceDescriptor: _fd, ...a } = acc as Record<string, unknown> & { faceDescriptor?: unknown };
-        if (a.pub && a.username) map.set(String(a.pub), a);
+        if (a.pub && a.username && this.isCurrentGeneration(a)) map.set(String(a.pub), a);
       }
     } catch { /* index may not exist on old databases - caller falls back to loadAccounts */ }
     return map;

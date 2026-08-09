@@ -1118,13 +1118,20 @@ export class NeuronNode extends EventEmitter {
    */
   async resolveAccount(identifier: string): Promise<string | null> {
     const local = this.ledger.resolveToPublicKey(identifier);
-    if (local) return local;
+    // Trust the local answer only when it is AUTHORITATIVE here: one of our own
+    // accounts, or the identifier already IS a pub (nothing to mis-map). A
+    // cached FOREIGN username mapping must be re-confirmed against the relay
+    // directory before anything routes value by it — a stale entry (network
+    // reset, rename) resolves to an account that no longer exists, which is
+    // exactly how alice's transfer went to generation-7 bob on 2026-08-09.
+    // The cache is still the fallback when no relay answers (isolated dev net).
+    if (local && (this.localKeys.has(local) || looksLikeAccountPub(identifier))) return local;
 
     const query = looksLikeAccountPub(identifier)
       ? { pub: identifier.toLowerCase() }
       : { username: identifier };
     const rec = await resolveAccountFromRelays(this.relayResolveBases(), query, this.ledger.network);
-    if (!rec) return null;
+    if (!rec) return local;
 
     // Same registration path the old gossip handler used — merge into the ledger…
     const account: LedgerAccount & Record<string, unknown> = {
