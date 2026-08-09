@@ -38,7 +38,9 @@ Rules that will save you a debugging session:
 - Relay logs while testing: `ssh ubuntu@<IP> "pm2 logs neuron-relay --lines 50"`.
   Attestations log as `[Attester] personhood attestation acct=…`, archived blocks as
   `[Archive] Stored …` (with `DEBUG_ARCHIVE=1`).
-- Testnet face limit is 3 accounts/face (relay-tunable); mainnet is 1.
+- Testnet face limit is **25** accounts/face (`FACE_MAX_TESTNET`); mainnet is 1.
+  Slots are provisional: a verify that never produces an open block is released
+  after 5 min, so abandoned attempts no longer burn the limit.
 - A 1–2 account network stays at optimistic `confirmed`, not `final` — committee
   finality needs a real validator population. **Not a bug.**
 
@@ -148,7 +150,8 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 1. Third profile: try creating another `alice` (different face if you have a
    volunteer; same face otherwise). **Pass:** rejected — username already attested
    (`6f6317b`, per-human `nid` claim `5befd13`).
-2. Create accounts until the same face exceeds the testnet limit (3).
+2. Create accounts until the same face exceeds the testnet limit (25, or set
+   `FACE_MAX_TESTNET=2` on the relay to make this testable in two accounts).
    **Pass:** attester returns the face-limit error, client shows it cleanly.
 
 ## T7 — Operators & reset (do this LAST)
