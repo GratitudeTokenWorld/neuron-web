@@ -205,13 +205,14 @@ function networkFromTopic(topic) {
 
 /** Archive an engine block seen on gossip (verify before storing). */
 // ── Face-slot accounting (abandoned attempts must not burn a slot) ───────────
-// A verify issues an attestation and consumes one of the human's face slots, but
-// most attempts never become an account: the user cancels, the quorum fails, the
-// camera dies. Those slots used to be gone forever — real testing hit
-// "Face limit reached (25/25)" without ever creating 25 accounts. Each use is now
-// PROVISIONAL until the account's open block is actually archived; unclaimed ones
-// are released after FACE_USE_TTL_MS.
-const pendingFaceUses = new Map();   // accountId → { nid, at, network }
+// A verify issues an attestation and consumes one of the human's face slots AND
+// claims the username, but most attempts never become an account: the user
+// cancels, the quorum fails, the camera dies. Both used to be spent forever —
+// real testing hit "Face limit reached (25/25)" without ever creating 25
+// accounts, and "luk is already registered" for an account that never existed.
+// Both are now PROVISIONAL until the account's open block is actually archived;
+// unclaimed ones are released after FACE_USE_TTL_MS.
+const pendingFaceUses = new Map();   // accountId → { nid, username, at, network }
 const FACE_USE_TTL_MS = 5 * 60 * 1000;
 
 function releaseStaleFaceUses() {
@@ -225,8 +226,16 @@ function releaseStaleFaceUses() {
       faceDbDirty = true;
       console.log(`[Attester] released unused face slot for acct=${String(accountId).slice(0, 12)}… → ${entry.count}`);
     }
+    // Only release the name if it is still held by THIS abandoned attempt.
+    const claim = use.username && usernameRegistry.get(use.username);
+    if (claim && claim.accountId === accountId) {
+      usernameRegistry.delete(use.username);
+      usernameDirty = true;
+      console.log(`[Attester] released unused username "${use.username}"`);
+    }
   }
   if (faceDbDirty) saveFaceDB().catch(() => {});
+  if (usernameDirty) saveUsernames().catch(() => {});
 }
 setInterval(releaseStaleFaceUses, 60_000);
 
@@ -669,7 +678,7 @@ async function main() {
         const commitment = deriveCommitment(nullifier, accountId);
         const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
         console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})${anchor ? ' [countersigned anchor nullifier]' : ''}`);
-        pendingFaceUses.set(accountId, { nid, at: Date.now(), network });   // released if no open block follows
+        pendingFaceUses.set(accountId, { nid, username, at: Date.now(), network });   // released if no open block follows
         if (username) { usernameRegistry.set(username, { accountId, nid }); usernameDirty = true; } // claim for this human
         recordOperator(accountId); // first OPERATOR_COUNT attested accounts become operators
         res.writeHead(200, { 'Content-Type': 'application/json' });
