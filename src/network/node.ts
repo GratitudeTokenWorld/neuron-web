@@ -1,7 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof } from './account-resolver';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -560,9 +560,14 @@ export class NeuronNode extends EventEmitter {
         this.processedInbox.delete(first);
       }
       this.emit('inbox:signal', signal);
-      // Slice 2: pull the sender's chain tail so the send block (and our
-      // auto-receive) arrive even if we don't hold the sender's shard.
-      if (!this.ledger.allBlocks.has(signal.blockHash)) this.engineResyncAccount(signal.sender);
+      // G2: claim via a compact proof packet — the send arrives verified
+      // without pulling or keeping the sender's chain. Falls back to the
+      // chain pull if no relay can serve a packet yet (e.g. its archive is
+      // still catching up on the sender's chain).
+      if (!this.ledger.allBlocks.has(signal.blockHash)) {
+        const proven = await this.claimViaProof(pub, signal.sender, signal.blockHash);
+        if (!proven) this.engineResyncAccount(signal.sender);
+      }
     });
   }
 
@@ -750,20 +755,11 @@ export class NeuronNode extends EventEmitter {
     this.pendingInboundTimer = setInterval(() => {
       for (const pub of this.localKeys.keys()) this.checkPendingInbound(pub);
     }, 60_000);
-    // ALSO refresh every held FOREIGN chain (counterparties we verified before).
-    // A send made while this node was OFFLINE lives on the sender's chain; inbox
-    // gossip is not replayed, so without this pull the new send block never
-    // arrives and the unclaimed-receive sweep has nothing to claim (the
-    // "offline recipient misses transfers" bug, found in TESTPLAN T3). Cost is
-    // O(held accounts) = own + counterparties — scale-invariant-safe. Arriving
-    // blocks flow through handleIncomingEngineBlock → autoReceiveEngine, which
-    // claims pending sends automatically.
-    setTimeout(() => {
-      const own = new Set(this.localKeys.keys());
-      const held = new Set<string>();
-      for (const b of this.ledger.allBlocks.values()) if (!own.has(b.accountId)) held.add(b.accountId);
-      for (const id of held) this.engineResyncAccount(id);
-    }, 7500);
+    // G2: the old "refresh every held FOREIGN chain" startup burst is gone.
+    // Offline sends are discovered by checkPendingInbound (ask the archive
+    // what's addressed to me — O(own inbound)) and claimed via proof packets,
+    // so there is no held-counterparty set to refresh: per-node cost no longer
+    // grows with how many accounts ever paid this node (the merchant case).
 
     this.status = 'running';
     this.startTime = Date.now();
@@ -1163,13 +1159,38 @@ export class NeuronNode extends EventEmitter {
   private async checkPendingInbound(pub: string): Promise<void> {
     try {
       const hints = await fetchPendingSends(this.relayResolveBases(), pub, this.ledger.network);
-      const senders = new Set<string>();
       for (const h of hints) {
         // Already holding the send block ⇒ claimed (or about to be) — skip.
-        if (!this.ledger.allBlocks.has(h.blockHash)) senders.add(h.sender);
+        if (this.ledger.allBlocks.has(h.blockHash)) continue;
+        // G2: payments claim via a compact proof packet — no sender chain held.
+        // NFTs (mint record needed) and proof failures fall back to the pull.
+        const proven = h.type === 'send' && await this.claimViaProof(pub, h.sender, h.blockHash);
+        if (!proven) this.engineResyncAccount(h.sender);
       }
-      for (const sender of senders) this.engineResyncAccount(sender);
     } catch { /* best-effort — the 60s backstop retries */ }
+  }
+
+  /**
+   * G2 — claim a payment from a counterparty proof packet instead of pulling
+   * and keeping the sender's chain (`sim/counterparty.ts` measures the gap:
+   * ~3.4 KB flat vs an O(chain) pull). Fetch packet → ledger verifies it fully
+   * (verified-human genesis, signed head, send inclusion) and registers JUST
+   * the send → the normal challenge-window claim path runs (autoReceiveEngine:
+   * wait, check the sender wasn't proven fraudulent, receive). During the
+   * window we subscribe the sender's shard so archive-published conflict
+   * evidence reaches us — detection itself needs no chain (fraud.ts evidence is
+   * self-verifying).
+   */
+  private async claimViaProof(recipientPub: string, senderId: string, sendBlockHash: string): Promise<boolean> {
+    try {
+      const packet = await fetchHeadProof(this.relayResolveBases(), senderId, sendBlockHash, this.ledger.network);
+      if (!packet || packet.sendBlock.hash !== sendBlockHash) return false;
+      const reg = this.ledger.registerVerifiedSend(packet, recipientPub);
+      if (!reg.ok) return reg.error === 'already claimed'; // claimed ⇒ nothing left to do
+      this.net.subscribeEngineShard(this.ledger.getShardOf(senderId)); // fraud-evidence watch
+      await this.autoReceiveEngine(packet.sendBlock);
+      return true;
+    } catch { return false; }
   }
 
   private async checkRelayLiveness(): Promise<void> {

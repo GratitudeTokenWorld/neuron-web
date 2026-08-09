@@ -48,6 +48,7 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // (via topic mirroring) and serves delta requests, so account chains are durably
 // held even when light clients holding a shard go offline.
 import { decodeBlock, verifyBlock } from '../src/engine/core/block.js';
+import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 
 // gossipsub 14.x ↔ libp2p 3.x interop shims (fixes A/B/C) — now shared with the
 // BROWSER build, which needs them just as much (clients could send but never
@@ -185,6 +186,27 @@ async function saveFaceDB() {
 // holder so accounts recover even if every light client holding a shard is gone.
 const engineBlockStore = new Map();
 let engineStoreDirty = false;
+// `${network}:${accountId}:${index}` → hash. Two DIFFERENT hashes at one height
+// = a double-spend. With G2 proof-claims, recipients no longer hold sender
+// chains, so the archive tier (which does) is where forks get noticed — on
+// detection the relay gossips both blocks on the shard's conflict topic and
+// every client freezes the equivocator via its own verification (fraud.ts).
+const engineHeightIndex = new Map();
+// Set in main() once pubsub exists: (network, shard, aHex, bHex) => void.
+let publishConflict = null;
+
+/** Height-index a stored row; publish conflict evidence if a sibling exists. */
+function indexEngineRow(row) {
+  const hkey = `${row.network}:${row.accountId}:${row.index}`;
+  const prior = engineHeightIndex.get(hkey);
+  if (prior && prior !== row.hash) {
+    const sibling = engineBlockStore.get(prior);
+    console.log(`[Archive] CONFLICT acct=${row.accountId.slice(0, 12)}… idx=${row.index} — publishing evidence`);
+    if (sibling && publishConflict) publishConflict(row.network, row.shard, sibling.blockHex, row.blockHex);
+    return;
+  }
+  engineHeightIndex.set(hkey, row.hash);
+}
 
 async function loadEngineBlocks() {
   try {
@@ -198,6 +220,7 @@ async function loadEngineBlocks() {
         if (block.hash !== r.hash || !verifyBlock(block)) { dropped++; continue; }
       } catch { dropped++; continue; }
       engineBlockStore.set(r.hash, r);
+      indexEngineRow(r);
     }
     console.log(`[Archive] Loaded ${engineBlockStore.size} engine block(s)${dropped ? ` (dropped ${dropped} invalid)` : ''}`);
   } catch { /* no archive yet */ }
@@ -262,13 +285,15 @@ function archiveEngineBlock(blockHex, network) {
   try { block = decodeBlock(hexToBytes(blockHex)); } catch { return; }
   if (!verifyBlock(block)) return;
   if (engineBlockStore.has(block.hash)) return;
-  engineBlockStore.set(block.hash, {
+  const row = {
     hash: block.hash, accountId: block.accountId, index: block.index,
     shard: block.shard, network, blockHex,
     // Denormalized so /pending-sends can scan without decoding every row.
     // Rows archived before this landed lack them — that scan decodes on demand.
     type: block.type, recipient: block.recipient,
-  });
+  };
+  engineBlockStore.set(block.hash, row);
+  indexEngineRow(row);
   engineStoreDirty = true;
   // The account exists — its face slot is now permanent.
   if (block.type === 'open') pendingFaceUses.delete(block.accountId);
@@ -647,6 +672,42 @@ async function main() {
         res.writeHead(found ? 200 : 404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify(found ? { blockHex: row.blockHex } : { error: 'not found' }));
 
+      } else if (req.url?.startsWith('/head-proof?')) {
+        // G2: serve a counterparty proof packet for one transfer, built from
+        // the archived chain — { open, head, send } blocks (hex) + RFC-6962
+        // audit paths tying open (leaf 0) and the send into the head's
+        // accumulator root. The recipient verifies everything against the
+        // sender's own signatures, claims, and holds NOTHING of the chain —
+        // O(log n) instead of the O(n) chain pull. Untrusted endpoint: a bad
+        // packet simply fails client verification.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const pub = String(q.get('pub') || '');
+        const send = String(q.get('send') || '');
+        const rows = [...engineBlockStore.values()]
+          .filter(r => r.accountId === pub && r.network === network)
+          .sort((a, b) => a.index - b.index);
+        // The proof needs the FULL contiguous chain 0..head (the accumulator
+        // commits every leaf). Forked/gappy archives refuse — the client falls
+        // back to the chain-pull path, where conflicts surface as evidence.
+        const contiguous = rows.length > 0 && rows.every((r, i) => r.index === i);
+        const sendRow = rows.find(r => r.hash === send);
+        if (!contiguous || !sendRow) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'chain incomplete or send unknown' }));
+        } else {
+          const acc = new AccountAccumulator();
+          for (const r of rows) acc.append(r.hash);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({
+            openHex: rows[0].blockHex,
+            headHex: rows[rows.length - 1].blockHex,
+            sendHex: sendRow.blockHex,
+            openProof: acc.proofHex(0),
+            sendProof: acc.proofHex(sendRow.index),
+          }));
+        }
+
       } else if (req.url?.startsWith('/pending-sends?')) {
         // G1 follow-up — offline-transfer discovery. A recipient that was
         // offline (or fully wiped + recovered) asks the archive which send /
@@ -993,6 +1054,13 @@ async function main() {
   const pubsub = node.services.pubsub;
   const NUM_SYNAPSES = 4;
 
+  // G2: the archive is where same-height forks are noticed once recipients stop
+  // holding sender chains — arm the conflict publisher (see indexEngineRow).
+  publishConflict = (network, shard, aHex, bHex) => {
+    const topic = `neuronchain/${PROTOCOL_VERSION}/${network}/engine-conflict/${shard}`;
+    pubsub.publish(topic, new TextEncoder().encode(JSON.stringify({ a: aHex, b: bHex }))).catch(() => {});
+  };
+
   // Prototype-level fix applied at module load (see top of file).
   // AbstractMessageStream.prototype now has .source and .sink so it-pipe
   // treats every stream as a duplex and gossipsub outbound streams form correctly.
@@ -1137,6 +1205,7 @@ async function main() {
           engineVerify(String(m.signature || ''), `reset:${m.generation}:${m.resetAt}`, m.operatorPub);
         if (!ok) { console.log('[Archive] Ignored reset — not an authorized operator'); return; }
         engineBlockStore.clear(); engineStoreDirty = true;
+        engineHeightIndex.clear();                            // conflict index follows the archive
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names
         accountStore.clear(); accountsDirty = true;           // wipe the directory too

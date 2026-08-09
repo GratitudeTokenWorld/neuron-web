@@ -1,11 +1,15 @@
 import { generateKeyPair, type KeyPair } from '../core/keys.js';
-import { AccountAccumulator, verifyInclusion } from '../core/accumulator.js';
-import { createOpenBlock, createBlock, verifyBlock, MINT_AMOUNT, type Block } from '../core/block.js';
+import { AccountAccumulator } from '../core/accumulator.js';
+import { createOpenBlock, createBlock, MINT_AMOUNT, type Block } from '../core/block.js';
 import { createAttestation } from '../core/attestation.js';
-import type { QuorumPolicy } from '../core/attestation.js';
 import { deriveCommitment } from '../core/identity.js';
-import { verifyAccountHead } from '../core/light-verify.js';
+import { buildPacketFromChain, type CounterpartyPacket } from '../core/counterparty-proof.js';
 import { canonicalJson, utf8ToBytes, type Hex } from '../core/hash.js';
+
+// The packet type + verifier were promoted into the engine proper
+// (core/counterparty-proof.ts) when G2 was implemented; the sim re-exports
+// them so the measurement harness and tests keep one import site.
+export { verifyPacket, buildPacketFromChain, type CounterpartyPacket, type PacketVerification } from '../core/counterparty-proof.js';
 
 /**
  * G2 measured: counterparty verification by PROOF instead of chain replication.
@@ -28,19 +32,6 @@ import { canonicalJson, utf8ToBytes, type Hex } from '../core/hash.js';
  * O(1). This module builds real signed chains, real RFC-6962 proofs, and measures
  * both paths so the gap is a number, not an argument.
  */
-
-export interface CounterpartyPacket {
-  /** Sender's genesis — carries the identity commitment + attestation quorum. */
-  openBlock: Block;
-  /** Sender's current head — its accumulatorRoot commits the whole history. */
-  headBlock: Block;
-  /** Audit path: openBlock is leaf 0 under headBlock.accumulatorRoot. */
-  openInclusionProof: Hex[];
-  /** The payment being claimed. */
-  sendBlock: Block;
-  /** Audit path: sendBlock is leaf `sendBlock.index` under the same root. */
-  sendInclusionProof: Hex[];
-}
 
 export interface SenderChain {
   keys: KeyPair;
@@ -98,57 +89,7 @@ export function buildSenderChain(length: number, sendIndex: number, recipient: H
 
 /** What a super-node holding the sender's chain would serve to the recipient. */
 export function buildPacket(chain: SenderChain, sendIndex: number): CounterpartyPacket {
-  return {
-    openBlock: chain.blocks[0]!,
-    headBlock: chain.blocks[chain.blocks.length - 1]!,
-    openInclusionProof: chain.accumulator.proofHex(0),
-    sendBlock: chain.blocks[sendIndex]!,
-    sendInclusionProof: chain.accumulator.proofHex(sendIndex),
-  };
-}
-
-export interface PacketVerification {
-  ok: boolean;
-  reason?: string;
-}
-
-/**
- * The recipient's full check, holding NOTHING of the sender beforehand:
- * chain authenticity + verified-human genesis + the payment's inclusion.
- */
-export function verifyPacket(
-  packet: CounterpartyPacket,
-  recipient: Hex,
-  identityPolicy: QuorumPolicy,
-): PacketVerification {
-  const head = verifyAccountHead(
-    {
-      openBlock: packet.openBlock,
-      headBlock: packet.headBlock,
-      openInclusionProof: packet.openInclusionProof,
-    },
-    identityPolicy,
-  );
-  if (!head.ok) return { ok: false, reason: `head: ${head.reason}` };
-
-  const send = packet.sendBlock;
-  if (send.type !== 'send') return { ok: false, reason: 'packet block is not a send' };
-  if (send.accountId !== packet.headBlock.accountId) {
-    return { ok: false, reason: 'send block belongs to a different account' };
-  }
-  if (send.recipient !== recipient) return { ok: false, reason: 'send is not addressed to this recipient' };
-  if (!verifyBlock(send)) return { ok: false, reason: 'send block failed signature/hash check' };
-
-  const treeSize = packet.headBlock.index + 1;
-  const included = verifyInclusion(
-    packet.headBlock.accumulatorRoot,
-    send.hash,
-    send.index,
-    treeSize,
-    packet.sendInclusionProof,
-  );
-  if (!included) return { ok: false, reason: 'send block is not committed by the head accumulator root' };
-  return { ok: true };
+  return buildPacketFromChain(chain.blocks, chain.blocks[sendIndex]!.hash)!;
 }
 
 /** Canonical on-wire size of any JSON-able value (bigint-safe via canonicalJson). */

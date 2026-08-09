@@ -9,6 +9,7 @@ import {
   type Block,
 } from '../engine/core/block.js';
 import { AccountAccumulator } from '../engine/core/accumulator.js';
+import { buildPacketFromChain, verifyPacket, type CounterpartyPacket } from '../engine/core/counterparty-proof.js';
 import { checkQuorum, type TypedAttestation, type QuorumPolicy } from '../engine/core/attestation.js';
 import { InMemoryIdentityRegistry, deriveCommitment, type Nullifier } from '../engine/core/identity.js';
 import { getShard, DEFAULT_NUM_SHARDS } from '../engine/core/partition.js';
@@ -669,6 +670,52 @@ export class EngineLedger extends EventEmitter {
     this.emit('block:added', block);
     this.emit('block:confirmed', block);
     return { success: true };
+  }
+
+  // ── G2: counterparty proof packets (claim without holding the chain) ─────────
+
+  /**
+   * Serve a proof packet for a transfer on a chain this node holds — what a
+   * super-node (or any peer still holding the chain) answers a recipient with.
+   */
+  buildCounterpartyPacket(senderPub: string, sendHash: string): CounterpartyPacket | null {
+    const h = this.held.get(senderPub);
+    if (!h || h.chain.length === 0) return null;
+    return buildPacketFromChain(h.chain, sendHash);
+  }
+
+  /**
+   * G2 receive path: register a transfer PROVEN by a counterparty packet so the
+   * normal claim path (`createReceive`) can run — without ever holding the
+   * sender's chain. Verifies the whole packet (verified-human genesis, signed
+   * head, inclusion of the send) and then registers exactly ONE block: the
+   * send. Per-counterparty cost is O(log sender-chain), not O(chain) — the
+   * scale fix `sim/counterparty.ts` measures (ARCHITECTURE.md → G2).
+   *
+   * NFT transfers (`nft-send`) verify identically, but the claim additionally
+   * needs the token's MINT record for info/display, which lives on the
+   * minter's chain — so the node keeps NFT claims on the chain-pull path until
+   * the archive serves token records too. Payments take the proof path.
+   */
+  registerVerifiedSend(packet: CounterpartyPacket, recipientPub: string): { ok: boolean; error?: string } {
+    const send = packet.sendBlock;
+    if (this.equivocated.has(send.accountId)) return { ok: false, error: 'sender equivocated' };
+    const v = verifyPacket(packet, recipientPub, this.identityPolicy);
+    if (!v.ok) return { ok: false, error: v.reason };
+    if (send.type !== 'send') return { ok: false, error: 'only payment sends claim via proof' };
+    if (this.claimedSends.has(send.hash)) return { ok: false, error: 'already claimed' };
+
+    // Register JUST the send (O(1)) — never the chain. The head/open blocks are
+    // verification inputs only and are dropped with the packet.
+    this.allBlocks.set(send.hash, send);
+    if (!this.unclaimedSends.has(send.hash)) {
+      this.unclaimedSends.set(send.hash, {
+        fromPub: send.accountId,
+        toPub: recipientPub,
+        amount: Number(send.amount ?? 0),
+      });
+    }
+    return { ok: true };
   }
 
   // ── Fraud-proof conflict safety (Phase 2) ────────────────────────────────────

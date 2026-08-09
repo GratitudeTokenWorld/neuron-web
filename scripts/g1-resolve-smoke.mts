@@ -28,7 +28,8 @@ import { generateKeyPair, sign } from '../src/engine/core/keys.js';
 import { encodeBlock } from '../src/engine/core/block.js';
 import { bytesToHex } from '../src/engine/core/hash.js';
 import { buildSenderChain } from '../src/engine/sim/counterparty.js';
-import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, fetchPendingSends, type AccountRecord } from '../src/network/account-resolver.js';
+import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, fetchPendingSends, fetchHeadProof, type AccountRecord } from '../src/network/account-resolver.js';
+import { verifyPacket } from '../src/engine/core/counterparty-proof.js';
 
 const RELAYS = [
   { name: 'relay-1', dial: '/ip4/80.97.27.224/tcp/9091/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh', http: 'http://80.97.27.224:9092' },
@@ -123,6 +124,28 @@ for (const r of RELAYS) {
 }
 const none = await fetchPendingSends(RELAYS.map((r) => r.http), generateKeyPair().pub, 'testnet');
 check(none.length === 0, 'an account with no inbound sends gets an empty pending list');
+
+// ── G2: counterparty proof packet (/head-proof) ─────────────────────────────
+// The recipient claims from a compact packet the archive builds — verified
+// end-to-end here exactly as the client ledger verifies it. No chain pull.
+const senderId = chain.blocks[0]!.accountId;
+const sendHash = chain.blocks[2]!.hash;
+for (const r of RELAYS) {
+  const packet = await fetchHeadProof([r.http], senderId, sendHash, 'testnet');
+  const verdict = packet ? verifyPacket(packet, recipient, { min: 1, requiredTypes: ['personhood'] }) : { ok: false, reason: 'no packet' };
+  check(verdict.ok === true, `${r.name} serves a proof packet that verifies for the recipient (${verdict.reason ?? 'ok'})`);
+  if (packet) {
+    check(
+      packet.headBlock.index === chain.blocks.length - 1 && packet.sendBlock.hash === sendHash,
+      `${r.name} packet spans the full chain head and the exact send`,
+    );
+  }
+}
+// Unknown send hash → no packet.
+check(
+  (await fetchHeadProof(RELAYS.map((r) => r.http), senderId, 'ab'.repeat(32), 'testnet')) === null,
+  'unknown send hash yields no packet',
+);
 
 await node.stop();
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

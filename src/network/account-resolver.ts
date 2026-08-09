@@ -1,6 +1,7 @@
 import { verify as engineVerify } from '../engine/core/keys';
 import { decodeBlock, verifyBlock, type Block } from '../engine/core/block';
-import { hexToBytes } from '../engine/core/hash';
+import { hexToBytes, type Hex } from '../engine/core/hash';
+import type { CounterpartyPacket } from '../engine/core/counterparty-proof';
 
 /**
  * G1 fix — on-demand account/username resolution (client side).
@@ -166,6 +167,51 @@ export async function fetchPendingSends(
     }
   }
   return [...byHash.values()];
+}
+
+/**
+ * G2 — fetch a counterparty proof packet (GET /head-proof) from the relays'
+ * archives: the sender's open + head + the send (hex) with the two RFC-6962
+ * audit paths. Decoded here; VERIFICATION happens in the ledger
+ * (registerVerifiedSend → verifyPacket), so a lying relay only wastes a fetch.
+ * Returns the first packet that decodes; null if no relay can serve one (the
+ * caller falls back to the chain-pull path).
+ */
+export async function fetchHeadProof(
+  bases: readonly string[],
+  senderId: string,
+  sendBlockHash: string,
+  network: string,
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<CounterpartyPacket | null> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(
+        `${base}/head-proof?pub=${encodeURIComponent(senderId)}&send=${encodeURIComponent(sendBlockHash)}&network=${encodeURIComponent(network)}`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) throw new Error(`head-proof ${res.status}`);
+      return (await res.json()) as {
+        openHex?: string; headHex?: string; sendHex?: string; openProof?: Hex[]; sendProof?: Hex[];
+      };
+    }),
+  );
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    const p = r.value;
+    if (!p?.openHex || !p.headHex || !p.sendHex || !Array.isArray(p.openProof) || !Array.isArray(p.sendProof)) continue;
+    try {
+      return {
+        openBlock: decodeBlock(hexToBytes(p.openHex)),
+        headBlock: decodeBlock(hexToBytes(p.headHex)),
+        sendBlock: decodeBlock(hexToBytes(p.sendHex)),
+        openInclusionProof: p.openProof,
+        sendInclusionProof: p.sendProof,
+      };
+    } catch { /* malformed — try the next relay */ }
+  }
+  return null;
 }
 
 /**
