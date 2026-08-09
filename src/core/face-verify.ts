@@ -570,7 +570,7 @@ export async function detectChallenge(
   // a jaw drop. Fractions of inter-eye distance; tightened 15% + 10% after real
   // runs passed too easily.
   const SMILE_LIFT_DELTA = 0.0175;
-  const SMILE_WIDTH_DELTA = 0.0437;
+  const SMILE_WIDTH_DELTA = 0.0550;
   // Jaw drop: lip gap / mouth width, over the calibrated neutral. Neutral sits
   // near 0.1, a deliberate open mouth clears 0.4 — enormous margin.
   const MOUTH_OPEN_DELTA = 0.22;
@@ -596,10 +596,24 @@ export async function detectChallenge(
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
-  const CLOSE_HOLD_MS = 400;
+  const CLOSE_HOLD_MS = 500;
+  /** How far back the rolling open-eye reference looks. */
+  const OPEN_REF_MS = 3000;
   let earBelowCount = 0;
   let sawEyesOpen = false;
   const earWindow: { t: number; ear: number }[] = [];
+  // Every action must be HELD, not merely touched. Jitter crosses a threshold
+  // for one frame; a deliberate expression stays there. This is what stops the
+  // checks feeling "too sensitive" without making them physically harder — the
+  // bar to clear is unchanged, it just has to be sustained.
+  const SUSTAIN_MS = 320;
+  let metSince = 0;
+  const sustained = (met: boolean): boolean => {
+    const t = Date.now();
+    if (!met) { metSince = 0; return false; }
+    if (!metSince) metSince = t;
+    return t - metSince >= SUSTAIN_MS;
+  };
   let browNeutral = 0;
   let earSdNeutral = 0;
   // Calibrated neutrals (filled during the calibration frames).
@@ -765,7 +779,7 @@ export async function detectChallenge(
       const rotationDominates = delta >= ROTATION_MARGIN * explained;
       const agree = Math.sign(signed) === Math.sign(skewΔ);
       debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} explains=${explained.toFixed(4)} agree=${agree}`);
-      if (delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree && stayedPut && rotationDominates) {
+      if (sustained(delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree && stayedPut && rotationDominates)) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
         return true;
       }
@@ -795,7 +809,7 @@ export async function detectChallenge(
       // BOTH must move: corners up AND mouth wider. Either alone is something
       // else — a jaw drop widens nothing, and raised corners with no widening is
       // usually the head tilting.
-      if (liftΔ >= SMILE_LIFT_DELTA && widthΔ >= SMILE_WIDTH_DELTA) {
+      if (sustained(liftΔ >= SMILE_LIFT_DELTA && widthΔ >= SMILE_WIDTH_DELTA)) {
         onStatus?.({ label: 'Smile detected', guide: 'smile', left: 100, right: 100, state: 'ok' });
         return true;
       }
@@ -808,7 +822,7 @@ export async function detectChallenge(
     } else if (type === 'mouth-open') {
       const openΔ = mouthMetrics(pts).open - openNeutral;
       debugMetrics(`mouth openΔ=${openΔ.toFixed(3)}/${MOUTH_OPEN_DELTA}`);
-      if (openΔ >= MOUTH_OPEN_DELTA) {
+      if (sustained(openΔ >= MOUTH_OPEN_DELTA)) {
         onStatus?.({ label: 'Mouth open detected', guide: 'mouth', left: 100, right: 100, state: 'ok' });
         return true;
       }
@@ -818,7 +832,7 @@ export async function detectChallenge(
     } else if (type === 'raise-brows') {
       const browΔ = browLift(pts) - browNeutral;
       debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA}`);
-      if (browΔ >= BROW_DELTA) {
+      if (sustained(browΔ >= BROW_DELTA)) {
         onStatus?.({ label: 'Eyebrows detected', guide: 'brow', left: 100, right: 100, state: 'ok' });
         return true;
       }
@@ -835,23 +849,34 @@ export async function detectChallenge(
       // window's span was always just under it by construction, so the
       // "held long enough" test could never fire — the check was unpassable
       // however long the eyes stayed shut (observed: span stuck at ~330ms).
-      while (earWindow.length && now - earWindow[0].t > CLOSE_HOLD_MS * 2) earWindow.shift();
+      while (earWindow.length && now - earWindow[0].t > OPEN_REF_MS) earWindow.shift();
 
       // Threshold from the MEASURED jitter, not a guessed factor. Measured on
       // real hardware: closed 0.296 vs open 0.314 is only 5.9% per frame — buried
       // in noise — but averaging the hold window shrinks that noise by sqrt(n)
       // and the same gap becomes ~4.8 sigma. So the test is on the WINDOW MEAN.
-      const margin = Math.max(2.0 * (earSdNeutral || 0.008), 0.010);
-      const closedBelow = (earOpen || 0.30) - margin;
+      // Reference the RECENT open eye, not the enrollment baseline. Measured:
+      // EAR drifts ~0.05 across a session with head pose and distance, while a
+      // real closure moves it only ~0.017 — so a fixed baseline goes stale and
+      // ordinary drift crosses the line on its own. That is the "passes
+      // instantly with your eyes open" case, caught in a real trace at
+      // mean=0.311 vs a 0.314 threshold. The 80th percentile of the last few
+      // seconds tracks drift while ignoring the closure itself.
+      const openHist = earWindow.filter(e => now - e.t <= OPEN_REF_MS).map(e => e.ear).sort((a, b) => a - b);
+      const openRef = openHist.length >= 6
+        ? openHist[Math.floor(openHist.length * 0.8)]
+        : (earOpen || 0.30);
+      const margin = Math.max(3.0 * (earSdNeutral || 0.008), 0.015);
+      const closedBelow = openRef - margin;
       if (ear >= closedBelow + margin * 0.5) sawEyesOpen = true;   // clearly open first
 
       // Mean over the LAST CLOSE_HOLD_MS, but only once the buffer actually
       // covers that much history.
       const recent = earWindow.filter(e => now - e.t <= CLOSE_HOLD_MS);
-      const span = earWindow.length ? now - earWindow[0].t : 0;
+      const span = recent.length ? now - recent[0].t : 0;
       const windowMean = recent.reduce((a, b) => a + b.ear, 0) / (recent.length || 1);
       const held = span >= CLOSE_HOLD_MS && recent.length >= 4;
-      debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
+      debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
 
       if (sawEyesOpen && held && windowMean <= closedBelow) {
         onStatus?.({ label: 'Eyes closed detected', guide: 'eyes', left: 100, right: 100, state: 'ok' });
