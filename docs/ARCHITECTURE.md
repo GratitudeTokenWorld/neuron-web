@@ -528,6 +528,35 @@ component in the system.
 
 ---
 
+## Where this stands (updated 2026-08-09)
+
+Phase status against the plan below, and what a new session should pick up.
+
+| Phase | State | Evidence |
+|---|---|---|
+| 0 — Foundations | **done** | `src/engine/core` — accumulator, light-verify, identity/nullifier, attestations, partition |
+| 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
+| 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
+| 3 — Storage CDN + tiered nodes | **engine built, NOT wired** | `src/engine/content` exists; `storage-manager.ts` still on the legacy `DAGLedger`, `EngineLedger.createStorage*` are `deferred()` stubs |
+| 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
+| Verification (below) | **never run** | `src/engine/sim` harness exists; the 10x/100x/1000x flat-cost proof has not been executed |
+
+The manual E2E matrix (TESTPLAN T1-T6) passed on the two-relay dev network on
+2026-08-09; T7 (operator reset) was skipped by decision as a dev-mode affordance.
+
+**Recommended next step: run the simulation first.** It is already built, it is
+the cheapest step, and it converts "G1 is a known violation" into a measured
+curve — which then says whether G1 or G2 is the real bottleneck and gives a
+before/after number to prove a fix worked. Implementing G1 first means rewriting
+username resolution with no baseline to compare against.
+
+Then, in order: **G1** (global `accounts` topic — fails first), **G2**
+(counterparty chain replication), **Phase 3 wiring**, **Phase 4**. The migration
+seam (~182 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
+caller, as each one is moved off the `DAGLedger` compatibility surface.
+
+---
+
 ## Migration phases (for the new build)
 
 Each phase is independently benchmarkable; do not advance until its invariant holds.

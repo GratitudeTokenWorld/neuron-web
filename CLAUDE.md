@@ -38,8 +38,20 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **197 tests / 47 files passing**, `npm run build` clean.
+Current baseline: **199 tests / 47 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
+
+## Where to pick up (as of 2026-08-09)
+
+The manual E2E matrix passed end to end on the two-relay dev network
+(TESTPLAN T1–T6; T7 skipped by decision). Face enrollment, 2-of-2 attestation,
+cross-relay sync, transfers both ways incl. offline claim, NFT mint/transfer/
+burn/reload, recovery-after-wipe and the uniqueness+face limits all work.
+
+**Next up is the architecture work, not more app fixes.** Phase status and the
+recommended order live in ARCHITECTURE.md → *Where this stands*. Short version:
+run the `src/engine/sim` harness first to get a measured baseline, then fix
+**G1** (global `accounts` topic), then **G2** (counterparty chain replication).
 
 `vitest.config.ts` is deliberately separate from `vite.config.ts` so the test run does
 not load the libp2p plugin (which spawns a relay).
@@ -103,8 +115,30 @@ Changes here need adversarial tests, not just happy-path ones.
   `REQUIRED_ATTESTERS` is build-aware (1 for `LOCAL_ONLY` dev, 2 for production).
   The single-attester SPOF is a **known, deferred** risk — quorum + federation is the
   fix (ARCHITECTURE.md → Subsystem 5).
+- **Face capture / liveness** (`src/core/face-verify.ts`). Every threshold there is
+  derived from measured `neuron_debug` traces, not geometry — the numbers and the
+  reasoning are in the comments beside each one. **Do not retune from intuition:**
+  get a trace (`localStorage.neuron_debug = '1'`, run an enrollment, read the
+  `[face]` lines), compute rest-vs-action separation, and set the threshold from
+  the data. Three traps that have each bitten more than once:
+  - *Bar and test measuring different things.* A progress bar that divides by a
+    different reference than the pass condition reads "nearly there" while the
+    check can never fire. Fixed twice (close-eyes, head turn).
+  - *A rolling reference fed by frames that are part of the action.* It chases the
+    action, the threshold runs away, and the check becomes unpassable. Feed a
+    reference only from frames that are clearly NOT the action.
+  - *Time-based windows assume ~16 fps* (60 ms poll). On slow hardware a "400 ms
+    window" holds one frame and the √n noise averaging silently stops working.
+  Detection uses `detectAllFaces` everywhere and aborts on >1 face:
+  `detectSingleFace` does **not** fail on two faces, it returns the highest-scoring
+  one — which let a photo held beside a real head supply the enrolled descriptor.
 - **Consensus.** Fraud-proof safety + ECVRF committee finality. Don't weaken the
   challenge window, slashing, or equivocation freezing.
+- **Cross-account replay order.** Persisted blocks are replayed sorted
+  accountId-then-index, so a recipient's chain may load before the sender's.
+  Anything that validates against another account's block must tolerate arriving
+  first (see the NFT mint/receive guards in `engine-ledger.ts`), or a reload
+  silently drops state and truncates the chain behind it.
 - **Secrets.** `.relay-*` files (attester key, signing key, face DB, operator list) and
   `*.openrc` are gitignored and contain live secrets/biometrics. Never commit, print,
   or copy them into docs or logs.
@@ -172,3 +206,8 @@ There is **no contract VM** — "smart contract" testing means the native-NFT su
 - Engine modules are pure and dependency-light (`@noble/*` crypto only) so they stay
   testable in Node without a browser. Keep browser/libp2p concerns in `src/network`.
 - The relay is `.ts` run via `tsx`; there is no separate build step for it.
+  ⚠ `relay/` is covered by **neither** `npm run typecheck` (engine only) nor any
+  test — an undefined variable in a 60 s timer once crash-looped both cloud boxes
+  47 times before anyone noticed. Re-read relay edits carefully, and after
+  deploying check `pm2 jlist` restart counts **after** the interval has fired
+  (>60 s), not immediately.
