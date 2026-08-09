@@ -1210,7 +1210,15 @@ export async function detectChallenge(
       // You cannot watch a progress bar with your eyes shut, so the bar is only
       // for the approach; the confirmation is what matters and it is announced
       // (with a tone) the moment it lands.
-      const depth = earOpen > 0 ? (earOpen - windowMean) / margin : 0;
+      // Measured against openRef — the SAME reference the pass test uses — not
+      // the calibration baseline. earOpen is a single snapshot from setup, and
+      // EAR drifts downward across a session with pose and distance (measured
+      // 0.333 at calibration against 0.312 a few seconds later, eyes wide open).
+      // Dividing that drift by the margin put the bar at 99% on open eyes while
+      // the test, correctly using the rolling reference, refused to fire — a bar
+      // that says "nearly there" while nothing is happening. Bar and test must
+      // read the same number or one of them is lying.
+      const depth = openRef > 0 ? (openRef - windowMean) / margin : 0;
       const pct = Math.max(0, Math.min(99, Math.round(depth * Math.min(1, span / CLOSE_HOLD_MS) * 100)));
       // Feed the reference ONLY with frames that are not part of a closure —
       // otherwise a long hold drags the reference down to meet the closure and
