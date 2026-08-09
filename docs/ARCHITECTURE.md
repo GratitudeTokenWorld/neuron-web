@@ -743,6 +743,16 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   `sim/directory.ts` (328 B record, flat per client). *At scale* the relay
   `/resolve` call is replaced by DHT `findProviders` — the call site
   (`account-resolver.ts`) is the seam; the record format doesn't change.
+- **Follow-up fix (same day): offline-transfer discovery.** The offline-claim
+  path had been free-riding on the removed firehose — a recovered device
+  learned every account that existed, and the startup refresh then pulled
+  every chain, which is how sends made while the recipient was offline (or
+  wiped) were found *by accident*. Interest-scoped replacement: relays answer
+  **`GET /pending-sends?pub=`** from the engine-block archive (rows carry
+  denormalized `type`+`recipient`); the client asks on startup, on recovery,
+  and on a 60 s backstop, then pulls each unknown sender's chain through the
+  existing verified delta path. O(own inbound); the relay's answer is a hint,
+  never trusted state.
 
 **G2 — Counterparty verification replicates whole chains.**
 A recipient pulls the sender's **entire account chain** to verify one payment

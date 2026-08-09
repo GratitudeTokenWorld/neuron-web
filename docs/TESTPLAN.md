@@ -142,6 +142,18 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 3. **Offline-recipient variant:** close B entirely; A sends another 1,000. Reopen B
    after a minute. **Pass:** the sweep claims the pending send on startup — balance
    includes it.
+   > **How this works post-G1:** the client asks the relays
+   > `GET /pending-sends?pub=<bob>&network=testnet` on startup / recovery / every
+   > 60 s, then delta-pulls each reported sender's chain (fully verified — the
+   > relay's answer is only a hint). Probe it directly with curl if a claim
+   > seems stuck. The pre-G1 build found offline sends only by accident: the
+   > O(N) accounts firehose taught every device every account, and the startup
+   > refresh pulled every chain.
+   **Wiped-recipient variant (the 2026-08-09 regression):** close B, A sends,
+   then recover bob in a FRESH private window (full wipe). **Pass:** after
+   recovery, bob's balance includes the pending send within ~90 s (recovery
+   `/pending-sends` check + delta pull + challenge window + sweep), and the
+   send's TX appears in bob's explorer (he now holds alice's chain).
 4. Reload both browsers. **Pass:** balances identical after reload (claims are
    on-chain, not local state).
 5. **Double-spend guard (fraud proofs):** nothing to do manually — but if a balance
