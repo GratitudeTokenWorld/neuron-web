@@ -55,7 +55,9 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    green bar, a rising tone, and a wireframe guide over the (mirrored) feed.
    The feed is 90% of viewport width on mobile and 50% of viewport height on PC. It runs a **setup stage** first — frame your
    head ("move closer" / "move back" / "hold your head level"), then a
-   **three-leg depth sweep: closer → back → closer**, which dials in the distance
+   **three-leg depth sweep: closer → back → closer** — a white inner ring tracks
+   your distance and lands exactly on the dashed target oval at 100% (and
+   shrinks back on the "move back" leg) — which dials in the distance
    *and* proves the face is three-dimensional (the perspective must reverse on
    demand, three times); exactly one face must be in shot throughout — then
    a **"relax your face"** baseline taken at that settled distance, then **five
