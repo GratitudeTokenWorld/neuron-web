@@ -677,10 +677,21 @@ async function main() {
         // commitment that binds this human (nullifier) to this account (accountId).
         // The per-account nullifier is `<nid>#<index>`, so up to faceMax accounts per
         // face get distinct, globally-unique nullifiers (testnet=3; mainnet=1).
-        const nullifier = `${nid}#${faceCount}`;
+        //
+        // Multi-attester (k-of-N): every attester has its OWN face DB, so its own nid —
+        // but the engine verifies all attestations against ONE commitment derived from
+        // the block's single nullifier. Attester #1's nullifier is therefore the
+        // ANCHOR: the client forwards it and subsequent attesters countersign THAT
+        // commitment (all face/limit/username checks above still ran against OUR db).
+        // Trust note: the anchor is client-supplied, so engine-side nullifier dedup is
+        // only as strong as each attester's own face limit — acceptable while the
+        // global commitment registry (ARCHITECTURE.md Subsystem 5) is deferred.
+        const anchor = typeof body.nullifier === 'string' && /^[0-9a-f-]{1,64}#\d{1,4}$/i.test(body.nullifier)
+          ? body.nullifier : undefined;
+        const nullifier = anchor ?? `${nid}#${faceCount}`;
         const commitment = deriveCommitment(nullifier, accountId);
         const attestation = createAttestation('personhood', commitment, { pub: attester.pub, priv: attester.priv });
-        console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})`);
+        console.log(`[Attester] personhood attestation acct=${accountId.slice(0, 12)}… face=${faceCount + 1}/${faceMax} (${matchedFace ? 'matched' : 'new'})${anchor ? ' [countersigned anchor nullifier]' : ''}`);
         if (username) { usernameRegistry.set(username, { accountId, nid }); usernameDirty = true; } // claim for this human
         recordOperator(accountId); // first OPERATOR_COUNT attested accounts become operators
         res.writeHead(200, { 'Content-Type': 'application/json' });

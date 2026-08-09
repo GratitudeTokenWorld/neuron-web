@@ -1694,7 +1694,10 @@ async function collectAttestation(
       const res = await fetch(faceVerifyEndpoint(ch.faceVerifyBase, 'verify'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network },
-        body: JSON.stringify({ descriptor, faceMapHash, accountId, username, challengeId: ch.challengeId }),
+        // `nullifier`: attester #1's nullifier is the ANCHOR — forward it so later
+        // attesters countersign the SAME commitment. Without this each attester signs
+        // over its own nid and the engine sees k different commitments ⇒ quorum 1/k.
+        body: JSON.stringify({ descriptor, faceMapHash, accountId, username, challengeId: ch.challengeId, nullifier }),
         signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) {
@@ -1707,7 +1710,7 @@ async function collectAttestation(
       const data = await res.json() as { nullifier?: string; attestation?: TypedAttestation };
       if (!data.attestation || seen.has(data.attestation.attesterPub)) continue;
       seen.add(data.attestation.attesterPub);
-      nullifier = data.nullifier;
+      nullifier = nullifier ?? data.nullifier;  // first attester's nullifier is the anchor (forwarded to the rest)
       attestations.push(data.attestation);
       onStatus(`Attester ${ch.peerId.slice(0, 8)} attested ✓ (${attestations.length}/${challenges.length})`);
     } catch (e) {
