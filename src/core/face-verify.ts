@@ -625,7 +625,11 @@ export async function calibrateNeutral(
           samples.length = 0;
           debugMetrics('depth: all legs confirmed');
         }
-        onStatus?.({ label: 'Good', guide: 'depth', left: 100, right: 100 });
+        // state:'ok' is what fires the completion chime — each sweep leg is a
+        // completed action from the user's side, so it gets the same audible
+        // confirmation as a challenge. Without it the setup stage was the one
+        // part of the flow that gave no feedback for doing the right thing.
+        onStatus?.({ label: 'Good', guide: 'depth', state: 'ok', left: 100, right: 100 });
         await sleep(150);
         continue;
       }
