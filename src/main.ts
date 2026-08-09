@@ -5,7 +5,7 @@ import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_SEQUENCE_ACTIONS, type ChallengeAction } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
@@ -930,7 +930,8 @@ async function challengeAndCapture(
 ): Promise<{ faceMap: import('./core/face-verify').FaceMap } | { failure: FaceCaptureFailure }> {
   const presence = newPresenceGuard();
   const turn = turnHint ?? (Math.random() < 0.5 ? 'look-left' : 'look-right');
-  const sequence: ChallengeAction[] = [...CHALLENGE_SEQUENCE_ACTIONS, turn];
+  // Every expression plus the head turn, order drawn fresh each run.
+  const sequence: ChallengeAction[] = [...CHALLENGE_EXPRESSIONS.slice(0, EXPRESSIONS_PER_RUN), turn];
   for (let i = sequence.length - 1; i > 0; i--) {             // Fisher–Yates
     const j = Math.floor(Math.random() * (i + 1));
     [sequence[i], sequence[j]] = [sequence[j], sequence[i]];

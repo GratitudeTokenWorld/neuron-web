@@ -689,7 +689,9 @@
     .capture-guide g { display: none; }
     .capture-guide[data-guide="turn"]  .cg-turn,
     .capture-guide[data-guide="blink"] .cg-blink,
+    .capture-guide[data-guide="eyes"]  .cg-blink,
     .capture-guide[data-guide="mouth"] .cg-mouth,
+    .capture-guide[data-guide="brow"]  .cg-brow,
     .capture-guide[data-guide="smile"] .cg-smile { display: block; }
 
     .cg-oval {
@@ -717,6 +719,15 @@
     /* Blink: the lids close and reopen on a human-ish cadence. */
     .cg-eye { transform-box: fill-box; transform-origin: center; animation: cg-blink 2.2s ease-in-out infinite; }
     @keyframes cg-blink { 0%, 82%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.08); } }
+
+    /* Close eyes: same eye shapes as blink, but a slow close-and-HOLD, which is
+       what is actually being asked for (a held state, not a 100ms flick). */
+    .capture-guide[data-guide="eyes"] .cg-eye { animation: cg-eyes-hold 2.8s ease-in-out infinite; }
+    @keyframes cg-eyes-hold { 0%, 12% { transform: scaleY(1); } 26%, 72% { transform: scaleY(0.08); } 88%, 100% { transform: scaleY(1); } }
+
+    /* Raise eyebrows: the brow arcs lift away from the eyes and settle back. */
+    .cg-brow-arc { animation: cg-brow 2s ease-in-out infinite; }
+    @keyframes cg-brow { 0%, 100% { transform: translateY(4px); } 45%, 65% { transform: translateY(-4px); } }
 
     /* Mouth open: the jaw ellipse stretches vertically, like a slow "ahh". */
     .cg-jaw { transform-box: fill-box; transform-origin: center top; animation: cg-jaw 1.8s ease-in-out infinite; }
@@ -1008,6 +1019,12 @@
               <ellipse class="cg-line cg-jaw" cx="100" cy="100" rx="17" ry="12"/>
               <circle class="cg-line" cx="78" cy="64" r="2.5"/>
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
+            </g>
+            <g class="cg-brow">
+              <path class="cg-line cg-brow-arc" d="M68 54 q12 -7 24 0"/>
+              <path class="cg-line cg-brow-arc" d="M108 54 q12 -7 24 0"/>
+              <path class="cg-line" d="M70 68 q10 -8 20 0" opacity="0.45"/>
+              <path class="cg-line" d="M110 68 q10 -8 20 0" opacity="0.45"/>
             </g>
           </svg>
         </div>
