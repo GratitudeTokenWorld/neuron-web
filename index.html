@@ -1152,7 +1152,15 @@
         </div>
       </div>
       <div class="card">
-        <div class="card-title">All Transactions</div>
+        <!-- NOT a global explorer: a node holds only its own accounts' chains plus
+             the counterparty chains it had to verify (scale invariant). Two nodes
+             legitimately show different rows — labelling this "All Transactions"
+             made that asymmetry read as a sync bug. -->
+        <div class="card-title">Transactions on this node</div>
+        <div style="margin:-4px 0 10px;font-size:12px;color:var(--text-dim);">
+          Blocks this node holds — your accounts plus counterparties you've transacted with.
+          Other nodes hold a different slice; there is no global index by design.
+        </div>
         <div id="explorerSyncStatus" style="margin-bottom:12px;font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px;"></div>
         <div class="table-wrap">
           <table>

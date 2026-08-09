@@ -588,6 +588,46 @@ not ready.
 - Generalizable signed-credential quorum ([dag-block.ts](src/core/dag-block.ts), [dag-ledger.ts:477-494](src/core/dag-ledger.ts#L477))
 - Storage-reward economics + spot-check/receipt repair ([storage-manager.ts](src/network/storage-manager.ts))
 
+## Deferred: scale-invariant gaps in the CURRENT build
+
+> **Status: explore after the architecture/refactor work is finished** (agreed
+> 2026-08-09, during the two-relay manual E2E run). Both are live violations of
+> the invariant in this repo today. Neither hurts a small testnet, and both have
+> a designed fix already described above — they are *unimplemented*, not unsolved.
+> Revisit them together: they are the two remaining `O(N)`-shaped subsystems.
+
+**G1 — The global `accounts` topic is `O(N)` (the one that fails first).**
+Every client subscribes to a single network-wide `accounts` gossip topic
+([`libp2p-network.ts`](../src/network/libp2p-network.ts) `start()`), so **every
+node ingests every account record ever created** — memory, bandwidth and storage
+all scale with total users, not with interest. Engine *blocks* are already
+correctly per-shard; the account/username directory is the straggler. It is also
+why a sender needs the recipient's record locally before `createSend` can resolve
+a username at all. *Designed fix (Subsystem 3):* interest-scoped announcements +
+on-demand resolution — look a username up via the DHT (`findProviders`) when you
+need it instead of ingesting the whole directory; cache what you resolve.
+
+**G2 — Counterparty verification replicates whole chains.**
+A recipient pulls the sender's **entire account chain** to verify one payment
+(delta sync), and keeps it. Per-node cost is therefore
+`O(own + Σ counterparty chain lengths)` — fine for a personal wallet, unbounded
+for a high-counterparty account (a merchant paid by 100k people holds 100k
+chains). Startup makes this concrete: the node refreshes every held foreign chain
+so an offline-received send is not missed ([`node.ts`](../src/network/node.ts)
+`start()`), which is `O(held accounts)` delta requests in a burst. *Designed fix
+(Subsystem 1, principle 3 "verify without holding"):* verify the sender's head
+via a per-account **Merkle accumulator inclusion proof** from a super-node in
+`O(log n)`, keep only your own receive block + the proof, and drop the foreign
+chain. Also caps the startup refresh (proof re-check, not chain re-pull).
+
+**Consequence to keep in mind meanwhile (correct, not a bug):** node views are
+*asymmetric by design* — a recipient holds the sender's chain, the sender holds
+nothing of the recipient's (a send block is self-contained; only the receiver
+must verify history). The explorer therefore shows a different set of blocks on
+each node, and is labelled "Transactions on this node" for exactly that reason.
+A sender also cannot see whether the recipient claimed a send without following
+the recipient's shard; a "claimed ✓" indicator needs an inbox ack.
+
 ## Hard problems / honest open risks
 
 - **1B pure-P2P is unsolved;** the tiered-hybrid topology is what makes it

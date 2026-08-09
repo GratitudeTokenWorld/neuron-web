@@ -16,6 +16,13 @@ designed to hold the *scale invariant*:
 Weigh that invariant on **every** change. Zero common-path overhead, interest-scoped
 propagation, no global indexes.
 
+Two **known live violations** are tracked in ARCHITECTURE.md → *Deferred:
+scale-invariant gaps in the current build*: **G1** the global `accounts` gossip
+topic (every node ingests every account record) and **G2** counterparty
+verification pulling whole chains instead of accumulator proofs. Both are
+deliberately deferred until the architecture/refactor work is done — don't
+re-derive them as new discoveries, and don't build on top of them.
+
 The full design, threat model, and consensus rationale live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — read it before touching the engine,
 consensus, or identity code. Relay/super-node operations: [docs/SUPERNODE.md](docs/SUPERNODE.md).
