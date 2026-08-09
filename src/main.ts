@@ -1019,7 +1019,7 @@ type FaceCaptureFailure =
 
 function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
   if (f.kind === 'presence') {
-    return '<span style="color:var(--danger)">Your face left the frame. Stay in view from the first check to the last sample.</span>';
+    return '<span style="color:var(--danger)">Out of frame or too dark! Stay in view, and well lit, from the first check to the last sample.</span>';
   }
   if (f.kind === 'setup') {
     if (f.reason === 'flat') {
@@ -1079,7 +1079,7 @@ async function challengeAndCapture(
   for (const [i, action] of sequence.entries()) {
     const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence, neutral);
     if (!done) {
-      addLog(`FaceID: ${presence.lost ? 'face left the frame' : `challenge "${action}" not detected`}`, 'error');
+      addLog(`FaceID: ${presence.lost ? 'out of frame or too dark' : `challenge "${action}" not detected`}`, 'error');
       return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
     }
     // Step 0 was setup, so action i completes step i+1; the next one becomes
@@ -1090,14 +1090,14 @@ async function challengeAndCapture(
     // prompt (the baseline itself is now immune, measured once up front).
     renderCaptureCue({ label: 'Relax your face', guide: 'hold', left: 0, right: 0 });
     if (!await holdPresence(video, 1000, presence, cue => renderCaptureCue(cue))) {
-      addLog('FaceID: face left the frame between checks', 'error');
+      addLog('FaceID: out of frame or too dark between checks', 'error');
       return { failure: { kind: 'presence' } };
     }
   }
 
   const faceMap = await enrollFace(video, (_s, _t, cue) => renderCaptureCue(cue), presence);
   if (!faceMap) {
-    addLog(`FaceID: ${presence.lost ? 'face left the frame during capture' : 'capture failed'}`, 'error');
+    addLog(`FaceID: ${presence.lost ? 'out of frame or too dark during capture' : 'capture failed'}`, 'error');
     return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
   }
   return { faceMap };
@@ -2053,7 +2053,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     const captured = await challengeAndCapture(video, turnHint);
     hideCameraModal();
     if ('failure' in captured) {
-      toast(captured.failure.kind === 'presence' ? 'Face left the frame — start again' : 'Face check failed', 'error');
+      toast(captured.failure.kind === 'presence' ? 'Out of frame or too dark! — start again' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(captured.failure);
       restoreCreateBtn(); return;
     }
@@ -2303,7 +2303,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const capturedR = await challengeAndCapture(video);
     hideCameraModal();
     if ('failure' in capturedR) {
-      toast(capturedR.failure.kind === 'presence' ? 'Face left the frame — start again' : 'Face check failed', 'error');
+      toast(capturedR.failure.kind === 'presence' ? 'Out of frame or too dark! — start again' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(capturedR.failure);
       finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
     }

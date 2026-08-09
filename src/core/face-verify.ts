@@ -192,7 +192,7 @@ export async function holdPresence(
     }
     if (solo.count === 1) markSeen(guard);
     if (absenceBroken(guard)) {
-      onStatus?.({ label: noFaceLabel(video, 'Face lost — start again'), guide: 'search', state: 'fail', left: 0, right: 0 });
+      onStatus?.({ label: noFaceLabel(video, 'Out of frame or too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
       return false;
     }
     await sleep(80);
@@ -1029,7 +1029,7 @@ export async function detectChallenge(
     if (!det?.landmarks) {
       // A miss counts toward the continuity budget — this is where a swap shows up.
       if (absenceBroken(guard)) {
-        onStatus?.({ label: noFaceLabel(video, 'Face lost — start again'), guide: 'search', state: 'fail', left: 0, right: 0 });
+        onStatus?.({ label: noFaceLabel(video, 'Out of frame or too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
         return false;
       }
       await sleep(100); continue;

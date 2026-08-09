@@ -69,7 +69,9 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    **Continuity:** from the first action to the last sample your face may not
    leave the frame for more than **1 s** — gaps between stages included. Worth
    testing deliberately: cover the lens for ~2 s mid-sequence and confirm the run
-   aborts with "face left the frame" rather than continuing.
+   aborts with "Out of frame or too dark!" rather than continuing.
+   (Same message covers a dark room — the detector cannot tell the two apart,
+   and a covered lens must stay a failure, so they share one wording.)
    **Anti-spoof checks worth trying:** sliding your body sideways must NOT satisfy
    the head turn (expect "turn, not slide"); holding a photo up must fail every
    action. The **setup depth sweep** is the strongest of them — a real head changes
