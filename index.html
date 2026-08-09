@@ -675,6 +675,44 @@
       .camera-modal video { height: 50vh; width: auto; max-width: 92vw; margin: 0 auto; }
     }
 
+    /* ── Step tracker ──────────────────────────────────────────────────────────
+       Six boxes above the progress bar: 0 is setup (framing, depth sweep,
+       baseline), 1-5 are the five challenge actions. Numbered rather than named
+       because the action order is drawn fresh each run — a fixed label list would
+       misdescribe the sequence the user is actually being given. Each turns
+       green with a checkmark as it completes, so the user can see how much of
+       the enrollment is left instead of facing an open-ended series of prompts. */
+    .capture-steps {
+      display: flex;
+      justify-content: center;
+      gap: 4px;
+      padding: 0 10px 8px;
+      background: var(--surface);   /* same ground as the header above it */
+    }
+    .capture-steps > i {
+      flex: 0 1 44px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-style: normal;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      transition: background 0.2s, color 0.2s, border-color 0.2s;
+    }
+    .capture-steps > i.active { color: var(--text); border-color: var(--text-dim); }
+    .capture-steps > i.done {
+      background: var(--success);
+      border-color: var(--success);
+      color: #fff;
+      font-size: 0;               /* hides the numeral, keeps the box size */
+    }
+    .capture-steps > i.done::after { content: '\2713'; font-size: 12px; }
+
     /* ── Centre-anchored capture progress ──────────────────────────────────────
        Two independent halves growing outward from the middle: a head-turn fills
        the side actually being turned toward, blink/smile/capture fill both. The
@@ -1019,6 +1057,10 @@
       <div class="camera-modal-header">
         <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
         <button class="camera-modal-close" id="cameraModalClose">&times;</button>
+      </div>
+      <!-- Step tracker: 0 = setup, 1-5 = the five challenge actions. -->
+      <div class="capture-steps" id="captureSteps">
+        <i>0</i><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i>
       </div>
       <div class="capture-bar" id="captureBar"><i class="l" id="captureBarL"></i><i class="r" id="captureBarR"></i></div>
       <div class="camera-modal-video">

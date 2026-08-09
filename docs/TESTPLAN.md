@@ -50,8 +50,10 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 *must* reach two distinct attesters or fail with "Need 2 independent attesters".
 
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
-   The capture UI shows a centre-out green bar, a rising tone, and a wireframe
-   guide over the (mirrored) feed. It runs a **setup stage** first — frame your
+   The capture UI shows a **six-box step tracker** (0 = setup, 1–5 = the five
+   actions; each turns green with a checkmark as it completes), a centre-out
+   green bar, a rising tone, and a wireframe guide over the (mirrored) feed.
+   The feed is 90% of viewport width on mobile and 50% of viewport height on PC. It runs a **setup stage** first — frame your
    head ("move closer" / "move back" / "hold your head level"), then a
    **three-leg depth sweep: closer → back → closer**, which dials in the distance
    *and* proves the face is three-dimensional (the perspective must reverse on

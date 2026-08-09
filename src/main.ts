@@ -963,9 +963,22 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
   }
 }
 
+/**
+ * Step tracker: `done` boxes go green with a checkmark, `active` is the one in
+ * progress. Steps are 0 = setup, 1-5 = the five challenge actions, so `done`
+ * runs 0-6 and `active` is -1 once nothing is outstanding.
+ */
+function setCaptureSteps(done: number, active = -1): void {
+  document.querySelectorAll<HTMLElement>('#captureSteps > i').forEach((el, i) => {
+    el.classList.toggle('done', i < done);
+    el.classList.toggle('active', i === active);
+  });
+}
+
 /** Clear bar + guide between phases so a stale animation never lingers. */
 function resetCaptureCue(): void {
   stopProgressTone();
+  setCaptureSteps(0);
   const bar = document.getElementById('captureBar');
   bar?.removeAttribute('data-state');
   (document.getElementById('captureBarL') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
@@ -1030,19 +1043,24 @@ async function challengeAndCapture(
   // is in shot, and only then measure the relaxed face — once, at a known-good
   // distance. (Calibrating inside each action captured the tail of the previous
   // one — still smiling, mouth still open — and broke the check that followed.)
+  setCaptureSteps(0, 0);
   const setup = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
   if (!setup.ok) {
     addLog(`FaceID: setup failed (${setup.reason})`, 'error');
     return { failure: setup.reason === 'presence' ? { kind: 'presence' } : { kind: 'setup', reason: setup.reason } };
   }
   const neutral = setup.neutral;
+  setCaptureSteps(1, 1);
 
-  for (const action of sequence) {
+  for (const [i, action] of sequence.entries()) {
     const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence, neutral);
     if (!done) {
       addLog(`FaceID: ${presence.lost ? 'face left the frame' : `challenge "${action}" not detected`}`, 'error');
       return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
     }
+    // Step 0 was setup, so action i completes step i+1; the next one becomes
+    // active. After the last action `done` is 6 and nothing is active.
+    setCaptureSteps(i + 2, i + 2 < 6 ? i + 2 : -1);
     // Watched pause — a blind sleep here would be a free window to swap faces —
     // and a beat for the user to drop the previous expression before the next
     // prompt (the baseline itself is now immune, measured once up front).
