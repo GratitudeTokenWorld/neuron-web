@@ -595,6 +595,13 @@ export class Libp2pNetwork extends EventEmitter {
     }] : [];
 
     this.libp2p = await createLibp2p({
+      // libp2p ≥3.3 ships a default BROWSER connection gater that denies every
+      // insecure-websocket (/ws) and private multiaddr (connection-gater.browser.js).
+      // Our dev topology is exactly that: plain /ws to localhost + raw-IP cloud
+      // relays (docs/TESTPLAN.md) — with the default gater every dial fails with
+      // DialDeniedError and the node sits at 0 connections. The browser itself
+      // already blocks genuinely-forbidden mixed content, so gate nothing here.
+      connectionGater: { denyDialMultiaddr: () => false },
       addresses: {
         // '/p2p-circuit' triggers the circuit-relay transport's listen() path,
         // which calls reservationStore.reserveRelay(). Without this entry the
