@@ -138,34 +138,6 @@ const USERNAMES_FILE = process.env.USERNAMES_FILE || inData('.relay-usernames.js
 // other accounts' resets are ignored. Survives wipes (kept like identity keys).
 const OPERATORS_FILE = process.env.OPERATORS_FILE || inData('.relay-operators.json');
 const RELOAD_LOG_FILE = process.env.RELOAD_LOG_FILE || inData('reload.log');
-
-/**
- * One-time layout migration: earlier deployments kept every .relay-* file (and
- * reload.log) in the repo root. Move them into DATA_DIR so a `git pull` deploy
- * of this change preserves relay identity (peer-id, attester key) with zero
- * manual steps on the boxes. Files with explicit env overrides are untouched
- * (their constant doesn't point into DATA_DIR). `.bak`/`.tmp` sidecars ride along.
- */
-async function migrateDataDir(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  const legacy = [
-    '.relay-peer-id.json', '.relay-signing-key.json', '.relay-face-db.json',
-    '.relay-attester-key.json', '.relay-engine-blocks.json', '.relay-keyblobs.json',
-    '.relay-usernames.json', '.relay-operators.json', '.relay-generation.json',
-    'reload.log',
-  ];
-  for (const base of legacy) {
-    for (const name of [base, `${base}.bak`, `${base}.tmp`]) {
-      try {
-        await fs.access(name);                       // exists in root?
-        await fs.access(inData(name)).then(
-          () => console.warn(`[Migrate] ${name}: both root and ${DATA_DIR} copies exist — keeping ${DATA_DIR}, root copy left in place`),
-          async () => { await fs.rename(name, inData(name)); console.log(`[Migrate] ${name} → ${DATA_DIR}/`); },
-        );
-      } catch { /* not in root — nothing to migrate */ }
-    }
-  }
-}
 const OPERATOR_COUNT = 3;
 const ARCHIVE_ENABLED = process.env.ARCHIVE !== '0';
 // Per-block/per-request archive logs are verbose; gate them behind DEBUG_ARCHIVE=1.
@@ -533,7 +505,7 @@ async function loadOrCreatePrivKey() {
 // ── Start relay ───────────────────────────────────────────────────────────────
 
 async function main() {
-  await migrateDataDir();
+  await fs.mkdir(DATA_DIR, { recursive: true });
   const privKey = await loadOrCreatePrivKey();
   const peerId = peerIdFromPrivateKey(privKey);
   const signingKey = await loadOrCreateSigningKey();

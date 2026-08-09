@@ -61,8 +61,7 @@ src/
 relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2
                    http/face-verify), vite-plugin.ts (dev auto-spawn),
                    ecosystem.config.cjs (pm2). Runtime state (identity keys,
-                   face DB, archives) lives in gitignored .relay-data/ —
-                   auto-migrated from the old root-level .relay-*.json on boot
+                   face DB, archives) lives in gitignored .relay-data/
 ```
 
 ## The migration seam — read before editing app code
@@ -133,6 +132,17 @@ instances / 128 vCPU / 160 GB RAM. Cheapest flavor: `b2i.2c-2g`.
 **Confirm with the user before creating, resizing, or deleting any cloud resource** —
 they are billable and outward-facing. Read-only commands (`list`, `show`, `token issue`)
 are fine unprompted.
+
+## Development mode — data is disposable
+
+**The network is in development mode until Lucian explicitly says otherwise.**
+The two cloud relays are the only relays that exist (old neuronweb.org /
+akashicrecords.dev deployments are dead — never account for them), and all
+blockchain/relay data is disposable: don't preserve chain state, write migration
+shims, or fear resets when a change calls for wiping `.relay-data/` and client
+storage. What must still survive any wipe: the relay **peer-id and attester key**
+files (identity — the baked bootstrap addrs embed the peerIds) and, as always,
+never commit secrets. Leaving dev mode is an explicit user call, not inferred.
 
 ## Two-relay dev network & manual testing
 

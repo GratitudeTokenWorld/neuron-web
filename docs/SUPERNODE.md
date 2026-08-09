@@ -37,11 +37,9 @@ Keep 9090/9092 **localhost-only** (firewalled); only nginx (443) is public.
 ## Runtime files (in `.relay-data/` under the repo root)
 
 All relay runtime state lives in the gitignored **`.relay-data/`** directory
-(override with `RELAY_DATA_DIR`; per-file `*_FILE` env overrides still win). On
-first boot after this change the relay **auto-migrates** any legacy root-level
-`.relay-*.json` files into it — identity is preserved. **Never commit these; back
-them up** (losing the peer-id or attester key changes the node's identity and
-breaks the baked bootstrap address).
+(override with `RELAY_DATA_DIR`; per-file `*_FILE` env overrides still win).
+**Never commit these; back them up** (losing the peer-id or attester key changes
+the node's identity and breaks the baked bootstrap address).
 
 | File | Contents | If lost |
 |------|----------|---------|
