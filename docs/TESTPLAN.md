@@ -113,6 +113,13 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 3. B burns it (if UI exposes burn). **Pass:** gone from both.
 4. Reload both. **Pass:** ownership state survives.
 
+> **All three face flows share one anti-spoofing path** (`challengeAndCapture`):
+> account creation, **recovery** (T5) and change-face (Security settings) each run
+> liveness → 3 random challenge actions → 3 capture samples under one presence
+> guard. Recovery is the one that hands over the keys and the key-blob is public
+> by design, so it gets the same treatment as enrollment — expect the full
+> sequence when testing T5, not just a face scan.
+
 ## T5 — Recovery after wipe (redundant durability)
 
 1. Browser B: note bob's balance. Wipe site data completely (DevTools → Application

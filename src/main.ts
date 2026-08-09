@@ -895,6 +895,69 @@ function resetCaptureCue(): void {
   document.getElementById('captureGuide')?.setAttribute('data-guide', '');
 }
 
+/** Why a face capture run was rejected — callers render their own copy. */
+type FaceCaptureFailure =
+  | { kind: 'presence' }
+  | { kind: 'challenge'; action: string }
+  | { kind: 'capture' };
+
+function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
+  if (f.kind === 'presence') {
+    return '<span style="color:var(--danger)">Your face left the frame. Stay in view from the first check to the last sample.</span>';
+  }
+  if (f.kind === 'challenge') {
+    return `<span style="color:var(--danger)">Timed out on "${escHtml(f.action)}". Try again.</span>`;
+  }
+  return '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>';
+}
+
+/**
+ * The anti-spoofing half of every face flow: all three challenge actions in a
+ * per-run random order, then the capture samples, under ONE presence guard so
+ * the face that passes the checks is provably the face that gets captured.
+ *
+ * Shared by account creation, recovery and change-face deliberately — a
+ * recovery or a face-rebind that is easier to spoof than enrollment just moves
+ * the attack rather than stopping it. Callers run liveness first (they own the
+ * step wording) and handle their own modal/button cleanup.
+ *
+ * `turnHint` fixes the head-turn direction (creation passes the relay-issued
+ * type, which is also the attestation nonce); otherwise it is drawn locally.
+ */
+async function challengeAndCapture(
+  video: HTMLVideoElement,
+  turnHint?: 'look-left' | 'look-right',
+): Promise<{ faceMap: import('./core/face-verify').FaceMap } | { failure: FaceCaptureFailure }> {
+  const presence = newPresenceGuard();
+  const turn = turnHint ?? (Math.random() < 0.5 ? 'look-left' : 'look-right');
+  const sequence: ('blink' | 'smile' | 'look-left' | 'look-right')[] = ['blink', 'smile', turn];
+  for (let i = sequence.length - 1; i > 0; i--) {             // Fisher–Yates
+    const j = Math.floor(Math.random() * (i + 1));
+    [sequence[i], sequence[j]] = [sequence[j], sequence[i]];
+  }
+  addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
+
+  for (const action of sequence) {
+    const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence);
+    if (!done) {
+      addLog(`FaceID: ${presence.lost ? 'face left the frame' : `challenge "${action}" not detected`}`, 'error');
+      return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
+    }
+    // Watched pause — a blind sleep here would be a free window to swap faces.
+    if (!await holdPresence(video, 700, presence, cue => renderCaptureCue(cue))) {
+      addLog('FaceID: face left the frame between checks', 'error');
+      return { failure: { kind: 'presence' } };
+    }
+  }
+
+  const faceMap = await enrollFace(video, (_s, _t, cue) => renderCaptureCue(cue), presence);
+  if (!faceMap) {
+    addLog(`FaceID: ${presence.lost ? 'face left the frame during capture' : 'capture failed'}`, 'error');
+    return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
+  }
+  return { faceMap };
+}
+
 // Close modal via X button
 $('#cameraModalClose').addEventListener('click', () => {
   hideCameraModal();
@@ -1803,72 +1866,19 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
     const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
 
-    // Active challenge: ALL THREE actions, in a fresh random order every time.
-    // A single fixed action is cheap to pre-record; demanding blink + smile + a
-    // head turn in an order the attacker can't predict means a replayed video has
-    // to contain all three in exactly the drawn sequence. The relay's issued type
-    // picks the turn direction (and is the anti-replay nonce for the attestation).
-    //
-    // Honest limit: detection runs in the CLIENT, so a patched client can skip it.
-    // This raises the bar against presentation attacks (a photo or a recording held
-    // up to a real camera), not against a modified app — closing that needs
-    // server-side verification of the captured frames.
-    // One guard for the whole enrollment: the face must stay in frame from the
-    // first challenge through the last capture sample (gaps included). Breaking
-    // continuity voids the run — see PresenceGuard for the attack it closes.
-    const presence = newPresenceGuard();
-
-    if (pendingChallenges.length > 0) {
-      const issued = pendingChallenges.map(c => c.type);
-      const turn = (issued.find(t => t === 'look-left' || t === 'look-right')
-        ?? (Math.random() < 0.5 ? 'look-left' : 'look-right')) as 'look-left' | 'look-right';
-      const sequence: ('blink' | 'smile' | 'look-left' | 'look-right')[] = ['blink', 'smile', turn];
-      for (let i = sequence.length - 1; i > 0; i--) {           // Fisher–Yates
-        const j = Math.floor(Math.random() * (i + 1));
-        [sequence[i], sequence[j]] = [sequence[j], sequence[i]];
-      }
-      addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
-
-      for (const action of sequence) {
-        const actionDone = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence);
-        if (!actionDone) {
-          const lost = presence.lost;
-          addLog(`FaceID: ${lost ? 'face left the frame' : `challenge "${action}" not detected`} — aborting`, 'error');
-          toast(lost ? 'Face left the frame — start again' : 'Challenge failed — perform each action and try again', 'error');
-          statusEl.innerHTML = lost
-            ? '<span style="color:var(--danger)">Your face left the frame during the checks. Stay in view from start to finish.</span>'
-            : `<span style="color:var(--danger)">Challenge timed out on "${escHtml(action)}". Try again.</span>`;
-          hideCameraModal(); restoreCreateBtn(); return;
-        }
-        // Watched pause — a blind sleep here would be a free window to swap faces.
-        if (!await holdPresence(video, 700, presence, cue => renderCaptureCue(cue))) {
-          addLog('FaceID: face left the frame between checks — aborting', 'error');
-          toast('Face left the frame — start again', 'error');
-          statusEl.innerHTML = '<span style="color:var(--danger)">Your face left the frame between checks. Stay in view from start to finish.</span>';
-          hideCameraModal(); restoreCreateBtn(); return;
-        }
-      }
-    }
-
-    // Face enrollment (camera still open, immediately after challenge action)
-    setCameraStatus('<span class="spinner"></span> Step 3/3: Hold still — capturing face map');
-    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue), presence);
+    // Challenges + capture under one presence guard (see challengeAndCapture).
+    // The relay-issued type fixes the turn direction and is the attestation nonce.
+    const issued = pendingChallenges.map(c => c.type);
+    const turnHint = issued.find(t => t === 'look-left' || t === 'look-right') as
+      'look-left' | 'look-right' | undefined;
+    const captured = await challengeAndCapture(video, turnHint);
     hideCameraModal();
-
-    if (!faceMap && presence.lost) {
-      // Continuity broke between the challenges and the samples: the face that
-      // passed the checks is not provably the face being enrolled.
-      addLog('FaceID: face left the frame during capture — aborting account creation', 'error');
-      toast('Face left the frame — start again', 'error');
-      statusEl.innerHTML = '<span style="color:var(--danger)">Your face left the frame during capture. Stay in view from the first check to the last sample.</span>';
+    if ('failure' in captured) {
+      toast(captured.failure.kind === 'presence' ? 'Face left the frame — start again' : 'Face check failed', 'error');
+      statusEl.innerHTML = faceCaptureErrorHtml(captured.failure);
       restoreCreateBtn(); return;
     }
-    if (!faceMap) {
-      addLog('FaceID: Face enrollment FAILED - could not capture enough samples', 'error');
-      toast('Face enrollment failed', 'error');
-      statusEl.innerHTML = '<span style="color:var(--danger)">Face enrollment failed. Try again with better lighting.</span>';
-      restoreCreateBtn(); return;
-    }
+    const faceMap = captured.faceMap;
 
     // Step 3: generate the account keys now (so we have the engine accountId the
     // attester binds the identity to), then collect engine personhood attestation(s).
@@ -2093,13 +2103,30 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
 
-    // Use the same multi-sample enrollment as account creation so the quantized
+    // Recovery gets the SAME anti-spoofing as enrollment. It is the flow that
+    // hands over the keys, and the key-blob is public by design (gossiped for
+    // peer-independent recovery), so the attacker needs only a username, the PIN
+    // and a photo. Without liveness + challenges + continuity the face factor
+    // collapses in exactly the case it exists for: a leaked/shoulder-surfed PIN.
+    const isLiveR = await detectLiveness(video, 15000, cue => renderCaptureCue(cue));
+    if (!isLiveR) {
+      hideCameraModal();
+      toast('Liveness failed - try moving your head more', 'error');
+      statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
+      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+    }
+
+    // Same multi-sample enrollment as account creation so the quantized
     // descriptor matches exactly (single-frame capture can differ enough to break
     // the derived AES key).
-    const faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
+    const capturedR = await challengeAndCapture(video);
     hideCameraModal();
-
-    if (!faceMap) { toast('No face detected', 'error'); statusEl.innerHTML = '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>'; finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return; }
+    if ('failure' in capturedR) {
+      toast(capturedR.failure.kind === 'presence' ? 'Face left the frame — start again' : 'Face check failed', 'error');
+      statusEl.innerHTML = faceCaptureErrorHtml(capturedR.failure);
+      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+    }
+    const faceMap = capturedR.faceMap;
 
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Decrypting keys with face + PIN...</span>';
 
@@ -2470,7 +2497,15 @@ $('#btnUpdateFace').addEventListener('click', async () => {
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
       return;
     }
-    faceMap = await enrollFace(video, (_step, _total, cue) => renderCaptureCue(cue));
+    // Full challenge + continuity: this flow REBINDS the account's biometric, so
+    // a swapped face here silently re-points the identity at someone else.
+    const captured = await challengeAndCapture(video);
+    if ('failure' in captured) {
+      hideCameraModal();
+      statusEl.innerHTML = faceCaptureErrorHtml(captured.failure);
+      return;
+    }
+    faceMap = captured.faceMap;
   } catch {
     hideCameraModal();
     statusEl.innerHTML = '<span style="color:var(--danger)">Camera error. Try again.</span>';
