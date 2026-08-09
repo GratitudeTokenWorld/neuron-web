@@ -478,18 +478,45 @@ export async function calibrateNeutral(
   const FRONTAL_SKEW = 0.15;
   const STABLE_YAW_RANGE = 0.04;
   const MAX_ROLL_DEG = 16;       // head tilt; beyond this the landmarks skew
-  const MIN_FACE_FRAC = 0.13;    // eye span as a fraction of frame width
-  const MAX_FACE_FRAC = 0.45;
+  // Framing starts mid-range so the sweep has room in BOTH directions without
+  // the face leaving the measurable band.
+  const MIN_FACE_FRAC = 0.15;    // eye span as a fraction of frame width
+  const MAX_FACE_FRAC = 0.32;
   const CENTRE_MIN = 0.25, CENTRE_MAX = 0.75;
-  // Depth sweep: how much closer, and how much the perspective must respond.
-  const APPROACH_RATIO = 1.30;
-  const SHAPE_DELTA = 0.025;     // relative rise in eye-span / jaw-width
+  // Depth sweep, THREE legs: closer → back → closer.
+  //
+  // One leg proves the face is 3D; three make it decisive. Each leg is measured
+  // against the end of the previous one, so the perspective has to reverse
+  // direction on demand — a flat surface fails all three identically, and a
+  // coincidental shape wobble cannot line up with three prescribed directions.
+  // Ending on "closer" also leaves the user at a good distance for the baseline
+  // and the capture that follows.
+  const LEGS = [
+    { in: true,  label: 'Move closer' },
+    { in: false, label: 'Move back' },
+    { in: true,  label: 'Move closer' },
+  ];
+  const LEG_SIZE_RATIO = 1.25;   // per leg, inverted when receding
+  const SHAPE_DELTA = 0.022;     // relative change in eye-span / jaw-width, per leg
   const FLAT_SHAPE_MAX = 0.35;   // fraction of SHAPE_DELTA that reads as "flat"
-  const deadline = Date.now() + 40000;
+  const deadline = Date.now() + 60000;
 
-  type Phase = 'frame' | 'approach' | 'settle' | 'baseline';
+  type Phase = 'frame' | 'sweep' | 'baseline';
   let phase: Phase = 'frame';
+  let leg = 0;
   let startFrac = 0, startShape = 0;
+  /**
+   * Snapshot of the face BEFORE the sweep. The usable baseline has to come
+   * after — the actions happen at the settled distance, and calibrating at any
+   * other one reproduces the stale-baseline bug we already hit twice. But the
+   * pre-sweep face is still worth keeping as a consistency reference: the
+   * distance-INVARIANT ratios (mouth width, corner lift, brow gap — all
+   * normalised by eye span) belong to the face, not the distance, so they should
+   * survive the sweep unchanged. A large drift means something about the subject
+   * changed while it was moving. Measured and logged for now, not enforced:
+   * a rejection rule needs real numbers behind it, not a guessed tolerance.
+   */
+  let preNeutral: FaceMetrics | null = null;
   const samples: FaceMetrics[] = [];
 
   const fail = (reason: CalibrationFailure): CalibrationResult => {
@@ -535,7 +562,7 @@ export async function calibrateNeutral(
       rollDeg > MAX_ROLL_DEG ? 'Hold your head level' :
       (Math.abs(m.yaw - 0.55) > FRONTAL_YAW || Math.abs(m.skew) > FRONTAL_SKEW) ? 'Look straight at the camera' : null;
 
-    if (phase !== 'approach' && badFrame) {
+    if (phase !== 'sweep' && badFrame) {
       samples.length = 0;
       onStatus?.({ label: badFrame, guide: 'search', left: 0, right: 0 });
       await sleep(80);
@@ -550,8 +577,13 @@ export async function calibrateNeutral(
       if (samples.length === FRAMES && Math.max(...yaws) - Math.min(...yaws) <= STABLE_YAW_RANGE) {
         startFrac = m.frac;
         startShape = m.shape;
+        const midOf = (pick: (x: FaceMetrics) => number) => {
+          const v = samples.map(pick).sort((a, b) => a - b);
+          return v[Math.floor(v.length / 2)];
+        };
+        preNeutral = { ...m, width: midOf(x => x.width), lift: midOf(x => x.lift), brow: midOf(x => x.brow) };
         samples.length = 0;
-        phase = 'approach';
+        phase = 'sweep';
         debugMetrics(`calibration: framed at frac=${startFrac.toFixed(3)} shape=${startShape.toFixed(4)}`);
         continue;
       }
@@ -564,16 +596,29 @@ export async function calibrateNeutral(
       continue;
     }
 
-    if (phase === 'approach') {
-      const sizeProgress = (m.frac / startFrac - 1) / (APPROACH_RATIO - 1);
+    if (phase === 'sweep') {
+      const { in: goIn, label } = LEGS[leg];
+      // Approaching magnifies the eyes faster than the jaw (they are nearer the
+      // lens) so the shape ratio RISES; receding flattens it back. A flat
+      // surface scales without either.
+      const sizeProgress = goIn
+        ? (m.frac / startFrac - 1) / (LEG_SIZE_RATIO - 1)
+        : (1 - m.frac / startFrac) / (1 - 1 / LEG_SIZE_RATIO);
       const shapeRel = startShape > 0 ? (m.shape / startShape - 1) : 0;
-      const shapeProgress = shapeRel / SHAPE_DELTA;
-      debugMetrics(`depth frac=${m.frac.toFixed(3)}/${startFrac.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)}`);
+      const shapeProgress = (goIn ? shapeRel : -shapeRel) / SHAPE_DELTA;
+      debugMetrics(`depth leg${leg + 1}/${LEGS.length} ${goIn ? 'in' : 'out'} frac=${m.frac.toFixed(3)}/${startFrac.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)}`);
 
       if (sizeProgress >= 1 && shapeProgress >= 1) {
-        phase = 'settle';
-        onStatus?.({ label: 'Good — move back', guide: 'depth', left: 100, right: 100 });
-        await sleep(120);
+        leg++;
+        startFrac = m.frac;          // next leg is measured from here
+        startShape = m.shape;
+        if (leg >= LEGS.length) {
+          phase = 'baseline';
+          samples.length = 0;
+          debugMetrics('depth: all legs confirmed');
+        }
+        onStatus?.({ label: 'Good', guide: 'depth', left: 100, right: 100 });
+        await sleep(150);
         continue;
       }
       // Moved a long way with no perspective response ⇒ the surface is flat.
@@ -582,20 +627,8 @@ export async function calibrateNeutral(
         return fail('flat');
       }
       const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
-      onStatus?.({ label: 'Move closer', guide: 'depth', left: pct, right: pct });
+      onStatus?.({ label, guide: 'depth', left: pct, right: pct });
       await sleep(50);
-      continue;
-    }
-
-    if (phase === 'settle') {
-      // Back inside the framed band, then hold for the baseline.
-      if (m.frac > startFrac * 1.12) {
-        onStatus?.({ label: 'Move back', guide: 'depth', left: 0, right: 0 });
-        await sleep(60);
-        continue;
-      }
-      phase = 'baseline';
-      samples.length = 0;
       continue;
     }
 
@@ -635,6 +668,9 @@ export async function calibrateNeutral(
       return Math.sqrt(xs.reduce((a, b) => a + (b - mu) ** 2, 0) / (xs.length || 1));
     })(),
   };
+  if (preNeutral) {
+    debugMetrics(`consistency pre→post: width ${(neutral.width - preNeutral.width).toFixed(4)} lift ${(neutral.lift - preNeutral.lift).toFixed(4)} brow ${(neutral.brow - preNeutral.brow).toFixed(4)}`);
+  }
   debugMetrics(`neutral(once): ear=${neutral.ear.toFixed(3)} lift=${neutral.lift.toFixed(4)} width=${neutral.width.toFixed(4)} open=${neutral.open.toFixed(3)} yaw=${neutral.yaw.toFixed(3)} skew=${neutral.skew.toFixed(3)} cx=${neutral.centreX.toFixed(3)} brow=${neutral.brow.toFixed(4)} earSd=${neutral.earSd.toFixed(4)} frac=${neutral.frac.toFixed(3)} shape=${neutral.shape.toFixed(4)}`);
   return { ok: true, neutral };
 }

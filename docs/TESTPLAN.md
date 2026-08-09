@@ -50,9 +50,10 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
    The capture UI shows a centre-out green bar, a rising tone, and a wireframe
    guide over the (mirrored) feed. It runs a **setup stage** first — frame your
-   head ("move closer" / "move back" / "hold your head level"), then **move
-   toward the camera and back**, which dials in the distance *and* proves the
-   face is three-dimensional; exactly one face must be in shot throughout — then
+   head ("move closer" / "move back" / "hold your head level"), then a
+   **three-leg depth sweep: closer → back → closer**, which dials in the distance
+   *and* proves the face is three-dimensional (the perspective must reverse on
+   demand, three times); exactly one face must be in shot throughout — then
    a **"relax your face"** baseline taken at that settled distance, then **five
    actions in a random order drawn per enrollment** — smile, open mouth, raise
    eyebrows, close eyes, and a head turn — each animated, each with a 12 s budget and each
