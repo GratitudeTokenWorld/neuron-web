@@ -328,6 +328,21 @@ function mouthMetrics(pts: Point[]): { lift: number; width: number; open: number
  * Both are 0-centred at rest (jawRatio at 0.5) and both grow in the SAME
  * direction as the head turns, so a sign check is meaningful.
  */
+/**
+ * Where the face sits in the frame, 0–1 across the width.
+ *
+ * This is what separates "turned my head" from "slid my body sideways", and
+ * nothing else can: translating in front of a lens genuinely rotates the face
+ * relative to the camera axis (10cm at 60cm ≈ 10° of apparent yaw), so every
+ * landmark-based yaw metric reports a real turn either way. The difference is
+ * that a head rotation pivots at the neck and barely moves the face across the
+ * frame, while a body shift moves it a long way — measured here so a turn can
+ * require yaw *without* displacement.
+ */
+function frameCentreX(pts: Point[], videoWidth: number): number {
+  return ((pts[36].x + pts[45].x) / 2) / (videoWidth || 640);
+}
+
 function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
   const nose = pts[30];
   const eyeR = pts[36];               // subject's right eye, outer corner
@@ -338,6 +353,87 @@ function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
     skew: (dist(nose, eyeR) - dist(nose, eyeL)) / eyeSpan,
     jawRatio: Math.abs(jawSpan) < 1 ? 0.5 : (nose.x - pts[0].x) / jawSpan,
   };
+}
+
+/** Every per-frame measurement the challenges compare against neutral. */
+interface FaceMetrics {
+  ear: number; lift: number; width: number; open: number;
+  yaw: number; skew: number; centreX: number;
+}
+
+function metricsOf(pts: Point[], videoWidth: number): FaceMetrics {
+  const m = mouthMetrics(pts);
+  const y = yawSignals(pts);
+  const rightEAR = eyeAspectRatio(pts.slice(36, 42));
+  const leftEAR = eyeAspectRatio(pts.slice(42, 48));
+  return {
+    ear: (rightEAR + leftEAR) / 2,
+    lift: m.lift, width: m.width, open: m.open,
+    yaw: y.jawRatio, skew: y.skew,
+    centreX: frameCentreX(pts, videoWidth),
+  };
+}
+
+/** The user's relaxed face, measured once per enrollment. */
+export type NeutralBaseline = FaceMetrics;
+
+/**
+ * Measure the neutral face ONCE, before any action is asked for.
+ *
+ * Per-action calibration was being poisoned by the previous action's tail: real
+ * runs recorded "neutral" at width=0.70 (still smiling) and open=0.70 (mouth
+ * still open) against true neutrals of 0.55 and 0.30 — half the baselines in a
+ * single session. A poisoned baseline makes the next check either unpassable or
+ * free, which is the "passed instantly without doing anything" symptom. Taken
+ * here, before the first prompt, the face is by definition at rest.
+ *
+ * 10 frames, first 4 discarded (transition), median of the rest.
+ */
+export async function calibrateNeutral(
+  video: HTMLVideoElement,
+  onStatus?: (cue: CaptureCue) => void,
+  guard?: PresenceGuard,
+): Promise<NeutralBaseline | null> {
+  const FRAMES = 10, DROP = 4;
+  const samples: FaceMetrics[] = [];
+  const deadline = Date.now() + 8000;
+
+  while (samples.length < FRAMES && Date.now() < deadline) {
+    let det: { landmarks?: { positions: Point[] } } | undefined;
+    try {
+      det = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
+    } catch { await sleep(80); continue; }
+    if (!det?.landmarks) {
+      if (absenceBroken(guard)) return null;
+      await sleep(80); continue;
+    }
+    markSeen(guard);
+    samples.push(metricsOf(det.landmarks.positions as Point[], video.videoWidth));
+    onStatus?.({
+      label: 'Relax your face', guide: 'hold',
+      left: Math.round((samples.length / FRAMES) * 100),
+      right: Math.round((samples.length / FRAMES) * 100),
+    });
+    await sleep(30);
+  }
+  if (samples.length < DROP + 1) return null;
+
+  const kept = samples.slice(DROP);
+  const med = (pick: (m: FaceMetrics) => number) => {
+    const s = kept.map(pick).sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  // EAR ignores frames caught mid-blink so the open-eye reference stays honest.
+  const open = kept.map(m => m.ear).filter(e => e > 0.15).sort((a, b) => a - b);
+  const neutral: NeutralBaseline = {
+    ear: open.length ? open[Math.floor(open.length * 0.7)] : med(m => m.ear),
+    lift: med(m => m.lift), width: med(m => m.width), open: med(m => m.open),
+    yaw: med(m => m.yaw), skew: med(m => m.skew), centreX: med(m => m.centreX),
+  };
+  debugMetrics(`neutral(once): ear=${neutral.ear.toFixed(3)} lift=${neutral.lift.toFixed(4)} width=${neutral.width.toFixed(4)} open=${neutral.open.toFixed(3)} yaw=${neutral.yaw.toFixed(3)} skew=${neutral.skew.toFixed(3)} cx=${neutral.centreX.toFixed(3)}`);
+  return neutral;
 }
 
 /** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
@@ -369,6 +465,7 @@ export async function detectChallenge(
   timeoutMs = 12000,
   onStatus?: (cue: CaptureCue) => void,
   guard?: PresenceGuard,
+  neutral?: NeutralBaseline,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   // Calibrate by SAMPLE COUNT, not wall-clock. The first inference after a model
@@ -423,6 +520,10 @@ export async function detectChallenge(
   // translation barely changes it, a rotation changes it a lot.
   const YAW_DELTA = 0.085;
   const SKEW_DELTA = 0.05;
+  // Max allowed movement of the face across the frame while turning, as a
+  // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
+  // slide big enough to fake that yaw moves it 15-20%.
+  const CENTRE_DRIFT_MAX = 0.09;
   let earBelowCount = 0;
   let sawEyesOpen = false;
   // Calibrated neutrals (filled during the calibration frames).
@@ -432,7 +533,8 @@ export async function detectChallenge(
   const openSamples: number[] = [];
   const yawSamples: number[] = [];
   const skewSamples: number[] = [];
-  let openNeutral = 0, yawNeutral = 0.5, skewNeutral = 0;
+  const centreSamples: number[] = [];
+  let openNeutral = 0, yawNeutral = 0.5, skewNeutral = 0, centreNeutral = 0.5;
   let earOpen = 0, liftNeutral = 0, widthNeutral = 0;
   /** Deepest closure seen — reported on timeout so a near-miss is tunable. */
   let earMin = Infinity;
@@ -484,7 +586,14 @@ export async function detectChallenge(
     const pts = det.landmarks.positions as Point[];
 
     // ── Calibration: learn this user's neutral face ───────────────────────────
-    if (widthSamples.length < CALIBRATION_FRAMES) {
+    if (neutral && !widthNeutral) {
+      // Baseline supplied by the caller (measured before ANY action) — no
+      // per-action calibration, so it cannot capture the previous movement.
+      earOpen = neutral.ear; liftNeutral = neutral.lift; widthNeutral = neutral.width;
+      openNeutral = neutral.open; yawNeutral = neutral.yaw; skewNeutral = neutral.skew;
+      centreNeutral = neutral.centreX;
+    }
+    if (!neutral && widthSamples.length < CALIBRATION_FRAMES) {
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
       const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
       const ear = (rightEAR + leftEAR) / 2;
@@ -496,6 +605,7 @@ export async function detectChallenge(
       const y = yawSignals(pts);
       yawSamples.push(y.jawRatio);
       skewSamples.push(y.skew);
+      centreSamples.push(frameCentreX(pts, video.videoWidth));
       const pct = Math.round((widthSamples.length / CALIBRATION_FRAMES) * 100);
       onStatus?.({ label: 'Relax your face', guide, left: pct, right: pct });
       await sleep(30);
@@ -515,6 +625,7 @@ export async function detectChallenge(
       openNeutral = settled(openSamples);
       yawNeutral = settled(yawSamples);
       skewNeutral = settled(skewSamples);
+      centreNeutral = settled(centreSamples);
       debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)} open=${openNeutral.toFixed(3)} yaw=${yawNeutral.toFixed(3)} skew=${skewNeutral.toFixed(3)}`);
     }
 
@@ -560,14 +671,24 @@ export async function detectChallenge(
       const signed = y.jawRatio - yawNeutral;
       const skewΔ = y.skew - skewNeutral;
       const delta = Math.abs(signed);
-      // Two independent estimators, both past threshold and both moving the SAME
-      // way. Leaning or sliding sideways nudges the jaw ratio (perspective) but
-      // leaves the eye-referenced skew almost untouched, so it can no longer pass.
+      // Displacement is the ONLY thing that separates a head turn from a body
+      // shift: both produce identical yaw at the landmarks, because sliding
+      // sideways really does rotate the face relative to the lens. A rotation
+      // pivots at the neck and keeps the face roughly in place; a shift carries
+      // it across the frame. So yaw must arrive WITHOUT the face having moved.
+      const driftΔ = Math.abs(frameCentreX(pts, video.videoWidth) - centreNeutral);
+      const stayedPut = driftΔ <= CENTRE_DRIFT_MAX;
       const agree = Math.sign(signed) === Math.sign(skewΔ);
-      debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} agree=${agree}`);
-      if (delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree) {
+      debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} agree=${agree}`);
+      if (delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree && stayedPut) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
         return true;
+      }
+      if (!stayedPut) {
+        // Name the mistake instead of silently refusing to fill the bar.
+        onStatus?.({ label: 'Keep your head in place — turn, don\'t move', guide: 'turn', left: 0, right: 0 });
+        await sleep(60);
+        continue;
       }
       // Bar tracks the WEAKER signal, so it only fills on a genuine rotation.
       const pct = Math.min(99, Math.round(Math.min(

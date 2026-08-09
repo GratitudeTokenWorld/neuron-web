@@ -5,7 +5,7 @@ import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, CHALLENGE_SEQUENCE_ACTIONS, type ChallengeAction } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_SEQUENCE_ACTIONS, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
@@ -937,19 +937,26 @@ async function challengeAndCapture(
   }
   addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
 
+  // Measure the relaxed face ONCE, before the first prompt. Calibrating inside
+  // each action captured the tail of the previous one (still smiling, mouth
+  // still open) and broke the check that followed.
+  const neutral = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
+  if (!neutral) {
+    addLog(`FaceID: ${presence.lost ? 'face left the frame' : 'could not read a neutral face'}`, 'error');
+    return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
+  }
+
   for (const action of sequence) {
-    const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence);
+    const done = await detectChallenge(video, action, 12000, cue => renderCaptureCue(cue), presence, neutral);
     if (!done) {
       addLog(`FaceID: ${presence.lost ? 'face left the frame' : `challenge "${action}" not detected`}`, 'error');
       return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
     }
-    // Watched pause — a blind sleep here would be a free window to swap faces.
-    // Also long enough (and explicitly prompted) for the user to RETURN TO
-    // NEUTRAL: the next action calibrates its baseline immediately, and a
-    // baseline caught mid-action (mouth still open, head still turned) makes
-    // that check either unpassable or free.
+    // Watched pause — a blind sleep here would be a free window to swap faces —
+    // and a beat for the user to drop the previous expression before the next
+    // prompt (the baseline itself is now immune, measured once up front).
     renderCaptureCue({ label: 'Relax your face', guide: 'hold', left: 0, right: 0 });
-    if (!await holdPresence(video, 1200, presence, cue => renderCaptureCue(cue))) {
+    if (!await holdPresence(video, 1000, presence, cue => renderCaptureCue(cue))) {
       addLog('FaceID: face left the frame between checks', 'error');
       return { failure: { kind: 'presence' } };
     }
