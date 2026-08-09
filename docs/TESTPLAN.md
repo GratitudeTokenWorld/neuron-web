@@ -216,10 +216,10 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 | # | Test | Result | Notes |
 |---|------|--------|-------|
 | T1 | 2-attester account creation | ☑ | |
-| T2 | Cross-relay account sync | ☑ → ☐ | **Re-run needed:** G1 moved resolution to on-demand `/resolve` (2026-08-09) |
-| T3 | Transfers + offline claim | ☑ → ☐ | **Re-run needed:** send flow now resolves the recipient via `/resolve` |
-| T4 | NFT mint/transfer/burn | ☑ | Reload loss fixed in `482ac05`; transfer recipient now resolves on demand |
-| T5 | Recovery after wipe (1 relay down) | ☑ → ☐ | **Re-run needed:** blob integrity check now fetches the record via `/resolve` on a wiped device |
+| T2 | Cross-relay account sync | ☑ | Re-tested through G1 `/resolve` (2026-08-09) |
+| T3 | Transfers + offline claim | ☑ → ☐ | **Re-run needed:** G2 — payment claims now verify a `/head-proof` packet instead of pulling the sender's chain (wiped-recipient variant included) |
+| T4 | NFT mint/transfer/burn | ☑ → ☐ | **Re-run needed:** NFT claims still chain-pull (by design, until archive token records), but the discovery path changed (`/pending-sends`) |
+| T5 | Recovery after wipe (1 relay down) | ☑ | Re-tested through G1 (2026-08-09) |
 | T6 | Username uniqueness + face limit | ☑ | |
 | T7 | Operator-gated reset | ☐ | Skipped by decision — reset is a dev-mode affordance |
 

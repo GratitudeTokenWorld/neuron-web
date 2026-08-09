@@ -715,10 +715,10 @@ silently overloading validators.
 
 ## Deferred: scale-invariant gaps in the CURRENT build
 
-> **Status (2026-08-09): G1 is implemented** (pending the manual T2/T3/T5
-> re-run — resolution, transfers and recovery all cross the new `/resolve`
-> path). **G2 remains a live violation** with a measured fix design waiting
-> (`sim/counterparty.ts`).
+> **Status (2026-08-09): BOTH gaps are implemented.** G1 shipped and passed
+> the manual re-test; G2 shipped the same day (payments claim via proof
+> packets; NFT claims stay on the chain-pull path until the archive serves
+> token records). Pending: a manual T3/T4 re-run through the proof path.
 
 **G1 — The global `accounts` topic is `O(N)`. FIXED 2026-08-09 (client dir
 ingest gone; awaiting manual T2 re-verify).** What shipped:
@@ -754,21 +754,34 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   existing verified delta path. O(own inbound); the relay's answer is a hint,
   never trusted state.
 
-**G2 — Counterparty verification replicates whole chains.**
-A recipient pulls the sender's **entire account chain** to verify one payment
-(delta sync), and keeps it. Per-node cost is therefore
-`O(own + Σ counterparty chain lengths)` — fine for a personal wallet, unbounded
-for a high-counterparty account (a merchant paid by 100k people holds 100k
-chains). Startup makes this concrete: the node refreshes every held foreign chain
-so an offline-received send is not missed ([`node.ts`](../src/network/node.ts)
-`start()`), which is `O(held accounts)` delta requests in a burst. *Designed fix
-(Subsystem 1, principle 3 "verify without holding"):* verify the sender's head
-via a per-account **Merkle accumulator inclusion proof** from a super-node in
-`O(log n)`, keep only your own receive block + the proof, and drop the foreign
-chain. Also caps the startup refresh (proof re-check, not chain re-pull).
-*The fix is measured:* `sim/counterparty.ts` builds the packet from real chains
-and proofs — 3.45 KB flat vs a 571 KB chain pull at length 1,024, adversarial
-cases rejected (see *Measured baseline*).
+**G2 — Counterparty verification replicates whole chains. FIXED 2026-08-09
+(payments; NFTs interim — awaiting manual T3/T4 re-verify).** What shipped:
+- **Proof packets replace chain pulls for payments.** On an inbox signal or a
+  `/pending-sends` hint, the recipient fetches **`GET /head-proof`** from a
+  relay archive — `{open, head, send}` blocks + two RFC-6962 audit paths —
+  verifies everything against the sender's own signatures
+  (`engine/core/counterparty-proof.ts`, promoted from the sim harness:
+  verified-human genesis, signed head, send inclusion), registers **exactly
+  one block** (the send) via `EngineLedger.registerVerifiedSend`, and claims
+  through the unchanged receive path. ~3.4 KB flat vs the O(chain) pull —
+  the measured `sim/counterparty.ts` curve, now live. Falls back to the old
+  chain pull if no relay can serve a packet.
+- **The startup foreign-chain refresh burst is gone** — offline sends are
+  found by `/pending-sends` (O(own inbound)), so per-node cost no longer
+  grows with how many accounts ever paid this node (the merchant case).
+- **Fraud safety moved with it, not weakened:** recipients no longer hold
+  sender chains, so the ARCHIVE tier now notices same-height forks (height
+  index in `relay/server.ts`) and gossips both blocks on the shard's conflict
+  topic; every client freezes the equivocator through the existing
+  self-verifying evidence path (`fraud.ts`), and the recipient subscribes to
+  the sender's shard for the challenge window. Adversarial tests cover
+  tampered amounts, mis-addressed claims, foreign-chain sends, truncated
+  proofs, double-claims and frozen senders
+  (`src/ledger/counterparty-claim.test.ts`).
+- **Interim:** NFT claims still pull the sender's chain — the claim needs the
+  token's MINT record (content CID + metadata), which lives on the minter's
+  chain; the packet verifier already accepts `nft-send`, so moving NFTs over
+  needs only an archive token-record endpoint.
 
 **Consequence to keep in mind meanwhile (correct, not a bug):** node views are
 *asymmetric by design* — a recipient holds the sender's chain, the sender holds

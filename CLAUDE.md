@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **213 tests / 52 files passing**, `npm run build` clean.
+Current baseline: **219 tests / 53 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-09)
@@ -50,17 +50,17 @@ The manual E2E matrix passed end to end on the two-relay dev network
 cross-relay sync, transfers both ways incl. offline claim, NFT mint/transfer/
 burn/reload, recovery-after-wipe and the uniqueness+face limits all work.
 
-**Next up is the architecture work, not more app fixes.** Phase status and the
-recommended order live in ARCHITECTURE.md → *Where this stands*. The
-`src/engine/sim` baseline is **done** (2026-08-09, incl. a 10B projection —
-ARCHITECTURE.md → *Measured baseline*), and **G1 is implemented** the same day:
-clients no longer subscribe to the global `accounts` topic; relays archive
-records (`.relay-accounts.json`) and serve **GET `/resolve`**; clients resolve
-on demand + verify signatures (`src/network/account-resolver.ts`,
-`node.resolveAccount`). ⚠ **Needs a manual TESTPLAN T2/T3/T5 re-run** (face
-flows can't be automated) and a relay deploy to both cloud boxes before that.
-Next: **G2** (counterparty chain replication → proof packets, measured target
-in `sim/counterparty.ts`).
+**Both scale gaps are closed (2026-08-09).** The `src/engine/sim` baseline ran
+(incl. a 10B projection — ARCHITECTURE.md → *Measured baseline*); **G1**
+(global `accounts` topic → on-demand `/resolve` + `/pending-sends`, manually
+re-tested) and **G2** (counterparty chain pulls → `/head-proof` proof packets
+for payments; archive-side fork detection preserves fraud safety) are both
+implemented and deployed to the cloud relays, with an automated live probe in
+`scripts/g1-resolve-smoke.mts` (run it after every relay deploy). ⚠ G2 still
+needs a **manual T3/T4 pass** (face flows can't be automated); NFT claims
+remain on the chain-pull path until the archive serves token records.
+Next: **Phase 3 wiring** (storage CDN — `storage-manager.ts` off the legacy
+`DAGLedger`), then Phase 4, per ARCHITECTURE.md → *Where this stands*.
 
 `vitest.config.ts` is deliberately separate from `vite.config.ts` so the test run does
 not load the libp2p plugin (which spawns a relay).
