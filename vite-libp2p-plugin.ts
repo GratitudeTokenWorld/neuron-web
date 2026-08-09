@@ -24,8 +24,12 @@ export function libp2pRelay(): Plugin {
       env: {
         ...process.env,
         PORT: '9090',
-        // LOCAL_ONLY=1 → don't dial the neuronweb.org peer relay (isolated local stack).
-        PEER_RELAYS: process.env.LOCAL_ONLY ? '' : '/dns4/neuronweb.org/tcp/9090/ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+        // LOCAL_ONLY=1 → don't dial any peer relay (isolated local stack).
+        // Otherwise PEER_RELAYS env wins, falling back to the two cloudify dev
+        // super-nodes (keep in sync with __BOOTSTRAP_ADDRS__ in vite.config.ts).
+        PEER_RELAYS: process.env.LOCAL_ONLY ? '' : (process.env.PEER_RELAYS
+          || '/ip4/80.97.27.224/tcp/9091/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh,'
+           + '/ip4/80.97.27.112/tcp/9091/p2p/12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU'),
       },
     });
 

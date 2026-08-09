@@ -52,10 +52,14 @@ export default defineConfig({
     // LOCAL_ONLY=1 omits the neuronweb.org bootstrap so a local dev stack is fully
     // isolated (no production/stale state leaks in). Clients still find the local
     // relay via /relay-info.
+    // Current default relays: the two cloudify.ro dev super-nodes (archive + attester
+    // each — docs/CLOUD.md). Raw-IP ws/http endpoints: reachable from http://localhost
+    // dev pages only (mixed content blocks them from https pages — docs/TESTPLAN.md).
+    // The previous production relays (neuronweb.org, akashicrecords.dev) are replaced.
     __BOOTSTRAP_ADDRS__: JSON.stringify([
       ...(process.env.LOCAL_ONLY ? [] : [
-        '/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
-        '/dns4/akashicrecords.dev/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWGaTPZoVcAno7WVzDG87ywozCnZYm6gHfiH9dBPpuBxN2',
+        '/ip4/80.97.27.224/tcp/9090/ws/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh',
+        '/ip4/80.97.27.112/tcp/9090/ws/p2p/12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU',
       ]),
       ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
     ]),

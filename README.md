@@ -5,9 +5,14 @@ face+PIN identity, relay) carried over and being re-platformed onto a new
 **sharded, age-weighted-personhood engine** designed to scale to 1B+ users.
 
 - `npm run dev` runs the app exactly like neuronchain (same UI).
-- `src/engine/` is the new scalable core — a tested library (96 tests) that the
-  app's ledger/consensus/storage are being refactored onto.
+- `src/engine/` is the new scalable core — a tested library that the app's
+  ledger/consensus/storage are being refactored onto. The engine **is** wired in
+  (`node.ts` runs `EngineLedger`); the remaining seam is the app-layer types +
+  `storage-manager` (see `CLAUDE.md`). Test suite: 197 passing.
 - The full design + threat model + measured results: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+- Ops: relay/super-node deployment [`docs/SUPERNODE.md`](docs/SUPERNODE.md), cloud
+  provisioning [`docs/CLOUD.md`](docs/CLOUD.md), manual E2E matrix
+  [`docs/TESTPLAN.md`](docs/TESTPLAN.md).
 
 ## Run / deploy
 
@@ -48,15 +53,15 @@ src/
 ## Status
 
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
-- **Engine** (`src/engine/`) — phases 0–4 + end-to-end capstone, **96 tests passing,
-  typechecked**, with **all 7 scale-invariants demonstrated by tests** (see
-  `docs/ARCHITECTURE.md`). It is integrated into the repo but not yet wired into
-  the app's hot path.
-- **Next** — the refactor: replace the app's `src/core/dag-ledger` + `vote` +
-  `src/network/storage-manager` internals with the `src/engine` equivalents
-  (sharded account chains, committee consensus, DHT content), keeping the UI,
-  face+PIN, and transport shells. Then the live-transport items
-  (real Kademlia/beacon/VRF, smoke-HTTP CDN, load tests) noted in the architecture doc.
+- **Engine** (`src/engine/` + `src/ledger/`) — phases 0–4, Phase 2 consensus
+  (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
+  **197 tests passing, engine typechecked**, all 7 scale-invariants demonstrated
+  by tests (see `docs/ARCHITECTURE.md`). Wired into the app via `EngineLedger`
+  (`src/network/node.ts`).
+- **Next** — finish the app-layer seam (unify legacy `AccountBlock`/`Account`
+  types, migrate `storage-manager`, drop the DAGLedger compat surface), then the
+  live-transport items (real Kademlia/beacon/VRF, smoke-HTTP CDN, load tests)
+  noted in the architecture doc. Manual two-relay validation: `docs/TESTPLAN.md`.
 
 ## Engine — measured scale invariants
 

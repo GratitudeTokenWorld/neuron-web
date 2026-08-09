@@ -1569,18 +1569,61 @@ function faceVerifyEndpoint(base: string, endpoint: string): string {
 }
 
 /**
+ * HTTP base for a relay's `/relay-info` + `/face-verify/*` endpoints, derived
+ * from its multiaddr. Two shapes:
+ *  - `/dns4/<host>/…/wss/…`  → `https://<host>`      (nginx-fronted production relay)
+ *  - `/ip4/<ip>/tcp/<p>/ws`  → `http://<ip>:<p+2>`   (bare dev relay; HTTP is PORT+2)
+ * Empty string ⇒ same-origin relay → use the relative path (Vite/nginx proxy).
+ */
+function relayHttpBase(addr: string | undefined): string {
+  if (!addr) return '';
+  const dns = addr.match(/\/dns[46]\/([^/]+)\//);
+  if (dns) {
+    if (typeof window !== 'undefined' && dns[1] === window.location.hostname) return ''; // origin → relative
+    return `https://${dns[1]}`;
+  }
+  const ip = addr.match(/\/ip4\/([^/]+)\/tcp\/(\d+)\/ws(\/|$)/);
+  if (ip) return `http://${ip[1]}:${Number(ip[2]) + 2}`;
+  return '';
+}
+
+/**
  * Face-verify HTTP base for a relay (attester-#2): its announced `faceVerifyUrl`,
- * else derived from its `/dns4/<host>/` multiaddr — so a SECONDARY relay is
- * reachable cross-origin for attestation (its `/face-verify` sets CORS `*`). The
+ * else derived from its multiaddr — so a SECONDARY relay is reachable
+ * cross-origin for attestation (its `/face-verify` sets CORS `*`). The
  * origin relay (and dev) uses a relative path. Empty string ⇒ relative.
  */
 function relayFaceVerifyBase(relay: import('./network/libp2p-network').KnownRelayRecord): string {
   if (relay.faceVerifyUrl) return relay.faceVerifyUrl;
-  const m = relay.addr?.match(/\/dns[46]\/([^/]+)\//);
-  if (!m) return '';
-  const host = m[1];
-  if (typeof window !== 'undefined' && host === window.location.hostname) return ''; // origin → relative
-  return `https://${host}`; // secondary relay → absolute cross-origin
+  return relayHttpBase(relay.addr);
+}
+
+/**
+ * Fill in missing `signingPub` on known-relay records by asking each relay's
+ * `/relay-info` (CORS `*`) directly. Baked bootstrap relays are registered
+ * addr-only ([libp2p-network] upsertKnownRelay(addr, '')), and their signingPub
+ * normally arrives via `relays` gossip from OTHER clients — which never happens
+ * for the first/only browser on the network. Without this, a fresh client sees
+ * one eligible attester and k-of-N account creation is impossible (the
+ * "account creation did not sync" failure mode). Transient enrichment only —
+ * gossip remains the durable path.
+ */
+async function withAttesterKeys(
+  relays: import('./network/libp2p-network').KnownRelayRecord[],
+): Promise<import('./network/libp2p-network').KnownRelayRecord[]> {
+  return Promise.all(relays.map(async r => {
+    if (r.signingPub) return r;
+    const base = relayHttpBase(r.addr);
+    if (!base) return r; // same-origin relay is handled by the /relay-info fallback
+    try {
+      const res = await fetch(`${base}/relay-info`, { signal: AbortSignal.timeout(4000) });
+      if (res.ok) {
+        const info = await res.json() as { signingPub?: string };
+        if (info.signingPub) return { ...r, signingPub: info.signingPub };
+      }
+    } catch { /* relay unreachable — leave record as-is */ }
+    return r;
+  }));
 }
 
 function pickRandomRelays(relays: import('./network/libp2p-network').KnownRelayRecord[], n: number) {
@@ -1716,7 +1759,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // instruction during enrollment so the user performs the action on camera.
     setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
     overlay.textContent = 'Contacting relay nodes...';
-    const pendingChallenges = await getRelayChallenges(pickRandomRelays(node.getKnownRelays(), 5));
+    const pendingChallenges = await getRelayChallenges(pickRandomRelays(await withAttesterKeys(node.getKnownRelays()), 5));
 
     // Active challenge: detect the relay-issued action before face capture.
     // This blocks enrollment until the user performs the action (blink/smile/look-left/right).

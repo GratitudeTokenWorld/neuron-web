@@ -1,5 +1,14 @@
 # Super-node / relay operations (neuronweb.org)
 
+> **Dev-relay variant (2026-08):** for the two bare-IP dev boxes on cloudify.ro
+> (no domain / no nginx / no TLS), provisioning is scripted —
+> [`scripts/setup-relay-box.sh`](../scripts/setup-relay-box.sh) — with ports
+> 9090–9092 exposed directly and clients connecting via `/ip4/<ip>/tcp/9090/ws`
+> multiaddrs + `http://<ip>:9092` for `/relay-info` + `/face-verify`. That works
+> only from `http://localhost` dev pages (mixed content blocks it from https).
+> Everything below (nginx/TLS/domain) is the *production* deployment shape.
+> Manual test matrix for the dev pair: [TESTPLAN.md](TESTPLAN.md).
+
 The same process (`relay-server.ts`) plays three roles. From Phase 1 it is also the
 network's first **archival super-node**.
 

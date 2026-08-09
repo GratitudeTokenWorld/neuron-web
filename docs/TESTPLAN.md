@@ -1,0 +1,136 @@
+# Manual E2E test plan — two-relay dev network
+
+The features that need a real face + camera cannot be automated; this is the manual
+matrix. It exercises everything the 197-test suite cannot: live libp2p transport,
+cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
+
+**Topology under test:** 2 cloud relays (super-node archive + attester each, IPs
+`RELAY1_IP` / `RELAY2_IP` below) + your local dev relay + 2 browser profiles.
+Provisioning: [CLOUD.md](CLOUD.md); box setup: `scripts/setup-relay-box.sh`.
+
+## Before you start
+
+```powershell
+# dev stack pointed at both cloud relays (replace IPs + peerIds; get peerIds from
+#   curl http://<IP>:9092/relay-info )
+$env:PEER_RELAYS = '/ip4/RELAY1_IP/tcp/9091/p2p/PEERID1,/ip4/RELAY2_IP/tcp/9091/p2p/PEERID2'
+$env:BOOTSTRAP_ADDRS = '/ip4/RELAY1_IP/tcp/9090/ws/p2p/PEERID1,/ip4/RELAY2_IP/tcp/9090/ws/p2p/PEERID2'
+npm run dev
+```
+
+Rules that will save you a debugging session:
+
+- **Open the app at `http://localhost:5173` — not the LAN IP, not the tunnel.**
+  `localhost` is a secure context (camera works) that still allows plain `ws://` and
+  `http://` to the raw-IP relays. The `https` tunnel would block both as mixed content.
+- Two "users" = two browser *profiles* (or normal + incognito), so each has its own
+  IndexedDB. Same machine is fine.
+- Relay logs while testing: `ssh ubuntu@<IP> "pm2 logs neuron-relay --lines 50"`.
+  Attestations log as `[Attester] personhood attestation acct=…`, archived blocks as
+  `[Archive] Stored …` (with `DEBUG_ARCHIVE=1`).
+- Testnet face limit is 3 accounts/face (relay-tunable); mainnet is 1.
+- A 1–2 account network stays at optimistic `confirmed`, not `final` — committee
+  finality needs a real validator population. **Not a bug.**
+
+## T1 — Account creation with 2-of-2 attesters (the previously-broken flow)
+
+The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creation
+*must* reach two distinct attesters or fail with "Need 2 independent attesters".
+
+1. Browser A → Create Account → username `alice` → face + PIN enrollment.
+2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
+   panel then shows `2/2` (or `3/3`) independent attestations.
+3. **Pass:** account opens; balance = 1,000,000 UNIT.
+4. **Cross-relay dedup:** watch both relays' logs — each should log the attestation.
+   The nullifier from attester #1 is what the open block commits.
+5. **Fail signatures to watch for** (the old bugs):
+   - `1/2 attestations` → the client couldn't reach attester #2. Check
+     `http://RELAY2_IP:9092/relay-info` returns `signingPub`, and that the browser
+     console shows no CORS error on `/face-verify/challenge` (needs `x-network` in
+     `Access-Control-Allow-Headers` — fixed in `624d0d8`).
+   - Attestation succeeds but account invisible in Browser B → see T2.
+
+## T2 — Account sync across relays (the "did not sync" bug)
+
+1. Browser B (other profile) → create `bob` (same face is fine on testnet, limit 3).
+2. In Browser A, look up `bob` (search/profile). **Pass:** bob's account + username
+   resolve in A within ~10 s without either browser talking to the other directly
+   (close B's tab first for a stricter test: A must get bob's chain from a relay
+   archive, not from B).
+3. Reload Browser A (F5). **Pass:** alice persists, balance intact, no re-enrollment.
+4. `curl http://RELAY1_IP:9092/relay-info` and RELAY2: same `generation`, and both
+   relays' logs show bob's open block archived (`[Archive] Stored open …`).
+
+## T3 — Transfer (the "transfers did not work" bug)
+
+Background: a transfer is sender `send` block + recipient `receive` (claim) block.
+The recipient claims via the unclaimed-receive sweep (`autoClaimPending`) — the fix
+history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
+
+1. Browser A: send 1,000 UNIT to `bob`. **Pass (sender):** alice's balance drops
+   immediately; block status `pending` → `confirmed` after the challenge window.
+2. Browser B (open): **Pass (recipient):** bob's balance rises without manual action
+   within ~15 s (auto-claim sweep).
+3. **Offline-recipient variant:** close B entirely; A sends another 1,000. Reopen B
+   after a minute. **Pass:** the sweep claims the pending send on startup — balance
+   includes it.
+4. Reload both browsers. **Pass:** balances identical after reload (claims are
+   on-chain, not local state).
+5. **Double-spend guard (fraud proofs):** nothing to do manually — but if a balance
+   ever *rises* on reload, capture both browsers' logs + relay archives immediately.
+
+## T4 — NFTs (native ownership — this is the "smart contract" surface)
+
+> ⚠ There is **no contract VM to test**: `createDeploy`/`createCall` are deferred
+> stubs returning "not available", *by design* (ARCHITECTURE.md rejects a general VM;
+> content ownership is native NFTs instead — B1/B2 commits). Test NFTs:
+
+1. Browser A: mint an NFT (content + metadata). **Pass:** NFT appears with alice as
+   owner; visible from Browser B after sync.
+2. A transfers the NFT to `bob`. **Pass:** ownership flips in both browsers;
+   same-browser receive works (`97e1c9d`); bob can see/render the content.
+3. B burns it (if UI exposes burn). **Pass:** gone from both.
+4. Reload both. **Pass:** ownership state survives.
+
+## T5 — Recovery after wipe (redundant durability)
+
+1. Browser B: note bob's balance. Wipe site data completely (DevTools → Application
+   → Clear storage), or use a third profile.
+2. Recover bob: username + face + PIN. **Pass:** account restores with full balance
+   and history — key-blob served from a relay archive (`c9ac182`), chain from the
+   delta archive. Do this once with relay #1 stopped (`pm2 stop neuron-relay`) to
+   prove relay #2 alone suffices; restart afterwards.
+
+## T6 — Username uniqueness + face limit
+
+1. Third profile: try creating another `alice` (different face if you have a
+   volunteer; same face otherwise). **Pass:** rejected — username already attested
+   (`6f6317b`, per-human `nid` claim `5befd13`).
+2. Create accounts until the same face exceeds the testnet limit (3).
+   **Pass:** attester returns the face-limit error, client shows it cleanly.
+
+## T7 — Operators & reset (do this LAST)
+
+The first 3 accounts attested by a fresh relay become its operators (`.relay-operators.json`).
+
+1. `curl http://RELAY1_IP:9092/relay-info` → `operators` contains alice (first 3).
+2. From a *non*-operator profile: Reset Testnet. **Pass:** relays ignore it (only
+   that browser clears + resyncs).
+3. From alice (first account in that browser): Reset Testnet. **Pass:** both relays
+   wipe (`[Archive] WIPED by operator`), `generation` increments on both
+   `/relay-info`, and every open browser clears on next refresh.
+
+## Result log
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| T1 | 2-attester account creation | ☐ | |
+| T2 | Cross-relay account sync | ☐ | |
+| T3 | Transfers + offline claim | ☐ | |
+| T4 | NFT mint/transfer/burn | ☐ | |
+| T5 | Recovery after wipe (1 relay down) | ☐ | |
+| T6 | Username uniqueness + face limit | ☐ | |
+| T7 | Operator-gated reset | ☐ | |
+
+File failures with: browser console log, `pm2 logs` from both relays, and which
+browser/profile was which account.

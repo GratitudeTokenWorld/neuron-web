@@ -54,6 +54,7 @@
     "vitest": "^4.1.8"
   },
   "overrides": {
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "react-native-webrtc": "npm:empty-npm-package@1.0.0"
   }
 }

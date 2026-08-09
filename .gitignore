@@ -14,3 +14,8 @@ coverage/
 # atomic-write .tmp/.bak sidecars.
 .relay-*
 reload.log
+
+# OpenStack credentials (application-credential secret) — never commit.
+*.openrc
+*credentials*.txt
+.openstack-venv/
