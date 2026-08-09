@@ -195,7 +195,11 @@ export async function holdPresence(
 export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
   try {
     const detection = await faceapi
-      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+      // 320, not 416: the larger input missed the face repeatedly during capture
+      // (observed 9 misses across 3 samples) while every other stage runs happily
+      // at 320. Detector input size sets the bounding box; the descriptor itself
+      // is computed from a fixed-size aligned crop, so quality is unaffected.
+      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
       .withFaceLandmarks()
       .withFaceDescriptor();
 
@@ -595,7 +599,7 @@ export async function detectChallenge(
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
-  const BROW_DELTA = 0.012;
+  const BROW_DELTA = 0.025;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
