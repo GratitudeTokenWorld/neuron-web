@@ -1100,7 +1100,10 @@
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
             </g>
             <g class="cg-mouth">
-              <ellipse class="cg-line cg-jaw" cx="100" cy="100" rx="17" ry="12"/>
+              <!-- cy 106, not 100: the mouth sits lower on the face than the
+                   midpoint the eye dots imply, and the open-jaw ellipse read as
+                   too high over a live feed. Still clears the oval (bottom 132). -->
+              <ellipse class="cg-line cg-jaw" cx="100" cy="106" rx="17" ry="12"/>
               <circle class="cg-line" cx="78" cy="64" r="2.5"/>
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
             </g>
