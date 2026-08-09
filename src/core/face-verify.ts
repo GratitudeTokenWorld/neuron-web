@@ -192,7 +192,7 @@ export async function holdPresence(
     }
     if (solo.count === 1) markSeen(guard);
     if (absenceBroken(guard)) {
-      onStatus?.({ label: 'Face lost — start again', guide: 'search', state: 'fail', left: 0, right: 0 });
+      onStatus?.({ label: noFaceLabel(video, 'Face lost — start again'), guide: 'search', state: 'fail', left: 0, right: 0 });
       return false;
     }
     await sleep(80);
@@ -269,7 +269,7 @@ export async function enrollFace(
     if (!desc) {
       if (retries++ > 10) { debugMetrics('enroll GAVE UP after 10 misses'); return null; }
       onProgress(i + 1, ENROLLMENT_SAMPLES, {
-        label: 'Look at the camera', guide: 'search', left: pct(i), right: pct(i),
+        label: noFaceLabel(video, 'Look at the camera'), guide: 'search', left: pct(i), right: pct(i),
       });
       i--;
       if (!await holdPresence(video, 1000, guard, c => onProgress(i + 2, ENROLLMENT_SAMPLES, c))) return null;
@@ -314,6 +314,60 @@ function dist(a: Point, b: Point): number {
  * that second face. A missed detection here is a spoof that walks through.
  */
 const SOLO_SCORE = 0.3;
+
+/**
+ * Mean luminance of the current frame, 0-255, or -1 if it cannot be sampled.
+ *
+ * The detector has no concept of lighting. In a dim room the face score simply
+ * drops under `scoreThreshold` and the detection disappears — a result byte-for
+ * byte identical to an empty frame — so the user is told to show their face
+ * while they are already showing it. Sampling the pixels is the only way to
+ * separate "nobody there" from "cannot see anybody".
+ *
+ * 64x48 and only called on a MISS, so it never touches the common path.
+ */
+let lumaCanvas: HTMLCanvasElement | null = null;
+function frameBrightness(video: HTMLVideoElement): number {
+  try {
+    if (!video.videoWidth) return -1;
+    if (!lumaCanvas) {
+      lumaCanvas = document.createElement('canvas');
+      lumaCanvas.width = 64; lumaCanvas.height = 48;
+    }
+    const ctx = lumaCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return -1;
+    ctx.drawImage(video, 0, 0, 64, 48);
+    const { data } = ctx.getImageData(0, 0, 64, 48);
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+    }
+    return sum / (data.length / 4);
+  } catch { return -1; }
+}
+
+/**
+ * Starting value, not a measured one — unlike the detection thresholds, being
+ * wrong here only changes the WORDING of a message, never whether a check
+ * passes. Every miss logs its luma, so a `neuron_debug` trace from a real dim
+ * room gives the number to replace it with.
+ */
+const DARK_LUMA = 45;
+
+/**
+ * Message for a frame with no usable face: name the darkness when that is the
+ * likely cause, otherwise fall back to the caller's wording.
+ *
+ * Deliberately does NOT relax the presence budget. Covering the lens produces a
+ * dark frame too, so treating darkness as forgivable would hand an attacker a
+ * free unwatched window mid-sequence — exactly what the continuity guard exists
+ * to close. Only the explanation improves; the timeout is unchanged.
+ */
+function noFaceLabel(video: HTMLVideoElement, fallback: string): string {
+  const luma = frameBrightness(video);
+  if (luma >= 0) debugMetrics(`no face detected; frame luma=${luma.toFixed(0)} (dark below ${DARK_LUMA})`);
+  return luma >= 0 && luma < DARK_LUMA ? 'Too dark — add more light' : fallback;
+}
 
 /**
  * Exactly one face, or nothing.
@@ -612,7 +666,7 @@ export async function calibrateNeutral(
 
     if (!dets.length || !dets[0]?.landmarks) {
       if (absenceBroken(guard)) return fail('presence');
-      onStatus?.({ label: 'Show your face', guide: 'search', left: 0, right: 0 });
+      onStatus?.({ label: noFaceLabel(video, 'Show your face'), guide: 'search', left: 0, right: 0 });
       samples.length = 0;
       await sleep(80);
       continue;
@@ -975,7 +1029,7 @@ export async function detectChallenge(
     if (!det?.landmarks) {
       // A miss counts toward the continuity budget — this is where a swap shows up.
       if (absenceBroken(guard)) {
-        onStatus?.({ label: 'Face lost — start again', guide: 'search', state: 'fail', left: 0, right: 0 });
+        onStatus?.({ label: noFaceLabel(video, 'Face lost — start again'), guide: 'search', state: 'fail', left: 0, right: 0 });
         return false;
       }
       await sleep(100); continue;
