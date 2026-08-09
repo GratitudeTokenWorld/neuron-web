@@ -832,8 +832,15 @@ export async function detectChallenge(
   // 0.105-0.33. 0.085 sat at the top of the "slight" band, which is why a small
   // movement filled the bar immediately. 0.13 sits below every deliberate turn
   // measured and above every slight one.
-  const YAW_DELTA = 0.13;
-  const SKEW_DELTA = 0.09;
+  // Raised on request so the bar fills roughly half as fast per degree turned.
+  // 0.22, not a literal 2x: the last trace peaked at jaw 0.133 and stopped
+  // there because it passed, so the true ceiling is unknown from that run —
+  // 0.26 would sit above everything recorded. 0.22 makes the same turn read
+  // ~60%, demanding a visibly further rotation while staying inside the
+  // 0.105-0.33 band deliberate turns have historically produced. Skew tracks at
+  // ~1.4x jaw in practice, so it moves with it and stays the looser of the two.
+  const YAW_DELTA = 0.22;
+  const SKEW_DELTA = 0.15;
   // Max allowed movement of the face across the frame while turning, as a
   // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
   // slide big enough to fake that yaw moves it 15-20%.
@@ -862,7 +869,11 @@ export async function detectChallenge(
   // 0.032-0.066. 0.020 sat at only 2.5x the resting maximum and a third of a
   // real raise, which is why it passed on almost nothing. 0.032 is 4x resting
   // noise and still only half of the measured raise.
-  const BROW_DELTA = 0.032;
+  // 0.038 = 0.032 + 20%, on request. Note this is close to the top of what the
+  // last trace recorded: the raise ran 0.031 -> 0.042, so only the final frames
+  // clear it and they must still hold for SUSTAIN_MS. If a genuine raise starts
+  // timing out, this is the number to walk back first.
+  const BROW_DELTA = 0.038;
   const BROW_WINDOW_MS = 400;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
@@ -1237,7 +1248,22 @@ export async function detectChallenge(
       // otherwise a long hold drags the reference down to meet the closure and
       // the test can never fire (observed: openRef decaying 0.329 -> 0.304 while
       // the eyes stayed shut).
-      if (windowMean > closedBelow) {
+      // Feed only frames that are CLEARLY open, judged against the reference
+      // itself — not merely frames that have not passed yet.
+      //
+      // `windowMean > closedBelow` meant "not currently passing", which is true
+      // for the entire descent into a closure, so every frame on the way down
+      // fed the reference and dragged it after the eyes. Logged: the reference
+      // fell 0.318 -> 0.292 during one closure, the threshold followed to 0.274,
+      // and a mean of 0.286 — a perfectly good closure that would have passed
+      // against the pre-closure reference — never caught it. The check became
+      // unpassable by chasing its own target, which is the same failure the
+      // earlier fix was meant to stop; it just came back through a looser test.
+      //
+      // Requiring the frame to sit within 40% of a margin of the reference keeps
+      // slow drift tracked while a closure, which is a full margin away, stops
+      // contributing the moment it begins.
+      if (ear >= openRef - margin * 0.4) {
         openRefHist.push({ t: now, ear });
         while (openRefHist.length && now - openRefHist[0].t > OPEN_REF_MS) openRefHist.shift();
       }
