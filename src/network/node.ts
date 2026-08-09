@@ -1,7 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends } from './account-resolver';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -91,6 +91,7 @@ export class NeuronNode extends EventEmitter {
   private publishInterval: ReturnType<typeof setInterval> | null = null;
   private resyncDebounce: ReturnType<typeof setTimeout> | null = null;
   private publishDebounce: ReturnType<typeof setTimeout> | null = null;
+  private pendingInboundTimer: ReturnType<typeof setInterval> | null = null;
   /** P2/C3: blocks waiting for their parent to arrive, keyed by previousHash. Entries older than 5 min are evicted. */
   private pendingBlocks: Map<string, { blocks: AccountBlock[]; addedAt: number }> = new Map();
   /** Phase 1: engine blocks waiting for their parent, keyed by previousHash (same TTL/eviction). */
@@ -629,7 +630,10 @@ export class NeuronNode extends EventEmitter {
       setTimeout(() => this.sweepUnclaimedReceives(), 1000);
       // Slice 4c: an account added after start (recovery, new device) must pull its
       // own chain — the start() bootstrap only covers accounts present at startup.
-      setTimeout(() => this.engineResyncAccount(pub), 1500);
+      // Also discover sends made while this account was offline/wiped (G1
+      // follow-up): a fresh recovery holds no sender chains to refresh, so
+      // without this ask-the-archive step a pending transfer is never found.
+      setTimeout(() => { this.engineResyncAccount(pub); this.checkPendingInbound(pub); }, 1500);
     }
   }
 
@@ -732,7 +736,20 @@ export class NeuronNode extends EventEmitter {
     // super-node archive serves them), so a fresh/recovered device restores its
     // balance without waiting for a periodic re-broadcast. Delayed so relay/peer
     // connections + shard meshes form first.
-    setTimeout(() => { for (const pub of this.localKeys.keys()) this.engineResyncAccount(pub); }, 6000);
+    setTimeout(() => {
+      for (const pub of this.localKeys.keys()) {
+        this.engineResyncAccount(pub);
+        // G1 follow-up: also discover inbound sends made while we were offline
+        // (the archive knows; the one-shot inbox signal does not replay).
+        this.checkPendingInbound(pub);
+      }
+    }, 6000);
+    // Backstop: re-check pending inbound once a minute while running, so a
+    // missed inbox signal (mesh not formed yet, tab asleep) heals without a
+    // reload. Two tiny GETs per account per minute — interest-scoped.
+    this.pendingInboundTimer = setInterval(() => {
+      for (const pub of this.localKeys.keys()) this.checkPendingInbound(pub);
+    }, 60_000);
     // ALSO refresh every held FOREIGN chain (counterparties we verified before).
     // A send made while this node was OFFLINE lives on the sender's chain; inbox
     // gossip is not replayed, so without this pull the new send block never
@@ -882,6 +899,7 @@ export class NeuronNode extends EventEmitter {
     if (this.resyncInterval) { clearInterval(this.resyncInterval); this.resyncInterval = null; }
     if (this.publishInterval) { clearInterval(this.publishInterval); this.publishInterval = null; }
     if (this.relayLivenessInterval) { clearInterval(this.relayLivenessInterval); this.relayLivenessInterval = null; }
+    if (this.pendingInboundTimer) { clearInterval(this.pendingInboundTimer); this.pendingInboundTimer = null; }
     if (this.resyncDebounce) { clearTimeout(this.resyncDebounce); this.resyncDebounce = null; }
     if (this.publishDebounce) { clearTimeout(this.publishDebounce); this.publishDebounce = null; }
     this.storage.stop();
@@ -1117,6 +1135,29 @@ export class NeuronNode extends EventEmitter {
     await this.net.cacheAccount(rec as unknown as Record<string, unknown>);
     this.emit('account:synced', rec);
     return String(rec.pub);
+  }
+
+  /**
+   * G1 follow-up — offline-transfer discovery. Ask the relays' block archives
+   * which send/nft-send blocks are addressed to `pub`, and pull each still-
+   * unknown sender's chain exactly like an inbox signal would. This is what
+   * lets a recipient that was OFFLINE during the send — including a wiped
+   * device that just recovered — find and claim it: the one-shot inbox signal
+   * is long gone, and the startup refresh only re-pulls chains the node
+   * already holds. (Before G1 this worked by accident: the O(N) accounts
+   * firehose taught a fresh device every account that existed.) The relay's
+   * answer is a hint only — the delta pull verifies everything.
+   */
+  private async checkPendingInbound(pub: string): Promise<void> {
+    try {
+      const hints = await fetchPendingSends(this.relayResolveBases(), pub, this.ledger.network);
+      const senders = new Set<string>();
+      for (const h of hints) {
+        // Already holding the send block ⇒ claimed (or about to be) — skip.
+        if (!this.ledger.allBlocks.has(h.blockHash)) senders.add(h.sender);
+      }
+      for (const sender of senders) this.engineResyncAccount(sender);
+    } catch { /* best-effort — the 60s backstop retries */ }
   }
 
   private async checkRelayLiveness(): Promise<void> {

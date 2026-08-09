@@ -192,7 +192,7 @@ export async function holdPresence(
     }
     if (solo.count === 1) markSeen(guard);
     if (absenceBroken(guard)) {
-      onStatus?.({ label: noFaceLabel(video, 'Out of frame or too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
+      onStatus?.({ label: noFaceLabel(video, 'Out of frame / Too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
       return false;
     }
     await sleep(80);
@@ -366,7 +366,7 @@ const DARK_LUMA = 45;
 function noFaceLabel(video: HTMLVideoElement, fallback: string): string {
   const luma = frameBrightness(video);
   if (luma >= 0) debugMetrics(`no face detected; frame luma=${luma.toFixed(0)} (dark below ${DARK_LUMA})`);
-  return luma >= 0 && luma < DARK_LUMA ? 'Too dark — add more light' : fallback;
+  return luma >= 0 && luma < DARK_LUMA ? 'Too dark, add more light.' : fallback;
 }
 
 /**
@@ -1029,7 +1029,7 @@ export async function detectChallenge(
     if (!det?.landmarks) {
       // A miss counts toward the continuity budget — this is where a swap shows up.
       if (absenceBroken(guard)) {
-        onStatus?.({ label: noFaceLabel(video, 'Out of frame or too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
+        onStatus?.({ label: noFaceLabel(video, 'Out of frame / Too dark!'), guide: 'search', state: 'fail', left: 0, right: 0 });
         return false;
       }
       await sleep(100); continue;

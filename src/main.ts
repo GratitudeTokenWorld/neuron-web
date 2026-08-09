@@ -2053,7 +2053,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     const captured = await challengeAndCapture(video, turnHint);
     hideCameraModal();
     if ('failure' in captured) {
-      toast(captured.failure.kind === 'presence' ? 'Out of frame or too dark! — start again' : 'Face check failed', 'error');
+      toast(captured.failure.kind === 'presence' ? 'Out of frame / Too dark!' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(captured.failure);
       restoreCreateBtn(); return;
     }
@@ -2303,7 +2303,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const capturedR = await challengeAndCapture(video);
     hideCameraModal();
     if ('failure' in capturedR) {
-      toast(capturedR.failure.kind === 'presence' ? 'Out of frame or too dark! — start again' : 'Face check failed', 'error');
+      toast(capturedR.failure.kind === 'presence' ? 'Out of frame / Too dark!' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(capturedR.failure);
       finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
     }

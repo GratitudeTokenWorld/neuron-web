@@ -25,7 +25,10 @@ import { identify } from '@libp2p/identify';
 import { multiaddr } from '@multiformats/multiaddr';
 import { applyGossipsubCompat } from '../src/network/gossipsub-compat.js';
 import { generateKeyPair, sign } from '../src/engine/core/keys.js';
-import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, type AccountRecord } from '../src/network/account-resolver.js';
+import { encodeBlock } from '../src/engine/core/block.js';
+import { bytesToHex } from '../src/engine/core/hash.js';
+import { buildSenderChain } from '../src/engine/sim/counterparty.js';
+import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, fetchPendingSends, type AccountRecord } from '../src/network/account-resolver.js';
 
 const RELAYS = [
   { name: 'relay-1', dial: '/ip4/80.97.27.224/tcp/9091/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh', http: 'http://80.97.27.224:9092' },
@@ -94,6 +97,32 @@ check(!!best && verifyAccountRecordSig(best), 'multi-relay resolve returns a sig
 // Unknown names still 404 → null.
 const missing = await resolveAccountFromRelays(RELAYS.map((r) => r.http), { username: 'no-such-user' }, 'testnet');
 check(missing === null, 'unknown username resolves to null');
+
+// ── Offline-transfer discovery (/pending-sends) ──────────────────────────────
+// Publish a real signed sender chain whose send is addressed to a recipient
+// that is NOT online: the relays must archive the blocks and then answer
+// "what is addressed to <recipient>?" — the query a wiped-and-recovered
+// device uses to find transfers it slept through.
+const recipient = generateKeyPair().pub;
+const chain = buildSenderChain(4, 2, recipient); // open + 3 sends, index 2 → recipient
+const blockTopic = `neuronchain/v1/testnet/engine-blocks/${chain.blocks[0]!.shard}`;
+pubsub.subscribe(blockTopic);
+await sleep(2000);
+for (const b of chain.blocks) {
+  await pubsub.publish(blockTopic, new TextEncoder().encode(JSON.stringify({ blockHex: bytesToHex(encodeBlock(b)) })));
+}
+console.log(`published ${chain.blocks.length}-block sender chain (send @2 → offline recipient)`);
+await sleep(3000); // relay ingest + federation
+
+for (const r of RELAYS) {
+  const hints = await fetchPendingSends([r.http], recipient, 'testnet');
+  check(
+    hints.length === 1 && hints[0]!.sender === chain.blocks[0]!.accountId && hints[0]!.blockHash === chain.blocks[2]!.hash,
+    `${r.name} reports exactly the pending send addressed to the offline recipient`,
+  );
+}
+const none = await fetchPendingSends(RELAYS.map((r) => r.http), generateKeyPair().pub, 'testnet');
+check(none.length === 0, 'an account with no inbound sends gets an empty pending list');
 
 await node.stop();
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

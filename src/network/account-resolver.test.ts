@@ -6,7 +6,9 @@ import {
   relayHttpBase,
   looksLikeAccountPub,
   resolveAccountFromRelays,
+  fetchPendingSends,
   type AccountRecord,
+  type PendingSendHint,
 } from './account-resolver';
 
 /** A well-formed, engine-signed account record for tests. */
@@ -29,7 +31,7 @@ function fakeFetch(routes: Record<string, () => { status: number; body: unknown 
   return (async (input: RequestInfo | URL) => {
     const url = String(input);
     for (const [prefix, handler] of Object.entries(routes)) {
-      if (url.startsWith(`${prefix}/resolve?`)) {
+      if (url.startsWith(`${prefix}/resolve?`) || url.startsWith(`${prefix}/pending-sends?`)) {
         const { status, body } = handler();
         return new Response(JSON.stringify(body), { status });
       }
@@ -100,6 +102,29 @@ describe('G1 — on-demand account resolution', () => {
       await resolveAccountFromRelays(['http://bad:9092'], { pub: real.pub }, 'testnet',
         fakeFetch({ 'http://bad:9092': () => ({ status: 200, body: signedRecord() }) })),
     ).toBeNull();
+  });
+
+  it('pending-send discovery: unions relays, dedups by hash, survives dead relays', async () => {
+    const hintA: PendingSendHint = { sender: '02' + 'a'.repeat(64), blockHash: 'h1', shard: 7, type: 'send' };
+    const hintB: PendingSendHint = { sender: '02' + 'b'.repeat(64), blockHash: 'h2', shard: 9, type: 'nft-send' };
+    const hints = await fetchPendingSends(
+      ['http://r1:9092', 'http://r2:9092', 'http://dead:9092'],
+      '02' + 'c'.repeat(64),
+      'testnet',
+      fakeFetch({
+        'http://r1:9092': () => ({ status: 200, body: [hintA, hintB] }),
+        'http://r2:9092': () => ({ status: 200, body: [hintA, { garbage: true }] }), // overlap + junk row
+        // http://dead:9092 unreachable
+      }),
+    );
+    expect(hints.map((h) => h.blockHash).sort()).toEqual(['h1', 'h2']);
+
+    // All relays down / empty ⇒ empty list, never a throw.
+    expect(await fetchPendingSends(['http://dead:9092'], 'x', 'testnet', fakeFetch({}))).toEqual([]);
+    expect(
+      await fetchPendingSends(['http://r1:9092'], 'x', 'testnet',
+        fakeFetch({ 'http://r1:9092': () => ({ status: 200, body: [] }) })),
+    ).toEqual([]);
   });
 
   it('prefers the freshest record when relays disagree (owner _version wins)', async () => {

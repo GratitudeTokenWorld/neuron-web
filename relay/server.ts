@@ -265,6 +265,9 @@ function archiveEngineBlock(blockHex, network) {
   engineBlockStore.set(block.hash, {
     hash: block.hash, accountId: block.accountId, index: block.index,
     shard: block.shard, network, blockHex,
+    // Denormalized so /pending-sends can scan without decoding every row.
+    // Rows archived before this landed lack them — that scan decodes on demand.
+    type: block.type, recipient: block.recipient,
   });
   engineStoreDirty = true;
   // The account exists — its face slot is now permanent.
@@ -630,6 +633,43 @@ async function main() {
         } else {
           res.end(JSON.stringify({ error: 'not found' }));
         }
+
+      } else if (req.url?.startsWith('/pending-sends?')) {
+        // G1 follow-up — offline-transfer discovery. A recipient that was
+        // offline (or fully wiped + recovered) asks the archive which send /
+        // nft-send blocks are addressed to it, then pulls each sender's chain
+        // via the normal delta path. This replaces the accidental discovery the
+        // old O(N) accounts firehose provided ("every node knew every account,
+        // so the startup refresh pulled every chain"). Interest-scoped: the
+        // answer is O(that account's inbound), and it is only a HINT — the
+        // client fully verifies the pulled chains, so a lying relay can at
+        // worst waste a delta request. Claimed sends are filtered client-side
+        // (the recipient already holds those blocks).
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const pub = q.get('pub');
+        const out = [];
+        if (pub) {
+          for (const r of engineBlockStore.values()) {
+            if (r.network !== network) continue;
+            let type = r.type;
+            let recipient = r.recipient;
+            if (type === undefined) {
+              // Row predates the denormalized fields — decode once and backfill.
+              try {
+                const b = decodeBlock(hexToBytes(r.blockHex));
+                type = r.type = b.type;
+                recipient = r.recipient = b.recipient;
+                engineStoreDirty = true;
+              } catch { continue; }
+            }
+            if ((type === 'send' || type === 'nft-send') && recipient === pub) {
+              out.push({ sender: r.accountId, blockHash: r.hash, shard: r.shard, type });
+            }
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(out));
 
       } else if (req.method === 'POST' && req.url === '/log-reload') {
         let body = '';

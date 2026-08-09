@@ -118,3 +118,50 @@ export async function resolveAccountFromRelays(
   }
   return best;
 }
+
+/** One row of a relay's answer to "which sends are addressed to this account?" */
+export interface PendingSendHint {
+  sender: string;
+  blockHash: string;
+  shard: number;
+  type: 'send' | 'nft-send';
+}
+
+/**
+ * G1 follow-up — offline-transfer discovery. Ask the relays' block archives
+ * which send/nft-send blocks are addressed to `pub` (GET /pending-sends), so a
+ * recipient that was offline — or wiped and freshly recovered — learns WHICH
+ * sender chains to pull. The old behavior free-rode on the O(N) accounts
+ * firehose: a recovered device learned every account that existed and the
+ * startup refresh pulled every chain, so inbound sends were found by accident.
+ * This is the interest-scoped replacement: O(own inbound), union across relays,
+ * dead relays skipped. The result is a HINT only — the caller pulls the
+ * sender's chain through the normal fully-verified delta path, so a lying
+ * relay can at worst waste one delta request.
+ */
+export async function fetchPendingSends(
+  bases: readonly string[],
+  pub: string,
+  network: string,
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<PendingSendHint[]> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(`${base}/pending-sends?pub=${encodeURIComponent(pub)}&network=${encodeURIComponent(network)}`, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`pending-sends ${res.status}`);
+      return (await res.json()) as PendingSendHint[];
+    }),
+  );
+  const byHash = new Map<string, PendingSendHint>();
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue;
+    for (const hint of r.value) {
+      if (!hint || typeof hint.sender !== 'string' || typeof hint.blockHash !== 'string') continue;
+      byHash.set(hint.blockHash, hint);
+    }
+  }
+  return [...byHash.values()];
+}
