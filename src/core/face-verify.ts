@@ -584,7 +584,7 @@ export async function detectChallenge(
   // Max allowed movement of the face across the frame while turning, as a
   // fraction of frame width. A neck-pivoted turn shifts the face ~5-7%; a body
   // slide big enough to fake that yaw moves it 15-20%.
-  const CENTRE_DRIFT_MAX = 0.045;
+  const CENTRE_DRIFT_MAX = 0.035;
   // Yaw that a pure sideways move explains on its own: apparent rotation grows
   // ~0.35 of jaw-ratio per unit of frame-width drift (60-degree lens, arm's
   // length). Demanding the observed yaw be several times that is what makes a
@@ -592,7 +592,7 @@ export async function detectChallenge(
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
-  const BROW_DELTA = 0.028;
+  const BROW_DELTA = 0.035;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
@@ -831,7 +831,11 @@ export async function detectChallenge(
       const ear = (rightEAR + leftEAR) / 2;
       const now = Date.now();
       earWindow.push({ t: now, ear });
-      while (earWindow.length && now - earWindow[0].t > CLOSE_HOLD_MS) earWindow.shift();
+      // Keep MORE than the hold. Pruning at exactly CLOSE_HOLD_MS meant the
+      // window's span was always just under it by construction, so the
+      // "held long enough" test could never fire — the check was unpassable
+      // however long the eyes stayed shut (observed: span stuck at ~330ms).
+      while (earWindow.length && now - earWindow[0].t > CLOSE_HOLD_MS * 2) earWindow.shift();
 
       // Threshold from the MEASURED jitter, not a guessed factor. Measured on
       // real hardware: closed 0.296 vs open 0.314 is only 5.9% per frame — buried
@@ -841,10 +845,13 @@ export async function detectChallenge(
       const closedBelow = (earOpen || 0.30) - margin;
       if (ear >= closedBelow + margin * 0.5) sawEyesOpen = true;   // clearly open first
 
+      // Mean over the LAST CLOSE_HOLD_MS, but only once the buffer actually
+      // covers that much history.
+      const recent = earWindow.filter(e => now - e.t <= CLOSE_HOLD_MS);
       const span = earWindow.length ? now - earWindow[0].t : 0;
-      const windowMean = earWindow.reduce((a, b) => a + b.ear, 0) / (earWindow.length || 1);
-      const held = span >= CLOSE_HOLD_MS && earWindow.length >= 4;
-      debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${earWindow.length}`);
+      const windowMean = recent.reduce((a, b) => a + b.ear, 0) / (recent.length || 1);
+      const held = span >= CLOSE_HOLD_MS && recent.length >= 4;
+      debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
 
       if (sawEyesOpen && held && windowMean <= closedBelow) {
         onStatus?.({ label: 'Eyes closed detected', guide: 'eyes', left: 100, right: 100, state: 'ok' });
@@ -856,7 +863,7 @@ export async function detectChallenge(
       const depth = earOpen > 0 ? (earOpen - windowMean) / margin : 0;
       const pct = Math.max(0, Math.min(99, Math.round(depth * Math.min(1, span / CLOSE_HOLD_MS) * 100)));
       onStatus?.({
-        label: sawEyesOpen ? 'Close your eyes for a second' : 'Look at the camera',
+        label: sawEyesOpen ? (windowMean <= closedBelow ? 'Keep them closed' : 'Close your eyes') : 'Look at the camera',
         guide: 'eyes', left: pct, right: pct,
       });
     }
