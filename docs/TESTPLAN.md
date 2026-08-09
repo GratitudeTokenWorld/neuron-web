@@ -77,6 +77,20 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    and move it toward the camera — size grows, shape does not, expect **"flat
    image detected"**; (b) have a second person step into frame, or hold a photo
    beside your own face — expect **"only one face in frame"**.
+
+   > **(b) is the one that broke.** Until `SOLO_SCORE`, only the setup stage
+   > looked for a second face; the actions and capture used `detectSingleFace`,
+   > which does not fail on two faces — it returns the highest-scoring one. A
+   > live head could perform every action while a photo beside it supplied the
+   > enrolled descriptor. Run (b) at **every** stage, not just setup: during an
+   > action, during a between-action pause, and during the three capture samples.
+   > Each must abort with "only one face in frame".
+   >
+   > **Limits, so this is not over-trusted:** the detector finds *faces*. It has
+   > no concept of a phone, a tablet or a hand — an object only registers if a
+   > face is visible on it and scores above `SOLO_SCORE` (0.3). A small, dim, or
+   > angled photo can still fall under that bar. The depth sweep, not this gate,
+   > is what catches a screen presented *as* the face.
 2. During "Contacting relay nodes": expect challenges from ≥2 relays. The status
    panel then shows `2/2` (or `3/3`) independent attestations.
 3. **Pass:** account opens; balance = 1,000,000 UNIT.

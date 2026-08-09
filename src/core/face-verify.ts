@@ -175,12 +175,16 @@ export async function holdPresence(
   const until = Date.now() + ms;
   if (!guard) { await sleep(ms); return true; }
   while (Date.now() < until) {
-    try {
-      const det = await faceapi.detectSingleFace(
-        video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 }),
-      );
-      if (det) markSeen(guard);
-    } catch { /* treat as a miss */ }
+    // The pauses between actions and between capture samples are the softest
+    // windows in the whole flow — nothing is being measured, so an unwatched
+    // second face here is free. Same one-face rule as everywhere else.
+    const solo = await detectSolo(video, 224);
+    if (solo.count > 1) {
+      debugMetrics(`hold ABORT: ${solo.count} faces in frame`);
+      onStatus?.({ label: 'Only one face in frame', guide: 'search', state: 'fail', left: 0, right: 0 });
+      return false;
+    }
+    if (solo.count === 1) markSeen(guard);
     if (absenceBroken(guard)) {
       onStatus?.({ label: 'Face lost — start again', guide: 'search', state: 'fail', left: 0, right: 0 });
       return false;
@@ -192,21 +196,31 @@ export async function holdPresence(
 
 // ──── Face Descriptor Capture ────
 
-export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
+/**
+ * Returns 'multi' rather than a descriptor when more than one face is in shot.
+ * This is the stage that matters most: whatever descriptor comes back here is
+ * what gets enrolled and becomes the identity. Picking the highest-scoring of
+ * two faces would mean the liveness actions proved one person was present while
+ * a different face was registered.
+ */
+export async function captureFaceDescriptor(
+  video: HTMLVideoElement,
+): Promise<FaceDescriptor | 'multi' | null> {
   try {
-    const detection = await faceapi
+    const dets = await faceapi
       // 320, not 416: the larger input missed the face repeatedly during capture
       // (observed 9 misses across 3 samples) while every other stage runs happily
       // at 320. Detector input size sets the bounding box; the descriptor itself
       // is computed from a fixed-size aligned crop, so quality is unaffected.
-      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+      .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: SOLO_SCORE }))
       .withFaceLandmarks()
-      .withFaceDescriptor();
+      .withFaceDescriptors() as unknown as { descriptor: Float32Array }[];
 
-    if (!detection) return null;
+    if (dets.length > 1) return 'multi';
+    if (dets.length !== 1 || !dets[0]?.descriptor) return null;
 
     return {
-      data: Array.from(detection.descriptor),
+      data: Array.from(dets[0].descriptor),
       capturedAt: Date.now(),
     };
   } catch {
@@ -237,7 +251,15 @@ export async function enrollFace(
     if (!await holdPresence(video, 800, guard, c => onProgress(i + 1, ENROLLMENT_SAMPLES, c))) return null;
 
     const desc = await captureFaceDescriptor(video);
-    debugMetrics(`enroll sample ${i + 1}/${ENROLLMENT_SAMPLES} descriptor=${desc ? 'ok' : 'MISS'} retries=${retries}`);
+    debugMetrics(`enroll sample ${i + 1}/${ENROLLMENT_SAMPLES} descriptor=${desc === 'multi' ? 'MULTI' : desc ? 'ok' : 'MISS'} retries=${retries}`);
+    if (desc === 'multi') {
+      // Not a retry: which face would we be retrying for?
+      debugMetrics('enroll ABORT: more than one face in frame');
+      onProgress(i + 1, ENROLLMENT_SAMPLES, {
+        label: 'Only one face in frame', guide: 'search', state: 'fail', left: 0, right: 0,
+      });
+      return null;
+    }
     if (!desc) {
       if (retries++ > 10) { debugMetrics('enroll GAVE UP after 10 misses'); return null; }
       onProgress(i + 1, ENROLLMENT_SAMPLES, {
@@ -277,6 +299,45 @@ type Point = { x: number; y: number };
 
 function dist(a: Point, b: Point): number {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+
+/**
+ * Score floor for the one-face gate. Lower than the 0.4 the setup screen used:
+ * a face on a phone or tablet scores lower than a live one (screen glare, lower
+ * effective resolution, moire), and the entire purpose of this gate is to SEE
+ * that second face. A missed detection here is a spoof that walks through.
+ */
+const SOLO_SCORE = 0.3;
+
+/**
+ * Exactly one face, or nothing.
+ *
+ * Every stage except setup used detectSingleFace, which does not mean "fail if
+ * there are two" — it silently returns the HIGHEST-SCORING face. So a second
+ * face was invisible to the liveness actions and to capture, and worse, nothing
+ * tied the face measured in one frame to the face measured in the next: a live
+ * head could perform the actions while a photo held beside it scored higher at
+ * capture time and supplied the descriptor that actually got enrolled.
+ *
+ * Reported by a user who passed setup and close-eyes while holding a still
+ * photo on a phone with their real head also in shot.
+ *
+ * `count` is what the caller must branch on: >1 means abort the run, not pick a
+ * winner.
+ */
+async function detectSolo(
+  video: HTMLVideoElement,
+  inputSize: number,
+): Promise<{ pts?: Point[]; count: number }> {
+  try {
+    const dets = await faceapi
+      .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: SOLO_SCORE }))
+      .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } }[];
+    if (dets.length !== 1 || !dets[0]?.landmarks) return { count: dets.length };
+    return { pts: dets[0].landmarks.positions as Point[], count: 1 };
+  } catch {
+    return { count: 0 };
+  }
 }
 
 function eyeAspectRatio(pts: Point[]): number {
@@ -537,7 +598,9 @@ export async function calibrateNeutral(
     let dets: { landmarks?: { positions: Point[] } }[] = [];
     try {
       dets = await faceapi
-        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+        // SOLO_SCORE (0.3), not 0.4: a face on a phone screen scores lower than
+        // a live one, and this screen only works if it SEES the second face.
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: SOLO_SCORE }))
         .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } }[];
     } catch { await sleep(80); continue; }
 
@@ -875,15 +938,17 @@ export async function detectChallenge(
   const inputSize = type === 'blink' ? 224 : 320;
 
   while (Date.now() < deadline) {
-    let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
-    let det: { landmarks?: { positions: Point[] } } | undefined;
-    try {
-      det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.3 }))
-        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
-    } catch {
-      await sleep(100); continue;
+    const solo = await detectSolo(video, inputSize);
+    if (solo.count > 1) {
+      // Abort, never pick a winner: a second face mid-action is a photo or
+      // screen held beside the real head, which is exactly the swap this whole
+      // sequence exists to prevent.
+      debugMetrics(`challenge ABORT: ${solo.count} faces in frame`);
+      onStatus?.({ label: 'Only one face in frame', guide: 'search', state: 'fail', left: 0, right: 0 });
+      return false;
     }
+    const det: { landmarks?: { positions: Point[] } } | undefined =
+      solo.pts ? { landmarks: { positions: solo.pts } } : undefined;
     if (!det?.landmarks) {
       // A miss counts toward the continuity budget — this is where a swap shows up.
       if (absenceBroken(guard)) {
@@ -1105,11 +1170,24 @@ export async function detectChallenge(
       // instantly with your eyes open" case, caught in a real trace at
       // mean=0.311 vs a 0.314 threshold. The 80th percentile of the last few
       // seconds tracks drift while ignoring the closure itself.
+      // MEDIAN, not the 80th percentile. The test compares a window MEAN against
+      // this reference, and comparing a mean to a high percentile builds in a
+      // systematic gap even when nothing happens — the reference sits above the
+      // middle of the same noise the mean sits in the middle of. Combined with
+      // slow drift that gap reached 0.015 with the eyes fully OPEN, which is the
+      // entire margin, so the check passed on an open-eyed face (caught in a real
+      // trace: mean 0.321 against a 0.321 threshold, openRef 0.336). The
+      // percentile was defensive against closure frames polluting the reference,
+      // but openRefHist is already filtered to exclude them below — so it bought
+      // nothing and cost a false pass. Median against mean is unbiased.
       const sortedOpen = openRefHist.map(e => e.ear).sort((a, b) => a - b);
       const openRef = sortedOpen.length >= 6
-        ? sortedOpen[Math.floor(sortedOpen.length * 0.8)]
+        ? sortedOpen[Math.floor(sortedOpen.length * 0.5)]
         : (earOpen || 0.30);
-      const margin = Math.max(3.0 * (earSdNeutral || 0.008), 0.015);
+      // Floor raised 0.015 -> 0.018: a real closure measured 0.018-0.027 of EAR
+      // drop, while session drift alone covered 0.015. 3-sigma of per-frame noise
+      // (~0.010) does not bound drift, so the floor is what actually governs.
+      const margin = Math.max(3.0 * (earSdNeutral || 0.008), 0.018);
       const closedBelow = openRef - margin;
       if (ear >= closedBelow + margin * 0.5) sawEyesOpen = true;   // clearly open first
 
