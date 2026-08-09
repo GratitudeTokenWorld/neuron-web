@@ -215,29 +215,37 @@ export function peerIdFromMultiaddr(addr: string): string {
 }
 
 /**
- * The NETWORK's reset epoch: the max generation across the same-origin dev
- * relay and the baked cloud relays. One number, because relying on the local
- * relay alone splits the brain — a reset applied on the cloud boxes while the
- * dev relay lagged left every client on the old epoch, holding (and resolving
- * from) records of accounts the reset had destroyed (2026-08-09). Returns −1
- * when NO relay answered, so callers can distinguish "network says 0" from
- * "network unreachable" and skip snap-down decisions entirely.
+ * The NETWORK's view, aggregated across the same-origin dev relay and the
+ * baked cloud relays — because relying on the local relay alone splits the
+ * brain (2026-08-09, twice):
+ *  - `generation` is the MAX epoch: a reset applied on the cloud boxes while
+ *    the dev relay lagged left every client on the old epoch, holding (and
+ *    resolving from) records of accounts the reset had destroyed. −1 when NO
+ *    relay answered, so callers can skip snap-down decisions on silence.
+ *  - `operators` is the UNION: each relay elects its own first-N list, and the
+ *    client-side reset gate checked only the same-origin relay's — right after
+ *    that relay's list re-elected, the gate said "not an operator" and quietly
+ *    downgraded a network reset to a device-only wipe. The union is only a UX
+ *    gate; every relay still verifies the signature against ITS OWN list.
  */
-async function fetchNetworkGeneration(primaryGeneration?: number): Promise<number> {
-  let max = typeof primaryGeneration === 'number' ? primaryGeneration : -1;
+async function fetchNetworkStatus(primary?: { generation?: number; operators?: string[] }): Promise<{ generation: number; operators: string[] }> {
+  let generation = typeof primary?.generation === 'number' ? primary.generation : -1;
+  const operators = new Set<string>(primary?.operators ?? []);
   const results = await Promise.allSettled(
     bakedBootstrapAddrs().map(async (addr) => {
       const base = relayHttpBase(addr);
       if (!base) throw new Error('same-origin (already covered by primary)');
       const res = await fetch(`${base}/relay-info`, { signal: AbortSignal.timeout(4000) });
       if (!res.ok) throw new Error(`status ${res.status}`);
-      const json = await res.json() as { generation?: number };
-      if (typeof json.generation !== 'number') throw new Error('no generation');
-      return json.generation;
+      return await res.json() as { generation?: number; operators?: string[] };
     }),
   );
-  for (const r of results) if (r.status === 'fulfilled') max = Math.max(max, r.value);
-  return max;
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    if (typeof r.value.generation === 'number') generation = Math.max(generation, r.value.generation);
+    for (const op of r.value.operators ?? []) operators.add(op);
+  }
+  return { generation, operators: [...operators] };
 }
 
 /** Bootstrap relay multiaddresses - always includes /p2p/<peerId> suffix. */
@@ -624,14 +632,15 @@ export class Libp2pNetwork extends EventEmitter {
 
     const relayInfo = await fetchRelayInfo();
     if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
-    if (relayInfo?.operators) this.operators = relayInfo.operators;
     // Catch up to the NETWORK's reset epoch (covers a device that missed a reset
-    // while offline): adopt + wipe if we're behind. Testnet-only. The epoch is
-    // the MAX across the same-origin dev relay AND the baked cloud relays — the
-    // local dev relay lags when a reset was applied on the cloud boxes only
-    // (2026-08-09: cloud at gen 8, local at 7 ⇒ no browser ever wiped, and a
-    // stale cached record misrouted a transfer to a destroyed account).
-    const networkGeneration = await fetchNetworkGeneration(relayInfo?.generation);
+    // while offline): adopt + wipe if we're behind. Testnet-only. Epoch +
+    // operator set are aggregated across the same-origin dev relay AND the
+    // baked cloud relays — the local relay alone lags/loses state
+    // (2026-08-09: cloud at gen 8, local at 7 ⇒ no browser ever wiped; then an
+    // empty local operator list silently downgraded a network reset).
+    const status = await fetchNetworkStatus(relayInfo ?? undefined);
+    this.operators = status.operators;
+    const networkGeneration = status.generation;
     if (this.network === 'testnet' && networkGeneration > this.generation) {
       await this.applyReset(networkGeneration);
     }
@@ -812,12 +821,12 @@ export class Libp2pNetwork extends EventEmitter {
     // gossip. Cheap (one tiny GET); could move to gossip at scale.
     this.relayInfoTimer = setInterval(async () => {
       const info = await fetchRelayInfo(1, 0);
-      if (info?.operators) this.operators = info.operators;
-      // Same max-across-relays epoch as start() — a cloud-side reset must reach
-      // clients even when the same-origin dev relay lags behind it.
-      const gen = await fetchNetworkGeneration(info?.generation);
-      if (this.network === 'testnet' && gen > this.generation) {
-        await this.applyReset(gen);
+      // Same aggregated epoch + operator union as start() — a cloud-side reset
+      // must reach clients even when the same-origin dev relay lags behind it.
+      const status = await fetchNetworkStatus(info ?? undefined);
+      this.operators = status.operators;
+      if (this.network === 'testnet' && status.generation > this.generation) {
+        await this.applyReset(status.generation);
         this.emit('generation:changed', true);
       }
     }, 120_000);

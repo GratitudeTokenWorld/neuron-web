@@ -410,6 +410,31 @@ function recordOperator(accountId) {
   console.log(`[Attester] operator #${operators.length}: ${accountId.slice(0, 12)}…`);
 }
 
+/**
+ * The full network wipe, shared by the operator-signed reset (gossip) and the
+ * peer-relay generation follower (a peer relay ahead of us proves a reset we
+ * missed). Clears every account-derived store, zeroes face SLOT counts while
+ * KEEPING descriptor+nid (the same human must map to the same nullifier across
+ * a reset, or one-human-one-account resets with the chain), and re-elects
+ * operators (the wipe destroys every account chain AND key-blob, so the old
+ * operator accounts are unrecoverable — keeping them would make the first
+ * reset a one-way door).
+ */
+function performNetworkWipe(newGeneration, source) {
+  engineBlockStore.clear(); engineStoreDirty = true;
+  engineHeightIndex.clear(); conflictAnnounced.clear(); // conflict index follows the archive
+  keyBlobStore.clear(); keyBlobDirty = true;
+  usernameRegistry.clear(); usernameDirty = true;       // free the names
+  accountStore.clear(); accountsDirty = true;           // wipe the directory too
+  for (const e of faceDescriptorDB) e.count = 0;
+  pendingFaceUses.clear();                              // provisional holds are moot now
+  saveFaceDB().catch(() => {});
+  operators = []; atomicWrite(OPERATORS_FILE, JSON.stringify(operators));
+  currentGeneration = newGeneration;
+  atomicWrite(GENERATION_FILE, JSON.stringify(currentGeneration));
+  console.log(`[Archive] WIPED by ${source} → generation ${currentGeneration}`);
+}
+
 /** Archive a key-blob seen on the keyblobs topic (keep the newest per account). */
 function archiveKeyBlob(blob, network) {
   if (!ARCHIVE_ENABLED || !blob || !blob.pub || !blob.username || !blob.encryptedKeys) return;
@@ -1076,6 +1101,40 @@ async function main() {
     pubsub.publish(topic, new TextEncoder().encode(JSON.stringify({ a: aHex, b: bHex }))).catch(() => {});
   };
 
+  // ── Generation follower: converge on peer relays' reset epoch ──────────────
+  // A relay that misses the operator-signed reset gossip (restarting, no
+  // operators elected yet, joined later) is left serving PRE-RESET state —
+  // stale usernames/records that misroute payments to destroyed accounts
+  // (2026-08-09, twice). PEER_RELAYS is the operator-configured federation, so
+  // a peer reporting a HIGHER generation is proof of a reset we missed: adopt
+  // it with the same full wipe. Stores refill from live gossip; all content is
+  // client-verified, so following a peer's epoch number trusts it only with
+  // cache lifetime, never with content.
+  const peerRelayHttpBase = (addr) => {
+    const dns = addr.match(/\/dns[46]\/([^/]+)\//);
+    if (dns) return `https://${dns[1]}`;
+    const ip = addr.match(/\/ip4\/([^/]+)\//);
+    if (ip) return `http://${ip[1]}:9092`; // dev boxes: HTTP is always PORT+2 = 9092
+    return null;
+  };
+  if (PEER_RELAYS.length > 0) {
+    setInterval(async () => {
+      for (const addr of PEER_RELAYS) {
+        const base = peerRelayHttpBase(addr);
+        if (!base) continue;
+        try {
+          const res = await fetch(`${base}/relay-info`, { signal: AbortSignal.timeout(4000) });
+          if (!res.ok) continue;
+          const info = await res.json();
+          if (typeof info.generation === 'number' && info.generation > currentGeneration) {
+            performNetworkWipe(info.generation, `peer relay ${base} (generation follower)`);
+            break; // one wipe is enough — the rest agree or will follow
+          }
+        } catch { /* peer unreachable — try again next tick */ }
+      }
+    }, 60_000);
+  }
+
   // Prototype-level fix applied at module load (see top of file).
   // AbstractMessageStream.prototype now has .source and .sink so it-pipe
   // treats every stream as a duplex and gossipsub outbound streams form correctly.
@@ -1219,29 +1278,8 @@ async function main() {
         const ok = m.operatorPub && operators.includes(m.operatorPub) &&
           engineVerify(String(m.signature || ''), `reset:${m.generation}:${m.resetAt}`, m.operatorPub);
         if (!ok) { console.log('[Archive] Ignored reset — not an authorized operator'); return; }
-        engineBlockStore.clear(); engineStoreDirty = true;
-        engineHeightIndex.clear(); conflictAnnounced.clear(); // conflict index follows the archive
-        keyBlobStore.clear(); keyBlobDirty = true;
-        usernameRegistry.clear(); usernameDirty = true;       // free the names
-        accountStore.clear(); accountsDirty = true;           // wipe the directory too
-        // Face SLOTS count accounts, and this wipe just destroyed every account —
-        // so a surviving count bars a human on the basis of accounts that no
-        // longer exist. Zero the counts, but KEEP each descriptor + nid: the same
-        // human must still map to the same nullifier identity across a reset, or
-        // the whole one-human-one-account property resets with the chain.
-        for (const e of faceDescriptorDB) e.count = 0;
-        pendingFaceUses.clear();                              // provisional holds are moot now
-        saveFaceDB().catch(() => {});
-        // Re-elect operators: the wipe destroys every account chain AND every
-        // key-blob, so the old operator accountIds can never be recovered by
-        // anyone — keeping them as the sole reset authority makes the FIRST
-        // network reset a one-way door (no live account can authorize the next
-        // one; only SSH can). The next OPERATOR_COUNT accounts attested after a
-        // wipe become the operators, exactly as on a fresh relay.
-        operators = []; atomicWrite(OPERATORS_FILE, JSON.stringify(operators));
-        currentGeneration = Number(m.generation) || currentGeneration + 1;
-        atomicWrite(GENERATION_FILE, JSON.stringify(currentGeneration));
-        console.log(`[Archive] WIPED by operator ${String(m.operatorPub).slice(0, 12)}… → generation ${currentGeneration}`);
+        performNetworkWipe(Number(m.generation) || currentGeneration + 1,
+          `operator ${String(m.operatorPub).slice(0, 12)}…`);
       } catch { /* malformed */ }
       return;
     }
