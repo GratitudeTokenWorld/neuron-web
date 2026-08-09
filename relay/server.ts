@@ -1087,6 +1087,14 @@ async function main() {
         keyBlobStore.clear(); keyBlobDirty = true;
         usernameRegistry.clear(); usernameDirty = true;       // free the names
         accountStore.clear(); accountsDirty = true;           // wipe the directory too
+        // Face SLOTS count accounts, and this wipe just destroyed every account —
+        // so a surviving count bars a human on the basis of accounts that no
+        // longer exist. Zero the counts, but KEEP each descriptor + nid: the same
+        // human must still map to the same nullifier identity across a reset, or
+        // the whole one-human-one-account property resets with the chain.
+        for (const e of faceDescriptorDB) e.count = 0;
+        pendingFaceUses.clear();                              // provisional holds are moot now
+        saveFaceDB().catch(() => {});
         // Re-elect operators: the wipe destroys every account chain AND every
         // key-blob, so the old operator accountIds can never be recovered by
         // anyone — keeping them as the sole reset authority makes the FIRST
