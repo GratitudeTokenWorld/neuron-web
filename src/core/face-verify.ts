@@ -110,6 +110,12 @@ export interface CaptureCue {
   right?: number;
   /** For a head turn: which way the user is being ASKED to turn. */
   dir?: 'left' | 'right';
+  /**
+   * For a depth-sweep leg: which way this leg goes. The guide draws the inner
+   * oval growing toward the target on an approach and shrinking on a retreat,
+   * so it has to know the direction — progress alone is a magnitude.
+   */
+  depth?: 'in' | 'out';
   state?: 'ok' | 'fail';
 }
 
@@ -692,7 +698,7 @@ export async function calibrateNeutral(
         // completed action from the user's side, so it gets the same audible
         // confirmation as a challenge. Without it the setup stage was the one
         // part of the flow that gave no feedback for doing the right thing.
-        onStatus?.({ label: 'Good', guide: 'depth', state: 'ok', left: 100, right: 100 });
+        onStatus?.({ label: 'Good', guide: 'depth', depth: goIn ? 'in' : 'out', state: 'ok', left: 100, right: 100 });
         await sleep(150);
         continue;
       }
@@ -702,7 +708,7 @@ export async function calibrateNeutral(
         return fail('flat');
       }
       const pct = Math.max(0, Math.min(99, Math.round(Math.min(sizeProgress, Math.max(shapeProgress, 0)) * 100)));
-      onStatus?.({ label, guide: 'depth', left: pct, right: pct });
+      onStatus?.({ label, guide: 'depth', depth: goIn ? 'in' : 'out', left: pct, right: pct });
       await sleep(50);
       continue;
     }

@@ -792,8 +792,22 @@
     @keyframes cg-brow { 0%, 100% { transform: translateY(4px); } 45%, 65% { transform: translateY(-4px); } }
 
     /* Depth: the outline breathes in and out — move toward/away from the lens. */
-    .cg-depth-oval { transform-box: fill-box; transform-origin: center; animation: cg-depth 2.4s ease-in-out infinite; }
-    @keyframes cg-depth { 0%, 100% { transform: scale(0.78); opacity: 0.55; } 50% { transform: scale(1.15); opacity: 1; } }
+    /* The inner oval IS the distance readout, not decoration. It starts small and
+       white — "you are far away" — and grows until it sits exactly on the dashed
+       target oval at 100%: same centre, same radii, so "matched" needs no
+       explanation. A "move back" leg runs the other way, shrinking as the leg
+       completes. Its geometry is identical to .cg-oval so scale(1) coincides
+       precisely; the size is driven from the same progress value as the bar
+       (--depth-scale), never animated on a timer, or it would show motion the
+       user is not making. */
+    .cg-depth-oval {
+      stroke: #fff;
+      stroke-opacity: 0.95;
+      transform-box: view-box;
+      transform-origin: 100px 74px;
+      transform: scale(var(--depth-scale, 0.5));
+      transition: transform 0.12s linear;
+    }
 
     /* Mouth open: the jaw ellipse stretches vertically, like a slow "ahh". */
     .cg-jaw { transform-box: fill-box; transform-origin: center top; animation: cg-jaw 1.8s ease-in-out infinite; }
@@ -1091,7 +1105,8 @@
               <circle class="cg-line" cx="122" cy="64" r="2.5"/>
             </g>
             <g class="cg-depth">
-              <ellipse class="cg-line cg-depth-oval" cx="100" cy="74" rx="30" ry="40"/>
+              <!-- Same geometry as .cg-oval: scale(1) lands exactly on it. -->
+              <ellipse class="cg-line cg-depth-oval" cx="100" cy="74" rx="44" ry="58"/>
               <path class="cg-line" d="M100 20 l-7 9 M100 20 l7 9" opacity="0.6"/>
               <path class="cg-line" d="M100 128 l-7 -9 M100 128 l7 -9" opacity="0.6"/>
             </g>

@@ -969,6 +969,15 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
     // two-sided liveness bar — so the arrows contradicted the words ("TURN
     // RIGHT" with chevrons pointing left) whenever the fill said otherwise.
     if (cue.dir) guide.setAttribute('data-dir', cue.dir);
+    // Depth: size the inner oval from the SAME progress the bar uses. An
+    // approach grows it from 0.5 to 1.0, where it lands exactly on the dashed
+    // target oval; a retreat runs it back down. Driving it from progress rather
+    // than a looping animation means the ring only moves when the user does.
+    if (cue.guide === 'depth' && cue.depth) {
+      const p = Math.max(0, Math.min(100, progress)) / 100;
+      const scale = cue.depth === 'in' ? 0.5 + 0.5 * p : 1 - 0.5 * p;
+      guide.style.setProperty('--depth-scale', scale.toFixed(3));
+    }
   }
 }
 
@@ -992,7 +1001,11 @@ function resetCaptureCue(): void {
   bar?.removeAttribute('data-state');
   (document.getElementById('captureBarL') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
   (document.getElementById('captureBarR') as HTMLElement | null)?.style.setProperty('transform', 'scaleX(0)');
-  document.getElementById('captureGuide')?.setAttribute('data-guide', '');
+  const g = document.getElementById('captureGuide');
+  g?.setAttribute('data-guide', '');
+  // Drop the depth size so the next run starts from "far away", not wherever
+  // the previous one left the ring.
+  g?.style.removeProperty('--depth-scale');
 }
 
 /** Why a face capture run was rejected — callers render their own copy. */
