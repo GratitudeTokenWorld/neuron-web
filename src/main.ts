@@ -1414,7 +1414,7 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   // Only honored if this account is one of the relay's operators (first 3 created);
   // otherwise just this device is cleared and the shared relays are untouched.
   const op = localAccounts[0];
-  await node.net.clearAll(op ? engineKeysFromAppPrivate(op.keys.priv) : undefined);
+  const networkWide = await node.net.clearAll(op ? engineKeysFromAppPrivate(op.keys.priv) : undefined);
   node.ledger.reset();
   node.storage.resetState();
   if (node.store.isStarted()) await node.store.clearAllContent().catch(() => {});
@@ -1424,8 +1424,9 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   localStorage.removeItem(WALLET_KEY);
   localStorage.removeItem('neuronchain_tab');
   localStorage.removeItem('neuronchain_facemaps');
-  // Reload page to fully clear in-memory state
-  toast('Testnet reset - reloading...', 'success');
+  // Reload page to fully clear in-memory state. Say which reset actually happened:
+  // only an operator wipes the shared network; everyone else clears just this device.
+  toast(networkWide ? 'Network reset - reloading...' : 'This device cleared (not an operator) - reloading...', 'success');
   writeReloadLog('manual testnet reset button');
   setTimeout(() => location.reload(), 500);
 });

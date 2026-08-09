@@ -585,6 +585,17 @@ export class Libp2pNetwork extends EventEmitter {
     if (this.network === 'testnet' && typeof relayInfo?.generation === 'number' && relayInfo.generation > this.generation) {
       await this.applyReset(relayInfo.generation);
     }
+    // Self-heal a device stranded ABOVE the network's generation (an unauthorized
+    // reset used to bump it locally — see clearAll). Such a device drops all
+    // inbound gossip and is invisibly deaf; snap back down to the network's epoch.
+    // No wipe: we are not behind, just mis-numbered. Testnet-only, like all reset
+    // logic, and no worse than trusting the relay to RAISE the generation (which
+    // already triggers a full local wipe on the same signal).
+    if (this.network === 'testnet' && typeof relayInfo?.generation === 'number' && relayInfo.generation < this.generation) {
+      console.warn(`[Libp2p] Local generation ${this.generation} > network ${relayInfo.generation} — snapping down (was dropping all inbound gossip)`);
+      this.generation = relayInfo.generation;
+      this.saveGeneration();
+    }
     const bootstrapList = buildBootstrapList(relayInfo);
 
     // Build directPeers for gossipsub - forces a gossipsub stream to the relay
@@ -1494,14 +1505,27 @@ export class Libp2pNetwork extends EventEmitter {
   }
 
   /**
-   * Reset: always wipes THIS device's local state, and publishes a network reset.
-   * Pass an engine operator signer to authorize wiping the shared relays — the
-   * relay honors the wipe only if `operator.pub` is one of its first-N operators
-   * (others are ignored). Without a signer, the local wipe still happens but no
-   * relay is touched.
+   * Reset: always wipes THIS device's local state, and — only for an operator —
+   * publishes a network-wide reset (new generation) that relays and other clients
+   * honor. Returns true if the reset was network-wide.
+   *
+   * CRITICAL: the generation is bumped ONLY when this device is an operator, i.e.
+   * when the rest of the network will actually follow. A non-operator that bumps
+   * its own generation lands strictly above everyone else and then silently drops
+   * every inbound message (`_gen < this.generation`) — a self-inflicted, one-way,
+   * permanent partition whose only symptom is "Recipient not found" (hit during
+   * TESTPLAN T3, 2026-08-09). A non-operator reset is therefore a purely local
+   * wipe at the CURRENT generation, after which the device re-syncs — which is
+   * what the reset dialog and docs/SUPERNODE.md have always promised.
    */
-  async clearAll(engineOperator?: { pub: string; priv: string }): Promise<void> {
-    if (this.network !== 'testnet') { console.warn('[Libp2p] Reset is testnet-only — ignored'); return; }
+  async clearAll(engineOperator?: { pub: string; priv: string }): Promise<boolean> {
+    if (this.network !== 'testnet') { console.warn('[Libp2p] Reset is testnet-only — ignored'); return false; }
+    const authorized = !!engineOperator && this.operators.includes(engineOperator.pub);
+    if (!authorized) {
+      console.warn('[Libp2p] Not an operator — clearing THIS device only (network untouched)');
+      await this.applyReset(this.generation);  // local wipe, generation unchanged
+      return false;
+    }
     this.generation++;
     this.saveGeneration();
 
@@ -1513,6 +1537,7 @@ export class Libp2pNetwork extends EventEmitter {
     }
     this.publish(topicGeneration(this.network), payload);
     await this.applyReset(this.generation);
+    return true;
   }
 
   /**
