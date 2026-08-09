@@ -98,7 +98,7 @@ export async function enrollFace(
     const desc = await captureFaceDescriptor(video);
     if (!desc) {
       if (retries++ > 10) return null;
-      onProgress(i + 1, ENROLLMENT_SAMPLES, 'No face detected. Look at the camera.');
+      onProgress(i + 1, ENROLLMENT_SAMPLES, 'Look at the camera.');
       i--;
       await sleep(1000);
       continue;
