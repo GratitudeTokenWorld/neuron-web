@@ -437,6 +437,14 @@ export async function calibrateNeutral(
   const FRONTAL_YAW = 0.13;     // |yaw − 0.55| — covers normal facial asymmetry
   const FRONTAL_SKEW = 0.15;
   const STABLE_YAW_RANGE = 0.04;
+  // FRAMING, checked before anything else. Every metric is a normalised ratio, so
+  // a face far from the camera still "works" — but at that distance the landmarks
+  // are a handful of pixels apart, which is what makes the expression deltas noisy
+  // and the captured descriptor weak. Demand a properly framed head up front
+  // instead of letting a distant face produce unreliable results throughout.
+  const MIN_FACE_FRAC = 0.13;   // eye span as a fraction of frame width
+  const MAX_FACE_FRAC = 0.45;   // too close: the face gets cropped
+  const CENTRE_MIN = 0.25, CENTRE_MAX = 0.75;
   const samples: FaceMetrics[] = [];
   const deadline = Date.now() + 10000;
 
@@ -453,7 +461,24 @@ export async function calibrateNeutral(
     }
     markSeen(guard);
 
-    const m = metricsOf(det.landmarks.positions as Point[], video.videoWidth);
+    const pts = det.landmarks.positions as Point[];
+    const m = metricsOf(pts, video.videoWidth);
+
+    // 1. Framing first — no point measuring a face that is too small to measure.
+    const faceFrac = faceScale(pts) / (video.videoWidth || 640);
+    const framing =
+      faceFrac < MIN_FACE_FRAC ? 'Move closer' :
+      faceFrac > MAX_FACE_FRAC ? 'Move back' :
+      (m.centreX < CENTRE_MIN || m.centreX > CENTRE_MAX) ? 'Centre your face' : null;
+    if (framing) {
+      samples.length = 0;
+      debugMetrics(`framing ${framing}: faceFrac=${faceFrac.toFixed(3)} cx=${m.centreX.toFixed(3)}`);
+      onStatus?.({ label: framing, guide: 'search', left: 0, right: 0 });
+      await sleep(80);
+      continue;
+    }
+
+    // 2. Then pose: frontal and still.
     if (Math.abs(m.yaw - 0.55) > FRONTAL_YAW || Math.abs(m.skew) > FRONTAL_SKEW) {
       samples.length = 0;                       // still turned — start over
       onStatus?.({ label: 'Look straight at the camera', guide: 'search', left: 0, right: 0 });
