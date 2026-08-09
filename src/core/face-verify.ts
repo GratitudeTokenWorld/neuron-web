@@ -108,6 +108,8 @@ export interface CaptureCue {
   guide: CaptureGuide;
   left?: number;
   right?: number;
+  /** For a head turn: which way the user is being ASKED to turn. */
+  dir?: 'left' | 'right';
   state?: 'ok' | 'fail';
 }
 
@@ -231,8 +233,9 @@ export async function enrollFace(
     if (!await holdPresence(video, 800, guard, c => onProgress(i + 1, ENROLLMENT_SAMPLES, c))) return null;
 
     const desc = await captureFaceDescriptor(video);
+    debugMetrics(`enroll sample ${i + 1}/${ENROLLMENT_SAMPLES} descriptor=${desc ? 'ok' : 'MISS'} retries=${retries}`);
     if (!desc) {
-      if (retries++ > 10) return null;
+      if (retries++ > 10) { debugMetrics('enroll GAVE UP after 10 misses'); return null; }
       onProgress(i + 1, ENROLLMENT_SAMPLES, {
         label: 'Look at the camera', guide: 'search', left: pct(i), right: pct(i),
       });
@@ -592,7 +595,7 @@ export async function detectChallenge(
   const TRANSLATION_YAW_GAIN = 0.35;
   const ROTATION_MARGIN = 3.0;
   // Eyebrow raise, as a fraction of face scale over the calibrated neutral.
-  const BROW_DELTA = 0.040;
+  const BROW_DELTA = 0.012;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
   // detectable at any frame rate. Both the depth and the hold must be met.
@@ -604,6 +607,8 @@ export async function detectChallenge(
   const earWindow: { t: number; ear: number }[] = [];
   /** Open-eye reference history, fed only by frames that are NOT a closure. */
   const openRefHist: { t: number; ear: number }[] = [];
+  /** Relaxed-brow reference history, fed only by frames that are NOT a raise. */
+  const browRefHist: { t: number; v: number }[] = [];
   // Every action must be HELD, not merely touched. Jitter crosses a threshold
   // for one frame; a deliberate expression stays there. This is what stops the
   // checks feeling "too sensitive" without making them physically harder — the
@@ -652,7 +657,7 @@ export async function detectChallenge(
     type === 'raise-brows' ? 'Raise your eyebrows' :
     type === 'close-eyes' ? 'Close your eyes' : `Turn head ${turnSide}`;
 
-  onStatus?.({ label: prompt, guide, left: 0, right: 0 });
+  onStatus?.({ label: prompt, guide, dir: guide === 'turn' ? turnSide : undefined, left: 0, right: 0 });
 
   // Frame time is dominated by the detector's input size. Blink needs the
   // highest possible frame rate to catch a ~100ms closure, and eye landmarks
@@ -782,7 +787,7 @@ export async function detectChallenge(
       const agree = Math.sign(signed) === Math.sign(skewΔ);
       debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} explains=${explained.toFixed(4)} agree=${agree}`);
       if (sustained(delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && agree && stayedPut && rotationDominates)) {
-        onStatus?.({ label: 'Turn detected', guide: 'turn', left: 100, right: 100, state: 'ok' });
+        onStatus?.({ label: 'Turn detected', guide: 'turn', dir: turnSide, left: 100, right: 100, state: 'ok' });
         return true;
       }
       if (!stayedPut) {
@@ -798,7 +803,7 @@ export async function detectChallenge(
       const movingLeft = signed > 0;   // nose drifts toward higher x when turning to their left
       onStatus?.({
         label: `Turn head ${turnSide}`,
-        guide: 'turn',
+        guide: 'turn', dir: turnSide,
         left: movingLeft ? pct : 0,
         right: movingLeft ? 0 : pct,
       });
@@ -832,8 +837,23 @@ export async function detectChallenge(
       onStatus?.({ label: 'Open your mouth', guide: 'mouth', left: pct, right: pct });
 
     } else if (type === 'raise-brows') {
-      const browΔ = browLift(pts) - browNeutral;
-      debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA}`);
+      // Rolling RELAXED reference, not the enrollment baseline. Measured: the
+      // resting brow sat 0.030 above the calibrated neutral for a whole action
+      // (75% of the old 0.040 bar) while the actual raise added only 0.015 on
+      // top — brow-to-lid distance shifts with head pitch and distance, so a
+      // fixed baseline goes stale exactly like the eye reference did. Fed only
+      // by frames that are NOT a raise, so holding the raise cannot erase it.
+      const browNow = browLift(pts);
+      const sortedBrow = browRefHist.map(e => e.v).sort((a, b) => a - b);
+      const browRef = sortedBrow.length >= 6
+        ? sortedBrow[Math.floor(sortedBrow.length * 0.3)]
+        : browNeutral;
+      const browΔ = browNow - browRef;
+      if (browΔ < BROW_DELTA * 0.5) {
+        browRefHist.push({ t: Date.now(), v: browNow });
+        while (browRefHist.length && Date.now() - browRefHist[0].t > OPEN_REF_MS) browRefHist.shift();
+      }
+      debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA} ref=${browRef.toFixed(4)} raw=${browNow.toFixed(4)}`);
       if (sustained(browΔ >= BROW_DELTA)) {
         onStatus?.({ label: 'Eyebrows detected', guide: 'brow', left: 100, right: 100, state: 'ok' });
         return true;

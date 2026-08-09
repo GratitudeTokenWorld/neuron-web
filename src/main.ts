@@ -954,11 +954,11 @@ function renderCaptureCue(cue: import('./core/face-verify').CaptureCue): void {
   const guide = document.getElementById('captureGuide');
   if (guide) {
     guide.setAttribute('data-guide', cue.guide);
-    // Point the chevrons at the side still being asked for (both → left first).
-    if (cue.guide === 'turn') {
-      const dir = (cue.right ?? 0) > 0 && (cue.left ?? 0) >= 100 ? 'right' : 'left';
-      guide.setAttribute('data-dir', dir);
-    }
+    // Point the chevrons the way the user is being ASKED to turn. This used to
+    // be inferred from which half of the bar was filling — a leftover from the
+    // two-sided liveness bar — so the arrows contradicted the words ("TURN
+    // RIGHT" with chevrons pointing left) whenever the fill said otherwise.
+    if (cue.dir) guide.setAttribute('data-dir', cue.dir);
   }
 }
 
