@@ -1397,10 +1397,43 @@ function refreshNFTTransferList() {
     }
   }
 
+  // Inbound NFTs that have not been claimed yet. A block-lattice transfer is
+  // send + receive, so between the two the token is owned by NOBODY and shows on
+  // neither side — which looks exactly like it vanished. Auto-claim normally
+  // closes that gap in seconds, but if the recipient's browser was closed or
+  // still syncing when the send arrived, the token can sit here indefinitely
+  // with nothing on screen to say so and no way to complete it by hand.
+  for (const acc of localAccounts) {
+    for (const u of node.ledger.getUnclaimedNftsForAccount(acc.pub)) {
+      rows.push(`<tr>
+        <td><span class="hash truncate" title="${escHtml(u.tokenId)}">${escHtml(trunc(u.tokenId, 12))}</span></td>
+        <td style="color:var(--warning);">Incoming — unclaimed</td>
+        <td style="color:var(--text-dim);">from ${escHtml(resolveNamePlain(u.fromPub))}</td>
+        <td>-</td>
+        <td>${escHtml(acc.username)}</td>
+        <td><button class="btn btn-outline btn-nft-claim" data-send="${escHtml(u.nftSendHash)}" data-to="${escHtml(acc.pub)}">Claim</button></td>
+      </tr>`);
+    }
+  }
+
   const tbody = $('#nftTransferList');
   tbody.innerHTML = rows.length > 0
     ? rows.join('')
     : `<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:16px;">No NFTs yet — mint one above.</td></tr>`;
+
+  tbody.querySelectorAll('.btn-nft-claim').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const nftSendHash = btn.getAttribute('data-send')!;
+      const toPub = btn.getAttribute('data-to')!;
+      const acc = localAccounts.find(a => a.pub === toPub);
+      if (!acc) return;
+      const result = await node.ledger.createReceiveNft(toPub, nftSendHash, engineSigner(acc));
+      if (!result.block) { toast(`Error: ${result.error}`, 'error'); return; }
+      const submit = await node.submitBlock(result.block);
+      if (submit.success) { toast('NFT claimed', 'success'); refreshTransfer(); }
+      else { toast(`Error: ${submit.error}`, 'error'); }
+    });
+  });
 
   tbody.querySelectorAll('.btn-nft-xfer').forEach(btn => {
     btn.addEventListener('click', async () => {

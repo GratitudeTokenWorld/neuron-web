@@ -445,6 +445,9 @@ export class EngineLedger extends EventEmitter {
 
   /** Claim an incoming NFT transfer — the recipient becomes the owner. */
   async createReceiveNft(recipientPub: string, nftSendHash: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    // Every other mutating entry point refuses on a frozen account; this one did
+    // not, so a claim could still append to an equivocated chain.
+    if (this.equivocated.has(recipientPub)) return { error: 'Account frozen' };
     const unclaimed = this.unclaimedNftTransfers.get(nftSendHash);
     if (!unclaimed) return { error: 'NFT transfer not found or already claimed' };
     if (unclaimed.toPub !== recipientPub) return { error: 'This NFT is not addressed to you' };
