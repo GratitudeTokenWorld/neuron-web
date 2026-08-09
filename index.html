@@ -691,13 +691,18 @@
        one-shot actions (1-5) have nothing to subdivide, so they stay binary. */
     .capture-steps {
       display: flex;
-      justify-content: center;
       gap: 5px;
       padding: 0 10px 10px;
       background: var(--surface);   /* same ground as the header above it */
     }
     .capture-steps > i {
-      flex: 0 1 52px;
+      /* Share the row equally and grow with it: the modal is sized by the feed
+         (50vh tall on PC, 90vw on mobile), so a fixed box width left the
+         tracker as a small huddle in the middle of a wide dialog. `basis: 0`
+         rather than `auto` so all seven stay the SAME width regardless of the
+         numeral or the checkmark inside them. */
+      flex: 1 1 0;
+      min-width: 0;
       height: 26px;
       display: flex;
       align-items: center;
