@@ -856,7 +856,13 @@ export async function detectChallenge(
   // real raise averages only 0.028, so the bar lurched between 0 and 50% on a
   // motionless face. Averaging ~400ms shrinks the resting noise to sd 0.003
   // while leaving the raise at 0.028 — an 8-sigma separation instead of 2.
-  const BROW_DELTA = 0.020;
+  // 0.032, not 0.020. Once the reference became rolling, a real raise measured
+  // far larger than the fixed-baseline estimate this threshold was set from:
+  // logged at rest max +0.0081 (sd 0.0046) against a sustained raise of
+  // 0.032-0.066. 0.020 sat at only 2.5x the resting maximum and a third of a
+  // real raise, which is why it passed on almost nothing. 0.032 is 4x resting
+  // noise and still only half of the measured raise.
+  const BROW_DELTA = 0.032;
   const BROW_WINDOW_MS = 400;
   // Eyes CLOSED AND HELD. A blink is a ~100ms transient that falls between
   // frames; a held closure is a state, so it is sampled many times over and is
@@ -1078,10 +1084,17 @@ export async function detectChallenge(
         await sleep(60);
         continue;
       }
-      // Bar tracks the WEAKER signal, so it only fills on a genuine rotation.
-      const pct = Math.min(99, Math.round(Math.min(
-        delta / YAW_DELTA, Math.abs(skewΔ) / SKEW_DELTA,
-      ) * 100));
+      // Bar tracks the WEAKER signal, so it only fills on a genuine rotation —
+      // and it stays empty while the SAFETY terms are unmet, because those are
+      // part of the test too. Dividing the magnitudes alone let a body slide
+      // fill the bar to 99% while rotationDominates silently held the action
+      // shut: the bar promised a pass that could not arrive. (Same defect as the
+      // close-eyes bar reading a reference the test did not use.)
+      const pct = (agree && rotationDominates)
+        ? Math.min(99, Math.round(Math.min(
+          delta / YAW_DELTA, Math.abs(skewΔ) / SKEW_DELTA,
+        ) * 100))
+        : 0;
       const movingLeft = signed > 0;   // nose drifts toward higher x when turning to their left
       onStatus?.({
         label: `Turn head ${turnSide}`,
