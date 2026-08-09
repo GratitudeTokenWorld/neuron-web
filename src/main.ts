@@ -886,6 +886,15 @@ function audioCtx(): AudioContext | null {
   } catch { return null; }
 }
 
+/**
+ * Peak gains for the two capture sounds, raised 50% from the original
+ * 0.025 / 0.07. Named rather than inline so the ratio between them survives
+ * future changes: the progress sweep has to sit under the confirmation chime,
+ * or the chime stops reading as an event and just sounds like more sweep.
+ */
+const TONE_GAIN = 0.0375;
+const BEEP_GAIN = 0.105;
+
 /** Map 0–100% onto a rising two-octave sweep (220 Hz → 880 Hz). */
 function setProgressTone(pct: number): void {
   const ctx = audioCtx();
@@ -903,7 +912,7 @@ function setProgressTone(pct: number): void {
     if (pct <= 0) { toneGain!.gain.setTargetAtTime(0, t, 0.04); return; }
     // Exponential in pitch so the rise sounds linear to the ear.
     toneOsc.frequency.setTargetAtTime(220 * Math.pow(4, Math.min(1, pct / 100)), t, 0.05);
-    toneGain!.gain.setTargetAtTime(0.025, t, 0.05);               // quiet
+    toneGain!.gain.setTargetAtTime(TONE_GAIN, t, 0.05);
   } catch { /* ignore */ }
 }
 
@@ -924,7 +933,7 @@ function beepOk(): void {
       osc.frequency.value = freq;
       const t0 = ctx.currentTime + at;
       gain.gain.setValueAtTime(0.0001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.07, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(BEEP_GAIN, t0 + 0.01);
       gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.16);
       osc.connect(gain).connect(ctx.destination);
       osc.start(t0);
