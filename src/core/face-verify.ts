@@ -254,22 +254,57 @@ function eyeAspectRatio(pts: Point[]): number {
   return C < 0.001 ? 0 : (A + B) / (2 * C);
 }
 
-function smileRatio(pts: Point[]): number {
-  // Mouth corners 48 & 54, top lip 51, bottom lip 57 (in 68-pt model)
-  const mouthWidth  = dist(pts[48], pts[54]);
-  const mouthHeight = dist(pts[51], pts[57]);
-  return mouthWidth < 0.001 ? 0 : mouthHeight / mouthWidth;
+/**
+ * Scale reference: outer eye corners (36 ↔ 45). Independent of mouth state and
+ * of how far the user sits from the camera, so mouth measurements normalised by
+ * it are comparable frame to frame.
+ */
+function faceScale(pts: Point[]): number {
+  return dist(pts[36], pts[45]);
+}
+
+/**
+ * Smile geometry, normalised by face scale.
+ *
+ * The previous metric was mouthHeight/mouthWidth, which measures how far the
+ * mouth is OPEN, not whether it is smiling: a closed-lip smile widens the mouth
+ * and pushes that ratio DOWN, while merely parting the lips pushes it up past
+ * the threshold — so it passed without a smile and failed with one.
+ *
+ * A smile has two robust signatures instead:
+ *  - `lift`  — the corners rise relative to the mouth's vertical centre
+ *              (y grows downward, so corners above centre ⇒ positive)
+ *  - `width` — the mouth widens
+ * Both are compared against the user's OWN neutral face (see calibration in
+ * detectChallenge), because absolute values vary hugely between faces.
+ */
+function mouthMetrics(pts: Point[]): { lift: number; width: number } {
+  const s = faceScale(pts) || 1;
+  const centreY = (pts[51].y + pts[57].y) / 2;
+  const cornerY = (pts[48].y + pts[54].y) / 2;
+  return { lift: (centreY - cornerY) / s, width: dist(pts[48], pts[54]) / s };
+}
+
+/** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
+function debugMetrics(msg: string): void {
+  try { if (localStorage.getItem('neuron_debug') === '1') console.log(`[face] ${msg}`); } catch { /* no localStorage */ }
 }
 
 /**
  * Detect a specific facial action before face capture.
  * Blocks until the action is confirmed or the timeout expires.
  *
+ * Every action is measured against the USER'S OWN neutral face, learned in a
+ * short calibration phase at the start (`CALIBRATION_MS`), because absolute
+ * thresholds cannot hold across face shapes, glasses, camera angle and distance.
+ *
  * Actions:
- *   blink      — eyes seen open, then EAR drops below threshold for 2+ consecutive frames
- *   look-left  — nose X shifts left ≥8 % of video width
- *   look-right — nose X shifts right ≥8 % of video width
- *   smile      — mouth height/width ratio exceeds threshold
+ *   blink      — eye-aspect-ratio drops to ≤BLINK_DROP of the user's open-eye
+ *                baseline, after the eyes have been seen open
+ *   look-left  — nose X shifts ≥8 % of video width from its resting position
+ *   look-right — same, other direction
+ *   smile      — mouth corners rise AND the mouth widens, both relative to the
+ *                calibrated neutral mouth
  *
  * Returns true when the action is detected, false on timeout.
  */
@@ -281,19 +316,36 @@ export async function detectChallenge(
   guard?: PresenceGuard,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const EAR_THRESHOLD = 0.28;
-  // Require ≥2 consecutive below-threshold frames (~160ms at 80ms/frame), and only
-  // after the eyes have been seen open — a static photo (eyes always open OR always
-  // closed) and single-frame sensor noise can no longer register as a blink.
-  const BLINK_FRAMES  = 2;
-  // mouthHeight/mouthWidth. A relaxed/neutral closed mouth sits well below this;
-  // a genuine smile (mouth widens / parts) clears it without straining. Empirically
-  // a full smile reaches ~0.28, so 0.22 gives margin above neutral and headroom to pass.
-  const SMILE_THRESHOLD = 0.22;
+  // Learn the neutral face first. Short enough not to feel like a wait, long
+  // enough for ~5-10 detections. The prompt during this window asks for a
+  // RELAXED face, so the baseline can't accidentally capture the action itself.
+  const CALIBRATION_MS = 800;
+  const calibrationEnds = Date.now() + CALIBRATION_MS;
+  // Blink: a real closure drops EAR far below the user's own open-eye value.
+  // Relative (0.62×) rather than absolute 0.28 — eye shape, glasses and camera
+  // angle move the absolute number more than a blink does.
+  const BLINK_DROP = 0.62;
+  // A single sub-threshold frame counts. A blink's closed phase is ~100ms and
+  // detection costs ~60-150ms per frame, so demanding two consecutive frames
+  // (the old rule) missed most ordinary blinks. The open→closed transition
+  // requirement below is what defeats a photo; the 38% relative drop is what
+  // rejects noise — neither needs a second frame.
+  const BLINK_FRAMES = 1;
+  // Smile: corners must rise AND the mouth widen, vs. this user's neutral.
+  // Requiring both rejects "mouth open" (widens little, corners don't rise) and
+  // a jaw drop. Values are fractions of inter-eye distance.
+  const SMILE_LIFT_DELTA = 0.012;
+  const SMILE_WIDTH_DELTA = 0.030;
   let earBelowCount = 0;
   let sawEyesOpen = false;
   let baselineNoseX: number | null = null;
   const baselineSamples: number[] = [];
+  // Calibrated neutrals (filled during the calibration window).
+  const earOpenSamples: number[] = [];
+  const liftSamples: number[] = [];
+  const widthSamples: number[] = [];
+  let earOpen = 0, liftNeutral = 0, widthNeutral = 0;
+  const mean = (a: number[]) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
 
   const actionLabel =
     type === 'blink' ? 'blink' :
@@ -312,12 +364,17 @@ export async function detectChallenge(
 
   onStatus?.({ label: prompt, guide, left: 0, right: 0 });
 
+  // Frame time is dominated by the detector's input size. Blink needs the
+  // highest possible frame rate to catch a ~100ms closure, and eye landmarks
+  // survive the smaller input fine; the other actions keep 320 for stability.
+  const inputSize = type === 'blink' ? 224 : 320;
+
   while (Date.now() < deadline) {
     let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
     let det: { landmarks?: { positions: Point[] } } | undefined;
     try {
       det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.3 }))
         .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
     } catch {
       await sleep(100); continue;
@@ -335,11 +392,37 @@ export async function detectChallenge(
     const pts = det.landmarks.positions as Point[];
     const videoWidth = video.videoWidth || 640;
 
+    // ── Calibration window: learn this user's neutral face ────────────────────
+    if (Date.now() < calibrationEnds) {
+      const rightEAR = eyeAspectRatio(pts.slice(36, 42));
+      const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
+      const ear = (rightEAR + leftEAR) / 2;
+      if (ear > 0.15) earOpenSamples.push(ear);   // ignore frames caught mid-blink
+      const m = mouthMetrics(pts);
+      liftSamples.push(m.lift);
+      widthSamples.push(m.width);
+      const pct = Math.round(((CALIBRATION_MS - (calibrationEnds - Date.now())) / CALIBRATION_MS) * 100);
+      onStatus?.({
+        label: type === 'blink' ? 'Look at the camera' : type === 'smile' ? 'Relax your face' : prompt,
+        guide, left: pct, right: pct,
+      });
+      await sleep(40);
+      continue;
+    }
+    if (!earOpen && earOpenSamples.length) earOpen = mean(earOpenSamples);
+    if (!widthNeutral && widthSamples.length) {
+      liftNeutral = mean(liftSamples);
+      widthNeutral = mean(widthSamples);
+      debugMetrics(`neutral: earOpen=${earOpen.toFixed(3)} lift=${liftNeutral.toFixed(4)} width=${widthNeutral.toFixed(4)}`);
+    }
+
     if (type === 'blink') {
       const rightEAR = eyeAspectRatio(pts.slice(36, 42));
       const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
       const ear = (rightEAR + leftEAR) / 2;
-      if (ear < EAR_THRESHOLD) {
+      const closedBelow = (earOpen || 0.28) * BLINK_DROP;
+      debugMetrics(`blink ear=${ear.toFixed(3)} threshold=${closedBelow.toFixed(3)} open=${earOpen.toFixed(3)}`);
+      if (ear < closedBelow) {
         // Only count a closure as a blink once we've confirmed the eyes were open —
         // this requires a real open→closed transition, defeating a static photo.
         if (sawEyesOpen) {
@@ -353,11 +436,14 @@ export async function detectChallenge(
         sawEyesOpen = true;
         earBelowCount = 0;
       }
-      // Two-stage, so the bar tracks the actual state machine: eyes seen open (50%)
-      // then a closure confirmed (100%). Raw EAR is a debug number, not guidance.
+      // Bar shows how far the lids have actually closed toward the trigger, so a
+      // half-blink reads as progress instead of nothing happening.
+      const closure = earOpen > 0
+        ? Math.max(0, Math.min(99, Math.round(((earOpen - ear) / (earOpen - closedBelow)) * 100)))
+        : 0;
       onStatus?.({
         label: sawEyesOpen ? 'Blink now' : 'Open your eyes',
-        guide: 'blink', left: sawEyesOpen ? 50 : 0, right: sawEyesOpen ? 50 : 0,
+        guide: 'blink', left: closure, right: closure,
       });
 
     } else if (type === 'look-left' || type === 'look-right') {
@@ -391,16 +477,27 @@ export async function detectChallenge(
       });
 
     } else if (type === 'smile') {
-      const ratio = smileRatio(pts);
-      if (ratio > SMILE_THRESHOLD) {
+      const m = mouthMetrics(pts);
+      const liftΔ = m.lift - liftNeutral;
+      const widthΔ = m.width - widthNeutral;
+      debugMetrics(`smile liftΔ=${liftΔ.toFixed(4)}/${SMILE_LIFT_DELTA} widthΔ=${widthΔ.toFixed(4)}/${SMILE_WIDTH_DELTA}`);
+      // BOTH must move: corners up AND mouth wider. Either alone is something
+      // else — a jaw drop widens nothing, and raised corners with no widening is
+      // usually the head tilting.
+      if (liftΔ >= SMILE_LIFT_DELTA && widthΔ >= SMILE_WIDTH_DELTA) {
         onStatus?.({ label: 'Smile detected', guide: 'smile', left: 100, right: 100, state: 'ok' });
         return true;
       }
-      const pct = Math.min(99, Math.round((ratio / SMILE_THRESHOLD) * 100));
+      // Progress = the weaker of the two, so the bar only fills on a real smile.
+      const pct = Math.max(0, Math.min(99, Math.round(Math.min(
+        (liftΔ / SMILE_LIFT_DELTA), (widthΔ / SMILE_WIDTH_DELTA),
+      ) * 100)));
       onStatus?.({ label: 'Smile', guide: 'smile', left: pct, right: pct });
     }
 
-    await sleep(80);
+    // Fast cadence: a blink's closed phase is ~100ms, so polling must be as
+    // tight as detection allows or the closure falls between two frames.
+    await sleep(type === 'blink' ? 20 : 60);
   }
 
   onStatus?.({ label: 'Timed out — try again', guide, state: 'fail', left: 0, right: 0 });
