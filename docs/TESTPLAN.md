@@ -62,7 +62,11 @@ The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creati
    head ("move closer" / "move back" / "hold your head level"), then a
    **three-leg depth sweep: closer → back → closer** — a white inner ring tracks
    your distance and lands exactly on the dashed target oval at 100% (and
-   shrinks back on the "move back" leg) — which dials in the distance
+   shrinks back on the "move back" leg), while the two small arrows above and
+   below say which WAY to travel: they point and drift **inward** to tighten the
+   shot on a "move closer" leg and **outward** to widen it on "move back" (the
+   ring is a distance readout, the arrows are the instruction) — which dials in
+   the distance
    *and* proves the face is three-dimensional (the perspective must reverse on
    demand, three times); exactly one face must be in shot throughout — then
    a **"relax your face"** baseline taken at that settled distance, then **five
@@ -220,17 +224,32 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 
 | # | Test | Result | Notes |
 |---|------|--------|-------|
-| T1 | 2-attester account creation | ☑ | |
-| T2 | Cross-relay account sync | ☑ | Re-tested through G1 `/resolve` (2026-08-09) |
-| T3 | Transfers + offline claim | ☑ → ☐ | **Re-run needed:** G2 — payment claims now verify a `/head-proof` packet instead of pulling the sender's chain (wiped-recipient variant included) |
-| T4 | NFT mint/transfer/burn | ☑ → ☐ | **Re-run needed:** NFT claims still chain-pull (by design, until archive token records), but the discovery path changed (`/pending-sends`) |
-| T5 | Recovery after wipe (1 relay down) | ☑ | Re-tested through G1 (2026-08-09) |
-| T6 | Username uniqueness + face limit | ☑ | |
-| T7 | Operator-gated reset | ☐ | Skipped by decision — reset is a dev-mode affordance |
+| T1 | 2-attester account creation | ☑ | Re-run 2026-08-10 on the seven-box tracker |
+| T2 | Cross-relay account sync | ☑ | Through G1 `/resolve` (on-demand, not spontaneous) |
+| T3 | Transfers + offline claim | ☑ | Through G2 `/head-proof` packets; offline **and** wiped-recipient variants |
+| T4 | NFT mint/transfer/burn | ☑ | Discovery via `/pending-sends`; claims still chain-pull by design |
+| T5 | Recovery after wipe (1 relay down) | ☑ | Key-blob + chain from the archive; claim gated on own-chain sync |
+| T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
+| T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
+
+**Automated pre-check.** Before the manual matrix, run the live probe — it
+covers everything about the archive API that does *not* need a face:
+
+```sh
+npx tsx scripts/g1-resolve-smoke.mts    # 16 checks; expect ALL CHECKS PASSED
+```
+
+It publishes a signed account record and a real signed sender chain to relay-1
+only, then asserts both relays (via federation) resolve the record, reject a
+forged higher-`_version` one, report the pending send addressed to an offline
+recipient with the right `headIndex`, and serve a `/head-proof` packet that
+verifies. A failure here means the manual run will fail too — fix it first.
 
 > Re-runs require deploying the updated relay to both cloud boxes first
 > (`git pull && npm install && pm2 restart neuron-relay`, then check `pm2 jlist`
-> restart counts again after >60 s — see CLAUDE.md relay caution).
+> restart counts again after >60 s — see CLAUDE.md relay caution). If you ran a
+> manual (non-operator) wipe, bump the generation and zero the face counts on
+> **one** relay per SUPERNODE.md → *Resets*; the follower carries it to the rest.
 
 File failures with: browser console log, `pm2 logs` from both relays, and which
 browser/profile was which account.

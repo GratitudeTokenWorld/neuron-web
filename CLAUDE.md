@@ -40,27 +40,41 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **219 tests / 53 files passing**, `npm run build` clean.
+Current baseline: **220 tests / 53 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
-## Where to pick up (as of 2026-08-09)
+## Where to pick up (as of 2026-08-10)
 
-The manual E2E matrix passed end to end on the two-relay dev network
-(TESTPLAN T1–T6; T7 skipped by decision). Face enrollment, 2-of-2 attestation,
-cross-relay sync, transfers both ways incl. offline claim, NFT mint/transfer/
-burn/reload, recovery-after-wipe and the uniqueness+face limits all work.
+**Both scale gaps are closed, deployed and manually re-tested.** The
+`src/engine/sim` baseline ran first (incl. a 10B projection — ARCHITECTURE.md →
+*Measured baseline*), then:
 
-**Both scale gaps are closed (2026-08-09).** The `src/engine/sim` baseline ran
-(incl. a 10B projection — ARCHITECTURE.md → *Measured baseline*); **G1**
-(global `accounts` topic → on-demand `/resolve` + `/pending-sends`, manually
-re-tested) and **G2** (counterparty chain pulls → `/head-proof` proof packets
-for payments; archive-side fork detection preserves fraud safety) are both
-implemented and deployed to the cloud relays, with an automated live probe in
-`scripts/g1-resolve-smoke.mts` (run it after every relay deploy). ⚠ G2 still
-needs a **manual T3/T4 pass** (face flows can't be automated); NFT claims
-remain on the chain-pull path until the archive serves token records.
-Next: **Phase 3 wiring** (storage CDN — `storage-manager.ts` off the legacy
-`DAGLedger`), then Phase 4, per ARCHITECTURE.md → *Where this stands*.
+- **G1** — no client ingests the global `accounts` topic. Relays archive
+  engine-verified account records and answer `GET /resolve`; clients resolve
+  counterparties on demand and verify the record's self-signature
+  (`src/network/account-resolver.ts`, `node.resolveAccount`). Offline inbound
+  transfers are found via `GET /pending-sends`, explorer TX search falls back to
+  `GET /block`.
+- **G2** — payments claim from a `GET /head-proof` proof packet
+  (`engine/core/counterparty-proof.ts` → `EngineLedger.registerVerifiedSend`)
+  and register only the send block; no sender chain is held, and the startup
+  foreign-chain refresh burst is gone. Fraud safety moved with it: relays
+  height-index the archive, detect same-height forks and gossip the evidence.
+  **NFT claims still chain-pull** (they need the token's mint record) — an
+  archive token-record endpoint finishes them.
+
+TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
+`npx tsx scripts/g1-resolve-smoke.mts` (16 checks) after every relay deploy.
+
+**Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
+`src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`
+stubs), then Phase 4. See ARCHITECTURE.md → *Where this stands*.
+
+Two lessons from this round worth carrying into the next: removing an `O(N)`
+crutch breaks whatever was quietly free-riding on it (offline discovery, TX
+search, and a wiped device's own-chain sync all were), and any epoch/authority
+state must be read as an aggregate **across relays** — reading only the
+same-origin relay split the brain twice (see SUPERNODE.md → *Resets*).
 
 `vitest.config.ts` is deliberately separate from `vite.config.ts` so the test run does
 not load the libp2p plugin (which spawns a relay).
@@ -74,22 +88,29 @@ src/
   core/            legacy app core carried from neuronchain (dag-ledger, vote,
                    face-store, face-verify, pin-crypto, snapshot, tab-lock, …)
   network/         libp2p-network, node.ts (the node orchestrator), smoke-store CDN,
-                   storage-manager
+                   storage-manager, account-resolver (G1/G2 archive queries:
+                   /resolve, /pending-sends, /head-proof, /block — every response
+                   verified client-side)
   ledger/          EngineLedger — the app↔engine bridge, and where the integration
-                   tests live (fraud-safety, committee-finality, multi-attester, nft, …)
+                   tests live (fraud-safety, committee-finality, multi-attester,
+                   nft, counterparty-claim, …)
   engine/          the scalable core, a self-contained tested library:
     core/          hash, P-256 keys, partition, Merkle accumulator, attestations,
-                   identity/nullifier dedup, blocks, light-verify
+                   identity/nullifier dedup, blocks, light-verify,
+                   counterparty-proof (G2 packet build/verify)
     node/          partial replication, delta sync, archival tiering, snapshots
     consensus/     VRF (RFC 9381), sortition, committees, weight, slashing, fraud
     content/       CIDs, chunking, provider DHT, replication
     economy/       capped reward inflation
     net/           relay federation (rendezvous hashing)
-    sim/           scale-invariant simulation harness
-relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2
-                   http/face-verify), vite-plugin.ts (dev auto-spawn),
+    sim/           scale-invariant harness: scenario (interest routing),
+                   directory (G1), counterparty (G2), archival, projection (10B)
+relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2 HTTP
+                   API — see docs/SUPERNODE.md), vite-plugin.ts (dev auto-spawn),
                    ecosystem.config.cjs (pm2). Runtime state (identity keys,
                    face DB, archives) lives in gitignored .relay-data/
+scripts/           os.sh / os-setup.ps1 (OpenStack), setup-relay-box.sh,
+                   g1-resolve-smoke.mts (live archive-API probe, run per deploy)
 ```
 
 ## The migration seam — read before editing app code

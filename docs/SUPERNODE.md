@@ -28,9 +28,43 @@ network's first **archival super-node**.
 | Port | Purpose | Exposure |
 |------|---------|----------|
 | `9090` (`PORT`) | libp2p WebSocket relay | behind nginx (`wss .../relay-ws` → `:9090`) |
-| `9092` (`PORT+2`) | HTTP: `/relay-info`, `/face-verify/*`, `/log-reload`, and the `/smoke-hub` WS | behind nginx |
+| `9092` (`PORT+2`) | HTTP API (below) + the `/smoke-hub` WS | behind nginx |
 
 Keep 9090/9092 **localhost-only** (firewalled); only nginx (443) is public.
+
+---
+
+## HTTP API (port 9092)
+
+Everything a client needs that gossip cannot give it on demand. **All of it is
+untrusted**: every response is self-certifying (account-signed records,
+account-signed blocks, Merkle inclusion proofs) and re-verified client-side, so
+a relay can *serve* or *withhold*, never forge. That is what lets the archive
+tier answer queries without becoming an authority.
+
+| Route | Answers | Verified by the client with |
+|---|---|---|
+| `GET /relay-info` | peerId, multiaddrs, `signingPub`, `operators`, `generation` | — (bootstrap/discovery; the reset epoch is cross-checked against the other relays, see *Resets*) |
+| `GET /resolve?username=\|pub=&network=` | one account record (**G1** directory tier) | record self-signs `account:{pub}:{username}:{createdAt}:{faceMapHash}` with the account's engine key |
+| `GET /pending-sends?pub=&network=` | `{ headIndex, sends[] }` — transfers addressed to `pub`, plus the archive's head index for `pub`'s own chain | a hint only: each send is then pulled/proven; `headIndex` gates claiming (see below) |
+| `GET /head-proof?pub=&send=&network=` | counterparty proof packet (**G2**): sender's open + head + send blocks with two RFC-6962 audit paths | `verifyPacket` — verified-human genesis, signed head, send inclusion |
+| `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
+| `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
+| `POST /log-reload` | dev telemetry sink | — |
+
+Two subtleties worth knowing before changing any of this:
+
+- **`headIndex` is a safety interlock, not a convenience.** A client whose own
+  chain trails the archive must finish syncing before it claims anything: a
+  receive built on a stale head forks the claimant's *own* chain, which is
+  cryptographically indistinguishable from a deliberate double-spend and gets
+  the account frozen network-wide. (That is exactly what a wiped-device
+  recovery did on 2026-08-09 — claimed at +1.5 s, forked itself, and every
+  reload minted another sibling.)
+- **`/head-proof` refuses a gappy or forked archive** (it requires the
+  contiguous chain `0..head`, since the accumulator commits every leaf). The
+  client then falls back to the delta chain-pull, where a conflict surfaces as
+  evidence instead of a bad proof.
 
 ---
 
@@ -129,10 +163,13 @@ server {
     proxy_read_timeout 86400s;
   }
 
-  # attester + relay info + G1 account resolution (HTTP)
-  location /face-verify { proxy_pass http://127.0.0.1:9092; }
-  location /relay-info  { proxy_pass http://127.0.0.1:9092; }
-  location /resolve     { proxy_pass http://127.0.0.1:9092; }
+  # attester + relay info + the archive query API (see "HTTP API" above)
+  location /face-verify   { proxy_pass http://127.0.0.1:9092; }
+  location /relay-info    { proxy_pass http://127.0.0.1:9092; }
+  location /resolve       { proxy_pass http://127.0.0.1:9092; }
+  location /pending-sends { proxy_pass http://127.0.0.1:9092; }
+  location /head-proof    { proxy_pass http://127.0.0.1:9092; }
+  location /block         { proxy_pass http://127.0.0.1:9092; }
 
   # the web app (static dist) — if served from here
   location / { root /home/admin/domains/neuronweb.org/dist; try_files $uri /index.html; }
@@ -275,12 +312,42 @@ A network reset is honored **only** when **signed by an operator** — the first
 `OPERATOR_COUNT` (3) accounts this relay ever attests, recorded in
 `.relay-operators.json` and served (with the current `generation`) in `/relay-info`.
 An operator reset wipes **everything, everywhere**: the relay's stores (engine
-blocks, key-blobs, usernames) **and** every connected client's local data (clients
-verify the operator signature before wiping; late/offline clients converge via the
-`generation` in `/relay-info` on next start/refresh). Any **non-operator** "Reset
-Testnet" is **ignored** by the relay and by all other clients — it only clears
-that one user's own device (which then re-syncs). This stops a stray browser from
-nuking the shared network while letting a founder reset it.
+blocks, key-blobs, usernames, account records) **and** every connected client's
+local data (clients verify the operator signature before wiping; late/offline
+clients converge via the `generation` in `/relay-info` on next start/refresh).
+Face **slot counts** are zeroed too — they count accounts, and the wipe just
+destroyed every account — while each face's descriptor + `nid` are **kept**, so
+one human still maps to one nullifier across a reset (otherwise
+one-human-one-account would reset with the chain, making reset a Sybil tool).
+Any **non-operator** "Reset Testnet" is **ignored** by the relay and by all other
+clients — it only clears that one user's own device (which then re-syncs). This
+stops a stray browser from nuking the shared network while letting a founder
+reset it.
+
+### Convergence — a reset must reach every relay and every browser
+
+Two independent split-brains bit on 2026-08-09; both are now closed, and both
+are worth understanding before touching this code:
+
+- **Clients aggregate across relays, not just the same-origin one.**
+  `fetchNetworkStatus()` takes the **max `generation`** and the **union of
+  `operators`** over the same-origin relay *and* the baked cloud relays. Reading
+  only the same-origin relay meant (a) a reset applied on the cloud boxes left
+  every browser on the old epoch — still holding, and resolving from, records of
+  accounts the reset had destroyed, which misrouted a payment to a dead account;
+  and (b) when that relay's operator list re-elected, the client-side gate
+  decided "not an operator" and silently downgraded a network reset to a
+  device-only wipe, which is why face limits appeared to survive resets. The
+  union is only a **UX gate** — every relay still verifies the reset signature
+  against **its own** operator list.
+- **Relays follow their peers.** Each relay polls `PEER_RELAYS`' `/relay-info`
+  every 60 s; a peer reporting a **higher** generation is proof of a reset this
+  relay missed (it was restarting, had no operators yet, or joined later), so it
+  performs the same full wipe. Content is client-verified, so following a peer's
+  epoch *number* trusts it with cache lifetime only, never with content.
+
+Net effect: a reset landing on any one relay propagates to all of them within
+~60 s, and browsers converge on their next start or 2-minute poll.
 
 - **Establishing operators:** the first 3 accounts created after the relay starts
   (with an empty operators file) become the operators. Back up `.relay-operators.json`.
@@ -296,13 +363,24 @@ nuking the shared network while letting a founder reset it.
   clients ignore it, and the device keeps the network's current generation so it
   simply re-syncs. (Before 2026-08-09 it also bumped its own generation, which
   silently made the device deaf to all inbound gossip; see `clearAll`.)
-- **Bootstrap / manual wipe** (no operators yet, or you want to force one):
+- **Bootstrap / manual wipe** (no operators yet, or you want to force one). Bump
+  the generation and zero the face counts as well, or clients will not converge
+  and the face limit will bar accounts that no longer exist:
   ```bash
   pm2 stop neuron-relay
-  rm -f .relay-data/.relay-engine-blocks.json .relay-data/.relay-keyblobs.json .relay-data/.relay-usernames.json
-  # also rm .relay-operators.json to re-elect operators from the next 3 accounts
-  pm2 start neuron-relay
+  cd .relay-data
+  rm -f .relay-engine-blocks.json .relay-keyblobs.json .relay-usernames.json \
+        .relay-accounts.json .relay-operators.json          # operators re-elect
+  node -e 'const f=require("fs");
+    f.writeFileSync(".relay-generation.json", String(<NEW_GEN>));
+    const db=JSON.parse(f.readFileSync(".relay-face-db.json","utf8"));
+    for (const e of db) e.count = 0;            // keep descriptor + nid
+    f.writeFileSync(".relay-face-db.json", JSON.stringify(db));'
+  cd .. && pm2 start neuron-relay
   ```
+  Do it on **one** relay and the generation follower carries it to the others
+  within 60 s; do it on the local dev relay too if you run one, since browsers
+  take the max epoch across all of them.
 
 ---
 

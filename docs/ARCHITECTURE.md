@@ -549,28 +549,38 @@ Phase status against the plan below, and what a new session should pick up.
 | 3 — Storage CDN + tiered nodes | **engine built, NOT wired** | `src/engine/content` exists; `storage-manager.ts` still on the legacy `DAGLedger`, `EngineLedger.createStorage*` are `deferred()` stubs |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
-
-The manual E2E matrix (TESTPLAN T1-T6) passed on the two-relay dev network on
-2026-08-09; T7 (operator reset) was skipped by decision as a dev-mode affordance.
+| G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof`; archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe `scripts/g1-resolve-smoke.mts` 16/16 |
 
 The simulation baseline has been run and extended (see *Measured baseline*
 below): the engine's block layer holds the invariant exactly, and the harness
-now also measures the **fix designs** for G1 (DHT directory), G2 (counterparty
+also measures the **fix designs** for G1 (DHT directory), G2 (counterparty
 proof packets) and decentralized archival, plus a 10B projection from the
-measured constants. Each G-fix now has a before/after number waiting for its
-implementation.
+measured constants — so each fix shipped against a before/after number.
 
-**G1 is implemented (2026-08-09)** — clients no longer ingest the global
-`accounts` topic; relays archive + serve records via `/resolve` and clients
-resolve on demand with local signature verification (see *Deferred gaps* → G1
-for the change list). It needs a **manual re-run of TESTPLAN T2/T3/T5** (face
-flows can't be automated; resolution, transfers and recovery all cross the new
-path).
+**Both gaps are now implemented, deployed and manually re-tested** (see
+*Deferred gaps* below for the per-gap change lists). The manual E2E matrix
+(TESTPLAN T1–T6) passed again on 2026-08-10 through the new paths; T7 (operator
+reset) is exercised routinely in dev rather than as a matrix row.
 
-Next, in order: **G2** (counterparty chain replication — measured target
-`sim/counterparty.ts`), **Phase 3 wiring**, **Phase 4**. The migration seam
-(~182 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
-caller, as each one is moved off the `DAGLedger` compatibility surface.
+What the manual runs surfaced — all fixed, and all instructive, because each
+was a *consequence* of removing an O(N) crutch rather than a bug in the new
+mechanism:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Offline transfer never claimed | offline discovery had been free-riding on the O(N) accounts firehose (a recovered device learned every account, so the startup refresh pulled every chain) | `GET /pending-sends` — interest-scoped inbound discovery |
+| Search returned nothing | interest-scoped views rarely hold a searched block | `GET /block` archive fallback, verified client-side |
+| Recovered account froze itself | claimed before its own chain finished syncing → self-fork = double-spend evidence | `ownChainIsCurrent` interlock on every claim path |
+| Transfer routed to a destroyed account | stale pre-reset record survived locally and outranked the live one | generation filter at the cache boundary + relay-first username resolution + newest-registration ranking |
+| "Reset testnet" did nothing to the network | operator gate read only the same-origin relay | epoch/operator aggregation across relays + relay generation follower |
+
+Next, in order: **Phase 3 wiring** (`storage-manager.ts` off the legacy
+`DAGLedger`; `EngineLedger.createStorage*` are deliberate `deferred()` stubs),
+then **Phase 4**. The migration seam (~182 app-layer type errors; see CLAUDE.md)
+can be paid down alongside, per caller, as each one is moved off the `DAGLedger`
+compatibility surface. Known remaining interim: NFT claims still chain-pull
+(they need the token's mint record — an archive token-record endpoint completes
+G2 for them).
 
 ---
 
@@ -715,10 +725,11 @@ silently overloading validators.
 
 ## Deferred: scale-invariant gaps in the CURRENT build
 
-> **Status (2026-08-09): BOTH gaps are implemented.** G1 shipped and passed
-> the manual re-test; G2 shipped the same day (payments claim via proof
-> packets; NFT claims stay on the chain-pull path until the archive serves
-> token records). Pending: a manual T3/T4 re-run through the proof path.
+> **Status (2026-08-10): BOTH gaps are implemented, deployed and manually
+> re-tested green** (TESTPLAN T1–T6 on the two-relay dev network). Payments
+> claim via proof packets; NFT claims stay on the chain-pull path until the
+> archive serves token records. Automated live probe:
+> `scripts/g1-resolve-smoke.mts` (16 checks — run it after every relay deploy).
 
 **G1 — The global `accounts` topic is `O(N)`. FIXED 2026-08-09 (client dir
 ingest gone; awaiting manual T2 re-verify).** What shipped:
@@ -743,6 +754,11 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   `sim/directory.ts` (328 B record, flat per client). *At scale* the relay
   `/resolve` call is replaced by DHT `findProviders` — the call site
   (`account-resolver.ts`) is the seam; the record format doesn't change.
+- **Explorer search follows the same rule.** A node's view is interest-scoped,
+  so a searched TX is routinely not held locally and search returned "no
+  results". `GET /block?hash=` serves it from the archive; the client verifies
+  content hash + signature and renders it display-only (never applied to the
+  ledger, which has no chain context for it).
 - **Follow-up fix (same day): offline-transfer discovery.** The offline-claim
   path had been free-riding on the removed firehose — a recovered device
   learned every account that existed, and the startup refresh then pulled
@@ -778,6 +794,17 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   tampered amounts, mis-addressed claims, foreign-chain sends, truncated
   proofs, double-claims and frozen senders
   (`src/ledger/counterparty-claim.test.ts`).
+- **Claim safety interlock (`ownChainIsCurrent`).** Every claim path — the
+  pending-inbound check, the unclaimed sweep, the challenge-window claim, and
+  the proof path — first confirms our local head is at least as fresh as the
+  archive's view of *our own* chain (`headIndex` from `/pending-sends`). A
+  receive built on a stale head forks the claimant's own chain, which is
+  indistinguishable from a deliberate double-spend: on 2026-08-09 a
+  wiped-device recovery claimed at +1.5 s, before its own chain had synced,
+  and the new fork detector (correctly) froze it network-wide. When behind, the
+  node resyncs and lets the 20 s/60 s backstops claim once current. If no relay
+  answers at all it stays permissive — there is no archive view to be behind of,
+  and blocking claims forever would deadlock an isolated dev network.
 - **Interim:** NFT claims still pull the sender's chain — the claim needs the
   token's MINT record (content CID + metadata), which lives on the minter's
   chain; the packet verifier already accepts `nft-send`, so moving NFTs over
