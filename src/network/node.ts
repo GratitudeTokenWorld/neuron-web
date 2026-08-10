@@ -1000,9 +1000,16 @@ export class NeuronNode extends EventEmitter {
       // publish failure never breaks the local commit. Engine blocks never route
       // through the legacy serializeBlock/voteIfConflict path.
       try { this.net.publishEngineBlock(eb); } catch { /* best-effort */ }
-      // Slice 2: notify the recipient's inbox so it can pull this send even when
-      // it does not subscribe to the sender's shard (Slice 3). Best-effort.
-      if (eb.type === 'send' && eb.recipient) {
+      // Slice 2: notify the recipient's inbox so it can claim this transfer even
+      // when it does not subscribe to the sender's shard (Slice 3). Best-effort.
+      //
+      // NFTs need this exactly as much as payments do, and used to be excluded:
+      // an `nft-send` had no direct wake-up at all, so the recipient only found
+      // it by happening to hold the sender's shard, or on the 60 s
+      // pending-inbound poll / next startup. That is why a transferred NFT
+      // appeared "only after a refresh" (reported 2026-08-10) while a payment
+      // of the same moment landed in seconds.
+      if ((eb.type === 'send' || eb.type === 'nft-send') && eb.recipient) {
         try { await this.sendEngineInboxSignal(eb); } catch { /* best-effort */ }
       }
     }

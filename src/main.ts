@@ -3100,7 +3100,10 @@ function wireNodeEvents() {
   });
   node.on('inbox:signal', (data: unknown) => {
     const sig = data as { sender: string; amount: number };
-    addLog(`Inbox: incoming ${formatUNIT(sig.amount)} UNIT from ${resolveNamePlain(sig.sender)}`, 'info');
+    // NFT transfers signal the inbox too, and carry no amount — don't claim
+    // "incoming 0 UNIT" for them.
+    const what = sig.amount > 0 ? `${formatUNIT(sig.amount)} UNIT` : 'transfer';
+    addLog(`Inbox: incoming ${what} from ${resolveNamePlain(sig.sender)}`, 'info');
   });
   node.on('contract:deployed', (data: unknown) => {
     addLog(`Contract: ${(data as { name: string }).name}`, 'success');
