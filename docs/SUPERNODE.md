@@ -48,6 +48,7 @@ tier answer queries without becoming an authority.
 | `GET /resolve?username=\|pub=&network=` | one account record (**G1** directory tier) | record self-signs `account:{pub}:{username}:{createdAt}:{faceMapHash}` with the account's engine key |
 | `GET /pending-sends?pub=&network=` | `{ headIndex, sends[] }` — transfers addressed to `pub`, plus the archive's head index for `pub`'s own chain | a hint only: each send is then pulled/proven; `headIndex` gates claiming (see below) |
 | `GET /head-proof?pub=&send=&network=` | counterparty proof packet (**G2**): sender's open + head + send blocks with two RFC-6962 audit paths | `verifyPacket` — verified-human genesis, signed head, send inclusion |
+| `GET /token?id=&network=` | an NFT's mint proof (**G2**): the MINTER's open + head + `nft-mint` blocks with audit paths | `verifyMintProof` — token id match, mint inclusion on a verified-human chain |
 | `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
 | `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
 | `POST /log-reload` | dev telemetry sink | — |
@@ -169,6 +170,7 @@ server {
   location /resolve       { proxy_pass http://127.0.0.1:9092; }
   location /pending-sends { proxy_pass http://127.0.0.1:9092; }
   location /head-proof    { proxy_pass http://127.0.0.1:9092; }
+  location /token         { proxy_pass http://127.0.0.1:9092; }
   location /block         { proxy_pass http://127.0.0.1:9092; }
 
   # the web app (static dist) — if served from here

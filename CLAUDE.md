@@ -18,12 +18,12 @@ designed to hold the *scale invariant*:
 Weigh that invariant on **every** change. Zero common-path overhead, interest-scoped
 propagation, no global indexes.
 
-Two **known live violations** are tracked in ARCHITECTURE.md → *Deferred:
-scale-invariant gaps in the current build*: **G1** the global `accounts` gossip
-topic (every node ingests every account record) and **G2** counterparty
-verification pulling whole chains instead of accumulator proofs. Both are
-deliberately deferred until the architecture/refactor work is done — don't
-re-derive them as new discoveries, and don't build on top of them.
+The two known `O(N)` violations — **G1** (global `accounts` gossip topic) and
+**G2** (counterparty verification pulling whole chains) — are **closed as of
+2026-08-10**; ARCHITECTURE.md → *Deferred: scale-invariant gaps* records what
+shipped for each. Don't re-derive them as new discoveries, and don't
+reintroduce a global topic or a whole-chain pull to make something easier: the
+replacements are on-demand, verified archive queries (see *Where to pick up*).
 
 The full design, threat model, and consensus rationale live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — read it before touching the engine,
@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **220 tests / 53 files passing**, `npm run build` clean.
+Current baseline: **222 tests / 53 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -60,11 +60,12 @@ Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
   and register only the send block; no sender chain is held, and the startup
   foreign-chain refresh burst is gone. Fraud safety moved with it: relays
   height-index the archive, detect same-height forks and gossip the evidence.
-  **NFT claims still chain-pull** (they need the token's mint record) — an
-  archive token-record endpoint finishes them.
+  NFTs claim the same way, verifying a second proof for the token's mint
+  record (`GET /token`) against the **minter's** chain — so no counterparty
+  chain is held at all.
 
 TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
-`npx tsx scripts/g1-resolve-smoke.mts` (16 checks) after every relay deploy.
+`npx tsx scripts/g1-resolve-smoke.mts` (21 checks) after every relay deploy.
 
 **Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
 `src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`
@@ -89,15 +90,15 @@ src/
                    face-store, face-verify, pin-crypto, snapshot, tab-lock, …)
   network/         libp2p-network, node.ts (the node orchestrator), smoke-store CDN,
                    storage-manager, account-resolver (G1/G2 archive queries:
-                   /resolve, /pending-sends, /head-proof, /block — every response
-                   verified client-side)
+                   /resolve, /pending-sends, /head-proof, /token, /block — every
+                   response verified client-side)
   ledger/          EngineLedger — the app↔engine bridge, and where the integration
                    tests live (fraud-safety, committee-finality, multi-attester,
                    nft, counterparty-claim, …)
   engine/          the scalable core, a self-contained tested library:
     core/          hash, P-256 keys, partition, Merkle accumulator, attestations,
                    identity/nullifier dedup, blocks, light-verify,
-                   counterparty-proof (G2 packet build/verify)
+                   counterparty-proof (G2 transfer + mint proofs)
     node/          partial replication, delta sync, archival tiering, snapshots
     consensus/     VRF (RFC 9381), sortition, committees, weight, slashing, fraud
     content/       CIDs, chunking, provider DHT, replication

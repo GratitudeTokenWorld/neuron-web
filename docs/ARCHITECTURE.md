@@ -549,7 +549,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 3 — Storage CDN + tiered nodes | **engine built, NOT wired** | `src/engine/content` exists; `storage-manager.ts` still on the legacy `DAGLedger`, `EngineLedger.createStorage*` are `deferred()` stubs |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
-| G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof`; archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe `scripts/g1-resolve-smoke.mts` 16/16 |
+| G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 21/21 |
 
 The simulation baseline has been run and extended (see *Measured baseline*
 below): the engine's block layer holds the invariant exactly, and the harness
@@ -578,9 +578,7 @@ Next, in order: **Phase 3 wiring** (`storage-manager.ts` off the legacy
 `DAGLedger`; `EngineLedger.createStorage*` are deliberate `deferred()` stubs),
 then **Phase 4**. The migration seam (~182 app-layer type errors; see CLAUDE.md)
 can be paid down alongside, per caller, as each one is moved off the `DAGLedger`
-compatibility surface. Known remaining interim: NFT claims still chain-pull
-(they need the token's mint record — an archive token-record endpoint completes
-G2 for them).
+compatibility surface.
 
 ---
 
@@ -725,11 +723,11 @@ silently overloading validators.
 
 ## Deferred: scale-invariant gaps in the CURRENT build
 
-> **Status (2026-08-10): BOTH gaps are implemented, deployed and manually
-> re-tested green** (TESTPLAN T1–T6 on the two-relay dev network). Payments
-> claim via proof packets; NFT claims stay on the chain-pull path until the
-> archive serves token records. Automated live probe:
-> `scripts/g1-resolve-smoke.mts` (16 checks — run it after every relay deploy).
+> **Status (2026-08-10): BOTH gaps are fully implemented, deployed and
+> manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network).
+> Payments **and NFTs** now claim via proof packets — no counterparty chain is
+> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (21 checks
+> — run it after every relay deploy).
 
 **G1 — The global `accounts` topic is `O(N)`. FIXED 2026-08-09 (client dir
 ingest gone; awaiting manual T2 re-verify).** What shipped:
@@ -805,10 +803,16 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   node resyncs and lets the 20 s/60 s backstops claim once current. If no relay
   answers at all it stays permissive — there is no archive view to be behind of,
   and blocking claims forever would deadlock an isolated dev network.
-- **Interim:** NFT claims still pull the sender's chain — the claim needs the
-  token's MINT record (content CID + metadata), which lives on the minter's
-  chain; the packet verifier already accepts `nft-send`, so moving NFTs over
-  needs only an archive token-record endpoint.
+- **NFTs claim from proofs too** (2026-08-10). A transfer packet proves the
+  *send* but cannot say what the token **is**: `contentRef` + metadata live in
+  the `nft-mint` block on the **minter's** chain — a different account once the
+  token has moved — and without it a claimed NFT renders as nothing. So an NFT
+  claim verifies **two** independent proofs: the transfer packet, plus a
+  **mint proof** (`GET /token?id=`) checked against the minter's own chain
+  (`verifyMintProof`). The mint is fetched *before* the transfer is registered,
+  so a token the node cannot describe never enters the unclaimed set. Both
+  proofs share one `verifyChainInclusion` core, so neither shape can skip the
+  head/inclusion check. No sender chain and no minter chain is held.
 
 **Consequence to keep in mind meanwhile (correct, not a bug):** node views are
 *asymmetric by design* — a recipient holds the sender's chain, the sender holds
