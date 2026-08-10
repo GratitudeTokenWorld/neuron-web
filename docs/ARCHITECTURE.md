@@ -813,6 +813,20 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   so a token the node cannot describe never enters the unclaimed set. Both
   proofs share one `verifyChainInclusion` core, so neither shape can skip the
   head/inclusion check. No sender chain and no minter chain is held.
+- **Two follow-ups the first live NFT round trip exposed** (both fixed the same
+  day, both consequences of no longer holding counterparty chains):
+  *(a)* ownership could not stay last-write-wins — replay is
+  accountId-then-index, so on an A→B→A round trip B's older receive replayed
+  after A's newer one and took the token back, permanently. Ownership is now
+  derived from per-token **custody** (per account: the index of the latest
+  block in its OWN chain touching the token, and whether that left it
+  holding), which is order-independent because per-account chains are totally
+  ordered. *(b)* proof-registered foreign blocks were memory-only, so a reload
+  lost both the mint (token renders as nothing) and the sender's `nft-send`
+  (the sender looks like the holder again). They are persisted and re-seated
+  by `restoreVerifiedBlock`. Also: `nft-send` now signals the recipient's
+  inbox like a payment — without it an NFT had no direct wake-up and appeared
+  only on the 60 s poll or the next startup.
 
 **Consequence to keep in mind meanwhile (correct, not a bug):** node views are
 *asymmetric by design* — a recipient holds the sender's chain, the sender holds

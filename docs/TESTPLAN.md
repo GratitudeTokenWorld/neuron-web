@@ -227,7 +227,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 | T1 | 2-attester account creation | ☑ | Re-run 2026-08-10 on the seven-box tracker |
 | T2 | Cross-relay account sync | ☑ | Through G1 `/resolve` (on-demand, not spontaneous) |
 | T3 | Transfers + offline claim | ☑ | Through G2 `/head-proof` packets; offline **and** wiped-recipient variants |
-| T4 | NFT mint/transfer/burn | ☑ | Discovery via `/pending-sends`; claims verify transfer packet + `/token` mint proof |
+| T4 | NFT mint/transfer/burn | ☑ | Discovery via inbox signal + `/pending-sends`; claims verify transfer packet + `/token` mint proof. **Re-check the round trip** (A→B→A) and that the claim lands in ~5 s without a refresh |
 | T5 | Recovery after wipe (1 relay down) | ☑ | Key-blob + chain from the archive; claim gated on own-chain sync |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |

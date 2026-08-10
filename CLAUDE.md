@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
 ```
 
-Current baseline: **222 tests / 53 files passing**, `npm run build` clean.
+Current baseline: **224 tests / 53 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -169,7 +169,20 @@ Changes here need adversarial tests, not just happy-path ones.
   accountId-then-index, so a recipient's chain may load before the sender's.
   Anything that validates against another account's block must tolerate arriving
   first (see the NFT mint/receive guards in `engine-ledger.ts`), or a reload
-  silently drops state and truncates the chain behind it.
+  silently drops state and truncates the chain behind it. Two rules follow, both
+  learned from live failures — do not regress them:
+  - **Never derive cross-account state last-write-wins.** Replay order is not
+    causal order. NFT ownership is derived from per-token *custody* (for each
+    account, the index of the latest block in ITS OWN chain touching the token,
+    and whether that left it holding). A round trip broke the naive rule: the
+    previous owner's older receive replayed last and took the token back.
+  - **Anything a proof claim registers must be persisted.** `registerVerified*`
+    puts foreign blocks in `allBlocks`, but a proof claim holds none of the
+    counterparty's chain, so nothing else rebuilds them. They are saved and
+    re-seated on start via `restoreVerifiedBlock` (which re-checks hash +
+    signature; `addBlock` rejects them for want of chain context). Lose the
+    `nft-mint` and the token renders as nothing; lose the `nft-send` and the
+    sender looks like they still hold it.
 - **Secrets.** `.relay-*` files (attester key, signing key, face DB, operator list) and
   `*.openrc` are gitignored and contain live secrets/biometrics. Never commit, print,
   or copy them into docs or logs.
