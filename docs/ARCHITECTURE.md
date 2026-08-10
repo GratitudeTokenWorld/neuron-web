@@ -724,7 +724,8 @@ silently overloading validators.
 ## Deferred: scale-invariant gaps in the CURRENT build
 
 > **Status (2026-08-10): BOTH gaps are fully implemented, deployed and
-> manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network).
+> manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network,
+> including the NFT round trip through the proof path).
 > Payments **and NFTs** now claim via proof packets — no counterparty chain is
 > held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (21 checks
 > — run it after every relay deploy).
