@@ -1,7 +1,7 @@
 import { verify as engineVerify } from '../engine/core/keys';
 import { decodeBlock, verifyBlock, type Block } from '../engine/core/block';
 import { hexToBytes, type Hex } from '../engine/core/hash';
-import type { CounterpartyPacket } from '../engine/core/counterparty-proof';
+import type { CounterpartyPacket, MintProof } from '../engine/core/counterparty-proof';
 
 /**
  * G1 fix — on-demand account/username resolution (client side).
@@ -235,6 +235,50 @@ export async function fetchHeadProof(
         sendBlock: decodeBlock(hexToBytes(p.sendHex)),
         openInclusionProof: p.openProof,
         sendInclusionProof: p.sendProof,
+      };
+    } catch { /* malformed — try the next relay */ }
+  }
+  return null;
+}
+
+/**
+ * G2 for NFTs — fetch a token's mint proof (GET /token) from the relays'
+ * archives: the MINTER's open + head + the nft-mint block, with audit paths.
+ * A transfer packet proves the send; this proves what the token IS
+ * (`contentRef` + metadata), which lives on the minter's chain — a different
+ * account once the token has moved at least once. Verification happens in the
+ * ledger (registerVerifiedMint → verifyMintProof).
+ */
+export async function fetchMintProof(
+  bases: readonly string[],
+  tokenId: string,
+  network: string,
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<MintProof | null> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(
+        `${base}/token?id=${encodeURIComponent(tokenId)}&network=${encodeURIComponent(network)}`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) throw new Error(`token ${res.status}`);
+      return (await res.json()) as {
+        openHex?: string; headHex?: string; mintHex?: string; openProof?: Hex[]; mintProof?: Hex[];
+      };
+    }),
+  );
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    const p = r.value;
+    if (!p?.openHex || !p.headHex || !p.mintHex || !Array.isArray(p.openProof) || !Array.isArray(p.mintProof)) continue;
+    try {
+      return {
+        openBlock: decodeBlock(hexToBytes(p.openHex)),
+        headBlock: decodeBlock(hexToBytes(p.headHex)),
+        mintBlock: decodeBlock(hexToBytes(p.mintHex)),
+        openInclusionProof: p.openProof,
+        mintInclusionProof: p.mintProof,
       };
     } catch { /* malformed — try the next relay */ }
   }

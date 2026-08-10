@@ -296,9 +296,10 @@ function archiveEngineBlock(blockHex, network) {
   const row = {
     hash: block.hash, accountId: block.accountId, index: block.index,
     shard: block.shard, network, blockHex,
-    // Denormalized so /pending-sends can scan without decoding every row.
-    // Rows archived before this landed lack them — that scan decodes on demand.
-    type: block.type, recipient: block.recipient,
+    // Denormalized so /pending-sends and /token can scan without decoding every
+    // row. Rows archived before this landed lack them — those scans decode on
+    // demand and backfill.
+    type: block.type, recipient: block.recipient, tokenId: block.tokenId,
   };
   engineBlockStore.set(block.hash, row);
   indexEngineRow(row);
@@ -741,6 +742,51 @@ async function main() {
           }));
         }
 
+      } else if (req.url?.startsWith('/token?')) {
+        // G2 for NFTs: a transfer packet proves the SEND, but not what the
+        // token is — `contentRef` + metadata live in the nft-mint block on the
+        // MINTER's chain, a different account after the first hop. Locate the
+        // mint by tokenId, then prove it against the minter's chain exactly
+        // like /head-proof does. Same contiguity requirement, same untrusted
+        // stance: the client re-verifies and a bad proof is simply rejected.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const tokenId = String(q.get('id') || '');
+        let mintRow = null;
+        for (const r of engineBlockStore.values()) {
+          if (r.network !== network) continue;
+          if (r.type === undefined) {
+            // Row predates the denormalized fields — decode once and backfill.
+            try {
+              const b = decodeBlock(hexToBytes(r.blockHex));
+              r.type = b.type; r.recipient = b.recipient; r.tokenId = b.tokenId;
+              engineStoreDirty = true;
+            } catch { continue; }
+          }
+          if (r.type === 'nft-mint' && r.tokenId === tokenId) { mintRow = r; break; }
+        }
+        const rows = mintRow
+          ? [...engineBlockStore.values()]
+              .filter(r => r.accountId === mintRow.accountId && r.network === network)
+              .sort((a, b) => a.index - b.index)
+          : [];
+        const contiguous = rows.length > 0 && rows.every((r, i) => r.index === i);
+        if (!mintRow || !contiguous) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'token unknown or minter chain incomplete' }));
+        } else {
+          const acc = new AccountAccumulator();
+          for (const r of rows) acc.append(r.hash);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({
+            openHex: rows[0].blockHex,
+            headHex: rows[rows.length - 1].blockHex,
+            mintHex: mintRow.blockHex,
+            openProof: acc.proofHex(0),
+            mintProof: acc.proofHex(mintRow.index),
+          }));
+        }
+
       } else if (req.url?.startsWith('/pending-sends?')) {
         // G1 follow-up — offline-transfer discovery. A recipient that was
         // offline (or fully wiped + recovered) asks the archive which send /
@@ -774,6 +820,7 @@ async function main() {
                 const b = decodeBlock(hexToBytes(r.blockHex));
                 type = r.type = b.type;
                 recipient = r.recipient = b.recipient;
+                r.tokenId = b.tokenId;
                 engineStoreDirty = true;
               } catch { continue; }
             }

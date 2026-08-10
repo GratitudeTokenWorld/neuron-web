@@ -1,7 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof } from './account-resolver';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -1193,10 +1193,9 @@ export class NeuronNode extends EventEmitter {
       for (const h of sends) {
         // Already holding the send block ⇒ claimed (or about to be) — skip.
         if (this.ledger.allBlocks.has(h.blockHash)) continue;
-        // G2: payments claim via a compact proof packet — no sender chain held.
-        // NFTs (mint record needed) and proof failures fall back to the pull.
-        const proven = h.type === 'send' && await this.claimViaProof(pub, h.sender, h.blockHash);
-        if (!proven) this.engineResyncAccount(h.sender);
+        // G2: claim via a compact proof packet — no sender chain held. Payments
+        // and NFTs both; a proof failure falls back to the chain pull.
+        if (!await this.claimViaProof(pub, h.sender, h.blockHash)) this.engineResyncAccount(h.sender);
       }
     } catch { /* best-effort — the 60s backstop retries */ }
   }
@@ -1221,6 +1220,22 @@ export class NeuronNode extends EventEmitter {
       if (!(await this.ownChainIsCurrent(recipientPub))) return true;
       const packet = await fetchHeadProof(this.relayResolveBases(), senderId, sendBlockHash, this.ledger.network);
       if (!packet || packet.sendBlock.hash !== sendBlockHash) return false;
+
+      // An NFT claim needs one more independently-verified input: the token's
+      // MINT record, which lives on the MINTER's chain (not the sender's, once
+      // the token has moved). Fetch it BEFORE registering the transfer so a
+      // token we cannot describe never enters the unclaimed set — otherwise the
+      // NFT would claim but render as an empty tile.
+      const tokenId = packet.sendBlock.tokenId;
+      if (packet.sendBlock.type === 'nft-send') {
+        if (!tokenId) return false;
+        if (!this.ledger.getNftInfo(tokenId)) {
+          const mint = await fetchMintProof(this.relayResolveBases(), tokenId, this.ledger.network);
+          if (!mint) return false;                                  // fall back to the chain pull
+          if (!this.ledger.registerVerifiedMint(mint, tokenId).ok) return false;
+        }
+      }
+
       const reg = this.ledger.registerVerifiedSend(packet, recipientPub);
       if (!reg.ok) return reg.error === 'already claimed'; // claimed ⇒ nothing left to do
       this.net.subscribeEngineShard(this.ledger.getShardOf(senderId)); // fraud-evidence watch

@@ -28,8 +28,10 @@ import { generateKeyPair, sign } from '../src/engine/core/keys.js';
 import { encodeBlock } from '../src/engine/core/block.js';
 import { bytesToHex } from '../src/engine/core/hash.js';
 import { buildSenderChain } from '../src/engine/sim/counterparty.js';
-import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, fetchPendingSends, fetchHeadProof, type AccountRecord } from '../src/network/account-resolver.js';
-import { verifyPacket } from '../src/engine/core/counterparty-proof.js';
+import { accountRecordPayload, resolveAccountFromRelays, verifyAccountRecordSig, fetchPendingSends, fetchHeadProof, fetchMintProof, type AccountRecord } from '../src/network/account-resolver.js';
+import { verifyPacket, verifyMintProof } from '../src/engine/core/counterparty-proof.js';
+import { createBlock } from '../src/engine/core/block.js';
+import { hashHex, utf8ToBytes } from '../src/engine/core/hash.js';
 
 const RELAYS = [
   { name: 'relay-1', dial: '/ip4/80.97.27.224/tcp/9091/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh', http: 'http://80.97.27.224:9092' },
@@ -153,6 +155,39 @@ for (const r of RELAYS) {
 check(
   (await fetchHeadProof(RELAYS.map((r) => r.http), senderId, 'ab'.repeat(32), 'testnet')) === null,
   'unknown send hash yields no packet',
+);
+
+// ── G2 for NFTs: mint proof (/token) ────────────────────────────────────────
+// Extend the same chain with a mint so the archive can prove what a token IS —
+// the half a transfer packet cannot carry (the mint lives on the MINTER's
+// chain, a different account once the token has moved).
+const mintTokenId = hashHex(utf8ToBytes(`smoke-token-${username}`));
+const mintBlock = createBlock(
+  {
+    accountId: senderId, index: chain.blocks.length, type: 'nft-mint',
+    previousHash: chain.blocks[chain.blocks.length - 1]!.hash, shard: chain.blocks[0]!.shard,
+    timestamp: 2000, balance: chain.blocks[chain.blocks.length - 1]!.balance,
+    tokenId: mintTokenId, contentRef: 'cid-smoke', nftMeta: { name: 'Smoke' },
+  },
+  chain.keys.priv,
+  chain.accumulator,
+);
+await pubsub.publish(blockTopic, new TextEncoder().encode(JSON.stringify({ blockHex: bytesToHex(encodeBlock(mintBlock)) })));
+console.log('published an nft-mint block');
+await sleep(3000);
+
+for (const r of RELAYS) {
+  const proof = await fetchMintProof([r.http], mintTokenId, 'testnet');
+  const verdict = proof ? verifyMintProof(proof, mintTokenId, { min: 1, requiredTypes: ['personhood'] }) : { ok: false, reason: 'no proof' };
+  check(verdict.ok === true, `${r.name} serves a mint proof that verifies (${verdict.reason ?? 'ok'})`);
+  check(
+    !!proof && proof.mintBlock.contentRef === 'cid-smoke' && proof.mintBlock.accountId === senderId,
+    `${r.name} mint proof carries the token's content ref + minter`,
+  );
+}
+check(
+  (await fetchMintProof(RELAYS.map((r) => r.http), 'cd'.repeat(32), 'testnet')) === null,
+  'unknown token id yields no mint proof',
 );
 
 await node.stop();

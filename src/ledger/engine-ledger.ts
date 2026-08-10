@@ -9,7 +9,10 @@ import {
   type Block,
 } from '../engine/core/block.js';
 import { AccountAccumulator } from '../engine/core/accumulator.js';
-import { buildPacketFromChain, verifyPacket, type CounterpartyPacket } from '../engine/core/counterparty-proof.js';
+import {
+  buildPacketFromChain, verifyPacket, buildMintProofFromChain, verifyMintProof,
+  type CounterpartyPacket, type MintProof,
+} from '../engine/core/counterparty-proof.js';
 import { checkQuorum, type TypedAttestation, type QuorumPolicy } from '../engine/core/attestation.js';
 import { InMemoryIdentityRegistry, deriveCommitment, type Nullifier } from '../engine/core/identity.js';
 import { getShard, DEFAULT_NUM_SHARDS } from '../engine/core/partition.js';
@@ -684,6 +687,36 @@ export class EngineLedger extends EventEmitter {
     return buildPacketFromChain(h.chain, sendHash);
   }
 
+  /** Serve a mint proof for a token whose MINTER's chain this node holds. */
+  buildMintProof(minterPub: string, tokenId: string): MintProof | null {
+    const h = this.held.get(minterPub);
+    if (!h || h.chain.length === 0) return null;
+    return buildMintProofFromChain(h.chain, tokenId);
+  }
+
+  /**
+   * Register a token's verified mint record without holding the minter's chain
+   * — the second half of an NFT claim (the transfer packet proves the send;
+   * this proves what the token IS). Idempotent, and deliberately does NOT touch
+   * `nftOwner`: ownership follows from the receive block, and the minter has
+   * usually long since transferred the token away.
+   */
+  registerVerifiedMint(proof: MintProof, tokenId: string): { ok: boolean; error?: string } {
+    if (this.nftInfo.has(tokenId)) return { ok: true };
+    const mint = proof.mintBlock;
+    if (this.equivocated.has(mint.accountId)) return { ok: false, error: 'minter equivocated' };
+    if (this.burnedNfts.has(tokenId)) return { ok: false, error: 'token burned' };
+    const v = verifyMintProof(proof, tokenId, this.identityPolicy);
+    if (!v.ok) return { ok: false, error: v.reason };
+    this.allBlocks.set(mint.hash, mint);
+    this.nftInfo.set(tokenId, {
+      minter: mint.accountId,
+      contentRef: mint.contentRef!,
+      meta: mint.nftMeta ?? {},
+    });
+    return { ok: true };
+  }
+
   /**
    * G2 receive path: register a transfer PROVEN by a counterparty packet so the
    * normal claim path (`createReceive`) can run — without ever holding the
@@ -692,17 +725,33 @@ export class EngineLedger extends EventEmitter {
    * send. Per-counterparty cost is O(log sender-chain), not O(chain) — the
    * scale fix `sim/counterparty.ts` measures (ARCHITECTURE.md → G2).
    *
-   * NFT transfers (`nft-send`) verify identically, but the claim additionally
-   * needs the token's MINT record for info/display, which lives on the
-   * minter's chain — so the node keeps NFT claims on the chain-pull path until
-   * the archive serves token records too. Payments take the proof path.
+   * Handles NFT transfers (`nft-send`) on the same footing. Their claim needs
+   * one extra input the transfer cannot carry — the token's MINT record, which
+   * lives on the MINTER's chain, a different account after the first hop — so
+   * the caller pairs this with {@link registerVerifiedMint}.
    */
   registerVerifiedSend(packet: CounterpartyPacket, recipientPub: string): { ok: boolean; error?: string } {
     const send = packet.sendBlock;
     if (this.equivocated.has(send.accountId)) return { ok: false, error: 'sender equivocated' };
     const v = verifyPacket(packet, recipientPub, this.identityPolicy);
     if (!v.ok) return { ok: false, error: v.reason };
-    if (send.type !== 'send') return { ok: false, error: 'only payment sends claim via proof' };
+
+    if (send.type === 'nft-send') {
+      if (!send.tokenId) return { ok: false, error: 'nft-send missing token' };
+      if (this.claimedNftTransfers.has(send.hash)) return { ok: false, error: 'already claimed' };
+      if (this.burnedNfts.has(send.tokenId)) return { ok: false, error: 'token burned' };
+      // Register JUST the send (O(1)) — never the chain.
+      this.allBlocks.set(send.hash, send);
+      if (!this.unclaimedNftTransfers.has(send.hash)) {
+        this.unclaimedNftTransfers.set(send.hash, {
+          tokenId: send.tokenId,
+          fromPub: send.accountId,
+          toPub: recipientPub,
+        });
+      }
+      return { ok: true };
+    }
+
     if (this.claimedSends.has(send.hash)) return { ok: false, error: 'already claimed' };
 
     // Register JUST the send (O(1)) — never the chain. The head/open blocks are

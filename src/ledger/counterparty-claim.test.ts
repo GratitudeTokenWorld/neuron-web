@@ -120,6 +120,77 @@ describe('G2 — counterparty proof claims (no sender chain held)', () => {
     expect(bobLedger.getAccountBalance(bob.pub)).toBe(balance);
   });
 
+  it('claims an NFT from proofs alone — transfer packet + mint proof', async () => {
+    const bobLedger = new EngineLedger('testnet');
+    const bob = generateKeyPair();
+    await openAcct(bobLedger, bob, 'human-bob');
+
+    // Alice's world: she mints a token and sends it to bob.
+    const aliceLedger = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    await openAcct(aliceLedger, alice, 'human-alice');
+    aliceLedger.registerAccount({ username: 'bob', pub: bob.pub });
+    const mint = await aliceLedger.createMintNft(alice.pub, 'cid-of-the-art', { name: 'Piece' }, alice);
+    const tokenId = mint.block!.tokenId!;
+    const xfer = await aliceLedger.createTransferNft(alice.pub, tokenId, bob.pub, alice);
+
+    const packet = aliceLedger.buildCounterpartyPacket(alice.pub, xfer.block!.hash)!;
+    const mintProof = aliceLedger.buildMintProof(alice.pub, tokenId)!;
+    expect(mintProof).not.toBeNull();
+
+    // Bob holds nothing of alice's chain. Mint first (so the token is never
+    // claimable-but-unrenderable), then the transfer, then the normal claim.
+    expect(bobLedger.registerVerifiedMint(mintProof, tokenId)).toEqual({ ok: true });
+    expect(bobLedger.registerVerifiedSend(packet, bob.pub)).toEqual({ ok: true });
+    const recv = await bobLedger.createReceiveNft(bob.pub, xfer.block!.hash, bob);
+    expect(recv.block).toBeDefined();
+    expect(bobLedger.addBlock(recv.block!).success).toBe(true);
+
+    // Owned, renderable, and none of alice's chain retained.
+    expect(bobLedger.getNftOwner(tokenId)).toBe(bob.pub);
+    const owned = bobLedger.getNftsOwnedBy(bob.pub);
+    expect(owned).toHaveLength(1);
+    expect(owned[0]).toMatchObject({ tokenId, contentRef: 'cid-of-the-art', minter: alice.pub });
+    expect(bobLedger.getAccountChain(alice.pub)).toHaveLength(0);
+  });
+
+  it('rejects forged mint proofs: wrong token, non-mint block, foreign chain', async () => {
+    const bobLedger = new EngineLedger('testnet');
+    const bob = generateKeyPair();
+    await openAcct(bobLedger, bob, 'human-bob');
+
+    const aliceLedger = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    await openAcct(aliceLedger, alice, 'human-alice');
+    const mintA = await aliceLedger.createMintNft(alice.pub, 'cid-a', {}, alice);
+    const mintB = await aliceLedger.createMintNft(alice.pub, 'cid-b', {}, alice);
+    const tokenA = mintA.block!.tokenId!;
+    const tokenB = mintB.block!.tokenId!;
+    const proofA = aliceLedger.buildMintProof(alice.pub, tokenA)!;
+
+    // A proof for token A cannot register token B (content swap).
+    expect(bobLedger.registerVerifiedMint(proofA, tokenB).ok).toBe(false);
+    expect(bobLedger.getNftInfo(tokenB)).toBeUndefined();
+
+    // Tampered content reference — the block's content hash breaks.
+    const tampered = { ...proofA, mintBlock: { ...proofA.mintBlock, contentRef: 'cid-evil' } };
+    expect(bobLedger.registerVerifiedMint(tampered, tokenA).ok).toBe(false);
+
+    // A non-mint block dressed up as one.
+    const notAMint = { ...proofA, mintBlock: aliceLedger.getAccountChain(alice.pub)[0]! };
+    expect(bobLedger.registerVerifiedMint(notAMint, tokenA).ok).toBe(false);
+
+    // Mint from a DIFFERENT chain: valid in isolation, not committed by this head.
+    const malloryLedger = new EngineLedger('testnet');
+    const mallory = generateKeyPair();
+    await openAcct(malloryLedger, mallory, 'human-mallory');
+    const mintM = await malloryLedger.createMintNft(mallory.pub, 'cid-m', {}, mallory);
+    const swapped = { ...proofA, mintBlock: mintM.block! };
+    expect(bobLedger.registerVerifiedMint(swapped, mintM.block!.tokenId!).ok).toBe(false);
+
+    expect(bobLedger.getNftInfo(tokenA)).toBeUndefined();
+  });
+
   it('refuses packets from a sender proven to have equivocated', async () => {
     const bobLedger = new EngineLedger('testnet');
     const bob = generateKeyPair();
