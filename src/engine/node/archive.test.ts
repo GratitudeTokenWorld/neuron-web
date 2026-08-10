@@ -41,12 +41,12 @@ describe('block encode/decode', () => {
 });
 
 describe('archival tiering (invariant #7 — no destructive history loss)', () => {
-  it('bounds hot memory, archives the rest, and keeps every block provable + retrievable', () => {
+  it('bounds hot memory, archives the rest, and keeps every block provable + retrievable', async () => {
     const { k, blocks } = buildChain(300);
     const archiveStore = new ContentStore(50 * 1024 * 1024);
     const store = new ArchivingStore(new BlockArchive(archiveStore), 50);
 
-    for (const b of blocks) expect(store.apply(b).ok).toBe(true);
+    for (const b of blocks) expect((await store.apply(b)).ok).toBe(true);
 
     // Hot memory is bounded by the window; the rest is archived (nothing dropped).
     expect(store.hotCount()).toBe(50);
@@ -54,26 +54,26 @@ describe('archival tiering (invariant #7 — no destructive history loss)', () =
     expect(store.length(k.pub)).toBe(300);
 
     // An OLD archived block is fully recovered (no loss) and provable against the root.
-    const pv = store.getProven(k.pub, 3);
+    const pv = await store.getProven(k.pub, 3);
     expect(pv).not.toBeNull();
     expect(verifyBlock(pv!.block)).toBe(true);
     expect(pv!.block.hash).toBe(blocks[3]!.hash);
     expect(verifyInclusion(pv!.root, pv!.block.hash, 3, pv!.treeSize, pv!.proof)).toBe(true);
 
     // A recent (hot) block is equally provable.
-    const hot = store.getProven(k.pub, 299)!;
+    const hot = (await store.getProven(k.pub, 299))!;
     expect(verifyInclusion(hot.root, hot.block.hash, 299, hot.treeSize, hot.proof)).toBe(true);
   });
 
-  it('detects a corrupt/missing archived body on retrieval', () => {
+  it('detects a corrupt/missing archived body on retrieval', async () => {
     const { blocks } = buildChain(2);
     const store = new ContentStore(1024 * 1024);
     const archive = new BlockArchive(store);
-    const ref = archive.archive(blocks[1]!);
-    expect(archive.retrieve(ref)).not.toBeNull();
+    const ref = await archive.archive(blocks[1]!);
+    expect(await archive.retrieve(ref)).not.toBeNull();
     // a reference to content the store doesn't hold → null
-    expect(archive.retrieve({ ...ref, cid: 'deadbeef'.repeat(8) })).toBeNull();
+    expect(await archive.retrieve({ ...ref, cid: 'deadbeef'.repeat(8) })).toBeNull();
     // a reference whose expected hash doesn't match the stored body → null
-    expect(archive.retrieve({ ...ref, hash: '00'.repeat(32) })).toBeNull();
+    expect(await archive.retrieve({ ...ref, hash: '00'.repeat(32) })).toBeNull();
   });
 });

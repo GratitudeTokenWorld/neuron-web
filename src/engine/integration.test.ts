@@ -48,7 +48,7 @@ function openAccount(registry: InMemoryIdentityRegistry, label: string): { keys:
 }
 
 describe('end-to-end capstone — all phases compose', () => {
-  it('runs identity → replication → consensus/slashing → media discovery', () => {
+  it('runs identity → replication → consensus/slashing → media discovery', async () => {
     // ── Phase 0: identity ──────────────────────────────────────────────────
     const identity = new InMemoryIdentityRegistry();
     const alice = openAccount(identity, 'alice');
@@ -127,7 +127,7 @@ describe('end-to-end capstone — all phases compose', () => {
     const media = new Uint8Array(20 * 1024 * 1024);
     for (let off = 0, ci = 0; off < media.length; off += 8 * 1024 * 1024, ci++) media[off] = (ci + 1) & 0xff;
     const aliceContent = new ContentStore(64 * 1024 * 1024);
-    const stored = aliceContent.storeContent(media);
+    const stored = await aliceContent.storeContent(media);
     expect(stored.ok).toBe(true);
     dht.provide(stored.manifest!.cid, 'peer-alicenode');
 
@@ -136,7 +136,7 @@ describe('end-to-end capstone — all phases compose', () => {
     expect(found.providers).toContain('peer-alicenode');
     expect(found.hops).toBeGreaterThanOrEqual(0);
 
-    const reassembled = aliceContent.getContent(stored.manifest!); // chunks fetched from the provider
+    const reassembled = await aliceContent.getContent(stored.manifest!); // chunks fetched from the provider
     expect(reassembled).not.toBeNull();
     expect(reassembled!.length).toBe(media.length);
   }, 30_000);

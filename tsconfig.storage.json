@@ -1,0 +1,15 @@
+{
+  // Node-side storage backends. Separate from tsconfig.json (browser/DOM) and
+  // tsconfig.engine.json (deliberately DOM- AND Node-free so the engine stays
+  // portable) — this is the one place `node:*` imports are legitimate, so it is
+  // the one config that pulls in node types. Wired into `npm run typecheck`, so
+  // this module does not join relay/ in the untypechecked bucket.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "noUncheckedIndexedAccess": true,
+    "types": ["node"],
+    "lib": ["ES2022"]
+  },
+  "include": ["src/storage/**/*.ts", "src/engine/content/**/*.ts"]
+}

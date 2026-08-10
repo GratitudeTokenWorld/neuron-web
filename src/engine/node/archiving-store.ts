@@ -45,7 +45,7 @@ export class ArchivingStore {
     private readonly verifySignatures = true,
   ) {}
 
-  apply(block: Block): ArchiveApplyResult {
+  async apply(block: Block): Promise<ArchiveApplyResult> {
     if (computeContentHash(block) !== block.hash) return { ok: false, reason: 'content hash mismatch' };
     if (this.verifySignatures && !verifyBlockSignature(block)) return { ok: false, reason: 'invalid signature' };
 
@@ -76,7 +76,7 @@ export class ArchivingStore {
 
     while (held.hot.length > this.hotWindow) {
       const old = held.hot.shift()!;
-      held.archived.set(old.index, this.archive.archive(old));
+      held.archived.set(old.index, await this.archive.archive(old));
     }
     return { ok: true };
   }
@@ -105,7 +105,7 @@ export class ArchivingStore {
   }
 
   /** Fetch any block (hot or archived) together with a proof of its membership. */
-  getProven(accountId: Hex, index: number): ProvenBlock | null {
+  async getProven(accountId: Hex, index: number): Promise<ProvenBlock | null> {
     const h = this.accounts.get(accountId);
     if (!h || index < 0 || index >= h.length) return null;
 
@@ -115,7 +115,7 @@ export class ArchivingStore {
       block = h.hot.find((b) => b.index === index);
     } else {
       const ref = h.archived.get(index);
-      block = ref ? this.archive.retrieve(ref) ?? undefined : undefined;
+      block = ref ? await this.archive.retrieve(ref) ?? undefined : undefined;
     }
     if (!block) return null;
 

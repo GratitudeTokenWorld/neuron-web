@@ -496,10 +496,40 @@ The rewards layer must follow the same rule: pay for *proven, current*
 custody, so an offline node earns nothing for bytes the network has already
 re-homed, and cannot park stale copies to farm storage rewards.
 
+### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
+
+A storage node's disk is an implementation detail behind one small CID-native
+interface (`has` / `getBlock` / `putBlock` / `used` / `available` + a possession
+proof). Content is immutable and keyed by its own hash, so the interface is
+deliberately *narrower* than an object-store API — none of S3's mutable-key,
+versioning, ACL or multipart semantics apply, and adopting them would mean
+building a more complex API to do a simpler job.
+
+| Adapter | Who uses it | Status |
+|---|---|---|
+| **Filesystem** | default for any server node; the CI target | zero dependencies — the honest bottom layer |
+| **OPFS / IndexedDB** | browsers | exists (`smoke-store.ts`) |
+| **S3-compatible client** | an operator who wants elastic capacity (Ceph RGW, MinIO, Garage, …) | **opt-in** |
+| **Read-only S3 gateway** | existing tooling reading network content by CID | later, interop only (fits the gateway tier) |
+
+> **Constraint (Lucian, 2026-08-10): any S3 adapter or gateway is MANUALLY
+> CONFIGURED by the node operator — never a default, never auto-discovered,
+> never assumed to exist.** The protocol must run with every node on plain
+> local disk. This is the same "no required party" rule the participation model
+> states, applied to storage backends: borrowing a provider's elastic disk is
+> one operator's private choice, so no provider can become load-bearing for the
+> network, and an operator who attaches one is still bound by the lease rules
+> above (declared capacity, proven custody, repaired around when offline).
+>
+> Corollary for reviewers: nothing in the core may *require* an object store to
+> be present, and no default config may point at one. We do **not** implement
+> an S3 server — that is commodity work with mature free implementations, and
+> it competes with the lease/repair logic that is the actual novelty here.
+
 **Reused:** content addressing, chunking, smoke HTTP CDN, provider selection,
 spot-check/receipt/repair machinery, storage-reward economics. **New:** DHT
 content routing, interest-scoped announcements, quota guard, archival pinning,
-GC, replica leases + rejoin cleanup.
+GC, replica leases + rejoin cleanup, pluggable operator-configured backends.
 
 ---
 

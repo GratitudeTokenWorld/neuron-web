@@ -25,17 +25,17 @@ export class BlockArchive {
   constructor(private readonly store: ContentStore) {}
 
   /** Move a block body into content-addressed storage; return a compact reference. */
-  archive(block: Block): ArchiveRef {
+  async archive(block: Block): Promise<ArchiveRef> {
     const bytes = encodeBlock(block);
     const cid = cidOf(bytes);
-    const r = this.store.putBlock(cid, bytes);
+    const r = await this.store.putBlock(cid, bytes);
     if (!r.ok) throw new Error(`archive failed: ${r.reason}`);
     return { accountId: block.accountId, index: block.index, hash: block.hash, cid };
   }
 
   /** Retrieve and fully re-verify an archived block. Returns null on any mismatch. */
-  retrieve(ref: ArchiveRef): Block | null {
-    const bytes = this.store.getBlock(ref.cid);
+  async retrieve(ref: ArchiveRef): Promise<Block | null> {
+    const bytes = await this.store.getBlock(ref.cid);
     if (!bytes) return null;
     if (cidOf(bytes) !== ref.cid) return null; // content integrity
     const block = decodeBlock(bytes);
