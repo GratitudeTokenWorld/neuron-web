@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 224 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 229 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
@@ -645,7 +645,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 0 — Foundations | **done** | `src/engine/core` — accumulator, light-verify, identity/nullifier, attestations, partition |
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
-| 3 — Storage CDN + tiered nodes | **engine built, NOT wired** | `src/engine/content` exists; `storage-manager.ts` still on the legacy `DAGLedger`, `EngineLedger.createStorage*` are `deferred()` stubs |
+| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10** | backend seam done: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Still to do: the four `EngineLedger.createStorage*` `deferred()` stubs (register/deregister/**heartbeat**/reward — heartbeat *is* the lease renewal), lease+repair logic, file index → DHT, `storage-manager.ts` off the legacy `DAGLedger` |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 21/21 |

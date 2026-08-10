@@ -37,10 +37,10 @@ npm run dev          # Vite dev server + auto-spawned relay
 npm run relay        # standalone relay (tsx relay/server.ts) — production entry
 npm run build        # → dist/ (static bundle)
 npm test             # vitest, all of src/**/*.test.ts
-npm run typecheck    # ⚠ engine only (tsconfig.engine.json) — see below
+npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **224 tests / 53 files passing**, `npm run build` clean.
+Current baseline: **229 tests / 54 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -106,6 +106,10 @@ src/
     net/           relay federation (rendezvous hashing)
     sim/           scale-invariant harness: scenario (interest routing),
                    directory (G1), counterparty (G2), archival, projection (10B)
+  storage/         Node-side block backends behind the engine's `BlockBackend`
+                   (filesystem today; an S3 client adapter is opt-in and
+                   OPERATOR-CONFIGURED — never a default). Own tsconfig, in
+                   `npm run typecheck`.
 relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2 HTTP
                    API — see docs/SUPERNODE.md), vite-plugin.ts (dev auto-spawn),
                    ecosystem.config.cjs (pm2). Runtime state (identity keys,
@@ -120,7 +124,10 @@ The engine **is** wired into the app: `node.ts` constructs an `EngineLedger`
 ([node.ts:121](src/network/node.ts#L121)). But the migration is unfinished, and this is
 the single most important thing to know about the codebase:
 
-- `npm run typecheck` covers **only `src/engine`**. Running `tsc -p tsconfig.json`
+- `npm run typecheck` covers **`src/engine` + `src/storage`** (two configs;
+  `src/storage` is the one place `node:*` imports are legitimate, so it has its
+  own `tsconfig.storage.json` with node types). It does NOT cover the app layer:
+  running `tsc -p tsconfig.json`
   surfaces ~180 errors in `main.ts`, `node.ts`, `neuronchain-api.ts` — the app layer
   still speaks the legacy `AccountBlock`/`Account` shapes while the engine speaks
   `Block`/`LedgerAccount` (`accountPub` vs `accountId` + `shard` + `accumulatorRoot`).
@@ -250,7 +257,7 @@ There is **no contract VM** — "smart contract" testing means the native-NFT su
 - Engine modules are pure and dependency-light (`@noble/*` crypto only) so they stay
   testable in Node without a browser. Keep browser/libp2p concerns in `src/network`.
 - The relay is `.ts` run via `tsx`; there is no separate build step for it.
-  ⚠ `relay/` is covered by **neither** `npm run typecheck` (engine only) nor any
+  ⚠ `relay/` is covered by **neither** `npm run typecheck` (engine + storage) nor any
   test — an undefined variable in a 60 s timer once crash-looped both cloud boxes
   47 times before anyone noticed. Re-read relay edits carefully, and after
   deploying check `pm2 jlist` restart counts **after** the interval has fired

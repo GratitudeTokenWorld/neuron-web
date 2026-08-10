@@ -2,13 +2,13 @@
 
 The scalable social-dApp build: the **neuronchain app** (UI, P2P transport,
 face+PIN identity, relay) carried over and being re-platformed onto a new
-**sharded, age-weighted-personhood engine** designed to scale to 1B+ users.
+**sharded, age-weighted-personhood engine** designed to scale to 10B users.
 
 - `npm run dev` runs the app exactly like neuronchain (same UI).
 - `src/engine/` is the new scalable core — a tested library that the app's
   ledger/consensus/storage are being refactored onto. The engine **is** wired in
   (`node.ts` runs `EngineLedger`); the remaining seam is the app-layer types +
-  `storage-manager` (see `CLAUDE.md`). Test suite: 197 passing.
+  `storage-manager` (see `CLAUDE.md`). Test suite: 229 passing.
 - The full design + threat model + measured results: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Ops: relay/super-node deployment [`docs/SUPERNODE.md`](docs/SUPERNODE.md), cloud
   provisioning [`docs/CLOUD.md`](docs/CLOUD.md), manual E2E matrix
@@ -49,20 +49,26 @@ src/
     economy/     capped reward inflation
     net/         relay federation (rendezvous hashing)
     sim/         scale-invariant simulation harness
+  storage/       Node-side block backends (filesystem; S3 opt-in, operator-set)
 ```
 
 ## Status
 
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
-- **Engine** (`src/engine/` + `src/ledger/`) — phases 0–4, Phase 2 consensus
+- **Engine** (`src/engine/` + `src/ledger/`) — phases 0–2 done, Phase 2 consensus
   (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
-  **197 tests passing, engine typechecked**, all 7 scale-invariants demonstrated
-  by tests (see `docs/ARCHITECTURE.md`). Wired into the app via `EngineLedger`
-  (`src/network/node.ts`).
-- **Next** — finish the app-layer seam (unify legacy `AccountBlock`/`Account`
-  types, migrate `storage-manager`, drop the DAGLedger compat surface), then the
-  live-transport items (real Kademlia/beacon/VRF, smoke-HTTP CDN, load tests)
-  noted in the architecture doc. Manual two-relay validation: `docs/TESTPLAN.md`.
+  **229 tests passing, engine + storage typechecked**, all 7 scale-invariants
+  demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
+  `EngineLedger` (`src/network/node.ts`).
+- **Scale invariant restored** — the two known `O(N)` violations are closed
+  (2026-08-10): accounts resolve on demand from an archive tier instead of a
+  global gossip topic, and payments *and* NFTs claim from `O(log n)` Merkle
+  proofs instead of replicating counterparty chains. Live on the two-relay dev
+  network; manual matrix green.
+- **Next** — Phase 3 (storage): the CID-native backend seam and a filesystem
+  adapter are in (`src/storage/`); still to do are the on-chain storage-provider
+  ops, replica leases + repair, and the file index → DHT. Then Phase 4, and the
+  app-layer type seam paid down per caller. Manual validation: `docs/TESTPLAN.md`.
 
 ## Engine — measured scale invariants
 
