@@ -93,7 +93,7 @@ durability only* — never trust. Every new node type must preserve this.
 | **Light client** | browser / mobile | own + followed data; signs/verifies; serves + caches its own content | nothing (every user) |
 | **Relay** | VPS / home w/ public addr | NAT traversal + connectivity brokering; **no global state** | reachability |
 | **Validator / shard node** | mini-PC / VPS / Pi | ledger shard(s); bonded; runs committee finality | RAM working-set, reliability |
-| **Storage node** | Pi+SSD / server | CID blob replicas + serving; earns storage rewards | disk capacity (cheap), I/O |
+| **Storage node** | Pi+SSD / server | CID blob replicas + serving, held under a liveness **lease** (not owned — see Subsystem 4); earns rewards for *proven current* custody | **declared** disk capacity, I/O |
 | **Archival / super-node** | VPS / server + on-disk DB | many shards' history + snapshots + state-sync | DB, bandwidth |
 | **Gateway** | VPS / serverless | HTTP rendering of content for plain-URL/open-web access | bandwidth, cache |
 
@@ -429,12 +429,77 @@ push model; DHT unused for content.
 - **Durable replication via super-nodes.** Keep `REDUNDANCY_TARGET`, spot-checks,
   receipts, and exponential-backoff repair
   ([storage-manager.ts:1198-1290,676-732](src/network/storage-manager.ts#L1198));
-  pin durable copies on storage super-nodes, with light clients caching opportunistically.
+  pin durable copies on storage super-nodes, with light clients caching
+  opportunistically — a cache is never counted toward `REDUNDANCY_TARGET`
+  unless that node is assigned and proving possession.
 - **Lifecycle/GC.** TTL + reference-count GC so per-node storage stays bounded.
+- **Leased foreign replicas + rejoin cleanup (DECIDED — 2026-08-10).** See the
+  next block; this is the rule that makes the storage tier *dynamic* rather
+  than an ever-growing pile of stale copies.
+
+### Durability is a FLOW property, not a stock (decided 2026-08-10)
+
+The thing that keeps content alive is **not** a high number of copies sitting
+somewhere. It is the network's ability to re-distribute the minimum replica
+count, in real time, as holders disappear. Stated as the invariant to design
+against:
+
+> Content survives iff the network can restore `REDUNDANCY_TARGET` live
+> replicas of any CID **faster than holders are lost**. Repair throughput ≥
+> churn rate × object size. A replica count that includes offline or unproven
+> holders is not a durability measurement — it is a guess.
+
+Three consequences that the sync logic must implement, none of which fall out
+of the existing push-replication code:
+
+1. **A node holds foreign content under a LEASE, not a deed.** The lease is
+   tied to liveness: miss heartbeats / spot-checks for longer than
+   `MAX_OFFLINE`, and the network treats those replicas as gone and repairs
+   them onto live nodes. `MAX_OFFLINE` is chosen relative to repair time — long
+   enough that a brief restart is not punished, short enough that the repair
+   completes before durability is actually at risk.
+2. **On rejoin past `MAX_OFFLINE`, discard the held content and start fresh
+   from declared capacity.** Those bytes were re-homed while the node was away;
+   keeping them means holding copies of things the node is no longer assigned,
+   which (a) consumes the capacity it just advertised for *current*
+   assignments, (b) inflates apparent redundancy with copies nobody is counting
+   on, and (c) grows without bound as a node accumulates everything it ever
+   touched — the storage-tier version of the `O(N)` violation this whole
+   document exists to remove. Below `MAX_OFFLINE`, a returning node keeps
+   whatever it is *still assigned* (re-verified by CID) and drops the rest, so
+   a quick restart costs no re-transfer.
+
+   **Authorship is not custody, and buys no exemption.** Content a node
+   publishes is *handed to the network* to distribute; the publisher does not
+   retain it locally by default and is not automatically one of its replicas.
+   So the lease rule applies uniformly to every byte of network content on a
+   node, including bytes it authored. What a node keeps unconditionally is its
+   own *ledger* state (account chain, keys, the ownership record naming the
+   CID) — ownership lives on-chain, custody is a network assignment, and the
+   two are deliberately decoupled. A user may still *pin* something for offline
+   use, but a pin is a local convenience: it counts as a replica only while the
+   node is assigned and proving possession like any other holder.
+
+   The correctness consequence to design for: **a publish is not complete until
+   the network confirms the minimum replicas.** Until then the uploader's copy
+   is the only one, so it must be retained as staging and retried — otherwise
+   closing the tab right after upload destroys the content. After that
+   handoff the author's device may vanish permanently with no loss, which is
+   the entire point of the arrangement.
+3. **Only verified-live replicas count toward the target.** Repair triggers on
+   the number of holders that have recently *proven* possession (the existing
+   spot-check / receipt machinery), never on the number that once announced it.
+   Otherwise a stale or parked copy silently substitutes for a real one, and
+   the first honest failure takes the object below the threshold.
+
+The rewards layer must follow the same rule: pay for *proven, current*
+custody, so an offline node earns nothing for bytes the network has already
+re-homed, and cannot park stale copies to farm storage rewards.
 
 **Reused:** content addressing, chunking, smoke HTTP CDN, provider selection,
 spot-check/receipt/repair machinery, storage-reward economics. **New:** DHT
-content routing, interest-scoped announcements, quota guard, archival pinning, GC.
+content routing, interest-scoped announcements, quota guard, archival pinning,
+GC, replica leases + rejoin cleanup.
 
 ---
 
@@ -605,8 +670,12 @@ Each phase is independently benchmarkable; do not advance until its invariant ho
   account across many attesters.
 - **Phase 3 — Storage CDN + tiered nodes.** DHT provider records; interest-scoped
   file announcements; quota-guarded chunked media; super-node archival pinning +
-  GC. *Validate:* 100MB+ media works; file discovery `O(log N)`; index size
-  independent of total files.
+  GC; **replica leases + rejoin cleanup**. *Validate:* 100MB+ media works; file
+  discovery `O(log N)`; index size independent of total files; and the flow
+  property — under continuous churn, every CID keeps `REDUNDANCY_TARGET`
+  *verified-live* replicas, a node returning after `MAX_OFFLINE` drops its
+  foreign bytes and refills to declared capacity, and per-node storage stays
+  bounded by that declared capacity rather than by everything it ever held.
 - **Phase 4 — Scale hardening.** Relay federation/directory; incentive payouts to
   super-nodes/relays; adaptive limits/compression; security bounds.
   *Validate:* sustained load test at target write rates with the invariant intact.
@@ -715,7 +784,7 @@ silently overloading validators.
 
 ---
 
-## What is already sound (keep, do not redesign)
+## What is already sound
 
 - Optimistic + conflict-only DAG voting model ([vote.ts](src/core/vote.ts))
 - Independent per-account chains + IDB `byAccount`/version indexes + incremental sync
