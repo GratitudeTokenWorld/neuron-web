@@ -20,7 +20,7 @@ propagation, no global indexes.
 
 The two known `O(N)` violations — **G1** (global `accounts` gossip topic) and
 **G2** (counterparty verification pulling whole chains) — are **closed as of
-2026-08-10**; ARCHITECTURE.md → *Deferred: scale-invariant gaps* records what
+2026-08-10**; ARCHITECTURE.md → *Scale-invariant gaps G1 + G2* records what
 shipped for each. Don't re-derive them as new discoveries, and don't
 reintroduce a global topic or a whole-chain pull to make something easier: the
 replacements are on-demand, verified archive queries (see *Where to pick up*).

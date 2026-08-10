@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 96 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 224 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
@@ -170,7 +170,9 @@ where redundancy silently fails first.
 
 ## Subsystem 1 — State & replication (the ledger)
 
-**Current limits:** `allBlocks`/`accountChains`/`accounts` are global in-RAM Maps
+**Current limits** *(as surveyed at the start of this work; counterparty
+replication is now fixed — see G2 under* Scale-invariant gaps *below)***:**
+`allBlocks`/`accountChains`/`accounts` are global in-RAM Maps
 ([dag-ledger.ts:75-77](src/core/dag-ledger.ts#L75)); `MAX_CHAIN_MEMORY=5000`
 **destructively deletes** old blocks ([dag-ledger.ts:662-666](src/core/dag-ledger.ts#L662));
 startup replays the whole chain.
@@ -372,7 +374,9 @@ fake at scale), so the assumption is strong, not weak. Its only real liability i
 
 ## Subsystem 3 — Networking & relays
 
-**Current limits:** every node subscribes to all block synapses + global
+**Current limits** *(as surveyed at the start of this work — the `accounts`
+topic is now fixed, see G1 under* Scale-invariant gaps *below; the rest still stand)*
+**:** every node subscribes to all block synapses + global
 `votes`/`accounts`/`files` topics ([libp2p-network.ts:604-618](src/network/libp2p-network.ts#L604));
 relay `maxReservations=1024` ([relay-server.js:487]); per-peer rate cap 10 msg/s
 ([libp2p-network.ts:397]); kadDHT present but **client-mode only and unused for
@@ -558,7 +562,7 @@ proof packets) and decentralized archival, plus a 10B projection from the
 measured constants — so each fix shipped against a before/after number.
 
 **Both gaps are now implemented, deployed and manually re-tested** (see
-*Deferred gaps* below for the per-gap change lists). The manual E2E matrix
+*Scale-invariant gaps* below for the per-gap change lists). The manual E2E matrix
 (TESTPLAN T1–T6) passed again on 2026-08-10 through the new paths; T7 (operator
 reset) is exercised routinely in dev rather than as a matrix row.
 
@@ -721,7 +725,7 @@ silently overloading validators.
 - Generalizable signed-credential quorum ([dag-block.ts](src/core/dag-block.ts), [dag-ledger.ts:477-494](src/core/dag-ledger.ts#L477))
 - Storage-reward economics + spot-check/receipt repair ([storage-manager.ts](src/network/storage-manager.ts))
 
-## Deferred: scale-invariant gaps in the CURRENT build
+## Scale-invariant gaps G1 + G2 — both CLOSED
 
 > **Status (2026-08-10): BOTH gaps are fully implemented, deployed and
 > manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network,
@@ -730,8 +734,8 @@ silently overloading validators.
 > held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (21 checks
 > — run it after every relay deploy).
 
-**G1 — The global `accounts` topic is `O(N)`. FIXED 2026-08-09 (client dir
-ingest gone; awaiting manual T2 re-verify).** What shipped:
+**G1 — The global `accounts` topic is `O(N)`. CLOSED** (shipped 2026-08-09,
+manually verified 2026-08-10). What shipped:
 - **Clients no longer subscribe** to the global `accounts` topic
   ([`libp2p-network.ts`](../src/network/libp2p-network.ts) `start()`), and
   `publishLocalData` no longer echoes foreign records (which also kills the
@@ -769,8 +773,8 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   existing verified delta path. O(own inbound); the relay's answer is a hint,
   never trusted state.
 
-**G2 — Counterparty verification replicates whole chains. FIXED 2026-08-09
-(payments; NFTs interim — awaiting manual T3/T4 re-verify).** What shipped:
+**G2 — Counterparty verification replicates whole chains. CLOSED** (payments
+shipped 2026-08-09, NFTs 2026-08-10, both manually verified). What shipped:
 - **Proof packets replace chain pulls for payments.** On an inbox signal or a
   `/pending-sends` hint, the recipient fetches **`GET /head-proof`** from a
   relay archive — `{open, head, send}` blocks + two RFC-6962 audit paths —
@@ -829,13 +833,16 @@ ingest gone; awaiting manual T2 re-verify).** What shipped:
   inbox like a payment — without it an NFT had no direct wake-up and appeared
   only on the 60 s poll or the next startup.
 
-**Consequence to keep in mind meanwhile (correct, not a bug):** node views are
-*asymmetric by design* — a recipient holds the sender's chain, the sender holds
-nothing of the recipient's (a send block is self-contained; only the receiver
-must verify history). The explorer therefore shows a different set of blocks on
-each node, and is labelled "Transactions on this node" for exactly that reason.
-A sender also cannot see whether the recipient claimed a send without following
-the recipient's shard; a "claimed ✓" indicator needs an inbox ack.
+**Consequence to keep in mind (correct, not a bug):** node views are
+*partial by design*. Before G2 a recipient kept the sender's whole chain; now it
+keeps only its own chain plus the few foreign blocks a claim actually needed
+(the proven send, and an NFT's mint record) — everything else was verification
+input and is dropped with the proof. So each node holds a different, much
+smaller slice, and the explorer is labelled "Transactions on this node" for
+exactly that reason; a searched block outside the slice is fetched from an
+archive (`GET /block`) and shown as such. A sender still cannot see whether the
+recipient claimed a send without following the recipient's shard; a "claimed ✓"
+indicator needs an inbox ack.
 
 ## Hard problems / honest open risks
 
