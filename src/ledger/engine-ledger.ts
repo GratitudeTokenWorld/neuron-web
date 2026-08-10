@@ -125,6 +125,21 @@ export class EngineLedger extends EventEmitter {
    * in-flight transfers; `burnedNfts` are permanently destroyed.
    */
   private readonly nftOwner = new Map<string, string>();
+  /**
+   * Per-token custody: tokenId → accountId → the index of the LATEST block in
+   * *that account's own chain* touching the token, and whether it left the
+   * account holding it (mint/receive) or not (send/burn).
+   *
+   * Ownership is derived from this rather than written last-wins, because
+   * blocks replay in accountId-then-index order, which is not causal order
+   * across accounts. A round trip (alice → bob → alice) breaks the naive rule:
+   * bob's older receive replays *after* alice's newer one and silently steals
+   * the token back — the NFT then vanishes from the real owner's wallet and
+   * never returns (observed 2026-08-10). Per-account chains ARE totally
+   * ordered, so "the account whose latest own-chain event for this token is a
+   * mint or receive" is well-defined and order-independent.
+   */
+  private readonly nftCustody = new Map<string, Map<string, { index: number; holds: boolean }>>();
   private readonly nftInfo = new Map<string, { minter: string; contentRef: string; meta: Record<string, string> }>();
   private readonly unclaimedNftTransfers = new Map<string, { tokenId: string; fromPub: string; toPub: string }>();
   private readonly burnedNfts = new Set<string>();
@@ -492,19 +507,43 @@ export class EngineLedger extends EventEmitter {
   }
 
   // Apply helpers — shared by local create + foreign addBlock so both paths agree.
+  /**
+   * Record this account's latest own-chain position for a token and re-derive
+   * the owner. Ignores anything at or below an index already seen for the same
+   * account, so a re-delivered or out-of-order block can never rewind custody.
+   */
+  private recordNftCustody(tokenId: string, accountId: string, index: number, holds: boolean): void {
+    let perAccount = this.nftCustody.get(tokenId);
+    if (!perAccount) this.nftCustody.set(tokenId, (perAccount = new Map()));
+    const prev = perAccount.get(accountId);
+    if (prev && prev.index >= index) return;
+    perAccount.set(accountId, { index, holds });
+    this.recomputeNftOwner(tokenId);
+  }
+
+  private recomputeNftOwner(tokenId: string): void {
+    if (this.burnedNfts.has(tokenId)) { this.nftOwner.delete(tokenId); return; }
+    const perAccount = this.nftCustody.get(tokenId);
+    if (!perAccount) return;
+    const holders = [...perAccount.entries()].filter(([, v]) => v.holds).map(([id]) => id);
+    if (holders.length === 1) { this.nftOwner.set(tokenId, holders[0]!); return; }
+    if (holders.length === 0) { this.nftOwner.delete(tokenId); return; }
+    // Two holders is only reachable MID-replay — a chain whose later send has
+    // not been applied yet. Keep the incumbent if it is still among them so the
+    // view doesn't flicker; the extra holder resolves as its own chain finishes.
+    const current = this.nftOwner.get(tokenId);
+    if (!current || !holders.includes(current)) this.nftOwner.set(tokenId, holders[holders.length - 1]!);
+  }
+
   private applyNftMint(b: Block): void {
     if (!b.tokenId || !b.contentRef) return;
-    // Don't claim ownership if a transfer already assigned it — the same
-    // replayed-out-of-order case applyNftSend guards against, from the other end.
-    if (!this.nftOwner.has(b.tokenId)) this.nftOwner.set(b.tokenId, b.accountId);
     this.nftInfo.set(b.tokenId, { minter: b.accountId, contentRef: b.contentRef, meta: b.nftMeta ?? {} });
+    this.recordNftCustody(b.tokenId, b.accountId, b.index, true);
     this.emit('nft:minted', { tokenId: b.tokenId, owner: b.accountId });
   }
   private applyNftSend(b: Block): void {
     if (!b.tokenId || !b.recipient) return;
-    // Only strip ownership if the sender still owns it — a send replayed AFTER its
-    // receive must not clobber the recipient's ownership (cross-account order).
-    if (this.nftOwner.get(b.tokenId) === b.accountId) this.nftOwner.delete(b.tokenId);
+    this.recordNftCustody(b.tokenId, b.accountId, b.index, false);
     if (!this.claimedNftTransfers.has(b.hash)) {
       this.unclaimedNftTransfers.set(b.hash, { tokenId: b.tokenId, fromPub: b.accountId, toPub: b.recipient });
     }
@@ -512,12 +551,13 @@ export class EngineLedger extends EventEmitter {
   private applyNftReceive(b: Block): void {
     if (!b.tokenId) return;
     if (b.sourceHash) { this.claimedNftTransfers.add(b.sourceHash); this.unclaimedNftTransfers.delete(b.sourceHash); }
-    this.nftOwner.set(b.tokenId, b.accountId);
-    this.emit('nft:transferred', { tokenId: b.tokenId, owner: b.accountId });
+    this.recordNftCustody(b.tokenId, b.accountId, b.index, true);
+    this.emit('nft:transferred', { tokenId: b.tokenId, owner: this.nftOwner.get(b.tokenId) ?? b.accountId });
   }
   private applyNftBurn(b: Block): void {
     if (!b.tokenId) return;
     this.burnedNfts.add(b.tokenId);
+    this.recordNftCustody(b.tokenId, b.accountId, b.index, false);
     this.nftOwner.delete(b.tokenId);
     this.emit('nft:burned', { tokenId: b.tokenId });
   }
@@ -715,6 +755,53 @@ export class EngineLedger extends EventEmitter {
       meta: mint.nftMeta ?? {},
     });
     return { ok: true };
+  }
+
+  /**
+   * Re-seat state from a FOREIGN block kept after an earlier proof-verified
+   * claim. A proof claim holds none of the counterparty's chain, so on reload
+   * `addBlock` rejects these ("missing prior chain") even though they are
+   * genuine, signed blocks we verified when we claimed. Two things break
+   * without this, both seen live on 2026-08-10:
+   *   - an `nft-mint` carries the token's content/metadata, so losing it makes
+   *     a claimed NFT render as nothing;
+   *   - an `nft-send` carries the sender's own-chain INDEX, which is the
+   *     evidence that they gave the token up. Lose it and the sender's older
+   *     `nft-receive` looks like their latest word on the token, so a
+   *     round-tripped NFT hops back to them on every refresh.
+   * Re-checks hash + signature (cheap); chain inclusion was proven at claim
+   * time. Never assigns ownership TO us — that follows from our own receive.
+   */
+  restoreVerifiedBlock(block: Block): boolean {
+    if (computeContentHash(block) !== block.hash || !verifyBlockSignature(block)) return false;
+    if (block.type === 'nft-mint') {
+      if (!block.tokenId || !block.contentRef) return false;
+      if (this.burnedNfts.has(block.tokenId)) return false;
+      this.allBlocks.set(block.hash, block);
+      if (!this.nftInfo.has(block.tokenId)) {
+        this.nftInfo.set(block.tokenId, {
+          minter: block.accountId, contentRef: block.contentRef, meta: block.nftMeta ?? {},
+        });
+      }
+      return true;
+    }
+    if (block.type === 'nft-send') {
+      if (!block.tokenId || !block.recipient) return false;
+      this.allBlocks.set(block.hash, block);
+      this.applyNftSend(block);   // records "sender gave it up at index N"
+      return true;
+    }
+    if (block.type === 'send') {
+      if (!block.recipient || block.amount === undefined) return false;
+      this.allBlocks.set(block.hash, block);
+      if (!this.claimedSends.has(block.hash) && !this.unclaimedSends.has(block.hash)) {
+        this.unclaimedSends.set(block.hash, {
+          fromPub: block.accountId, toPub: block.recipient, amount: Number(block.amount),
+        });
+      }
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -1033,6 +1120,7 @@ export class EngineLedger extends EventEmitter {
     this.claimedSends.clear();
     this.claimedNftTransfers.clear();
     this.nftOwner.clear();
+    this.nftCustody.clear();
     this.nftInfo.clear();
     this.unclaimedNftTransfers.clear();
     this.burnedNfts.clear();

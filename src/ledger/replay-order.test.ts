@@ -68,6 +68,85 @@ describe('replay-order soundness', () => {
     expect(dst.getUnclaimedNftsForAccount(bob.pub)).toHaveLength(0);
   });
 
+  it('a round-tripped NFT does not hop back when the sender send block is missing', async () => {
+    // The live failure (2026-08-10): alice -> bob -> alice. Alice claimed the
+    // return by PROOF, so bob's nft-send lived only in memory, while bob's
+    // chain up to his older nft-receive was persisted. On reload the newest
+    // evidence about bob was "bob received it", so the token hopped back to him
+    // and vanished from alice's wallet on every refresh.
+    const source = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    const bob = generateKeyPair();
+    await openAcct(source, alice, 'alice', 'human-alice');
+    await openAcct(source, bob, 'bob', 'human-bob');
+
+    const mint = await source.createMintNft(alice.pub, 'cid-art', {}, alice);
+    const tokenId = mint.block!.tokenId!;
+    const out = await source.createTransferNft(alice.pub, tokenId, bob.pub, alice);
+    await source.createReceiveNft(bob.pub, out.block!.hash, bob);
+    const back = await source.createTransferNft(bob.pub, tokenId, alice.pub, bob);
+    await source.createReceiveNft(alice.pub, back.block!.hash, alice);
+    expect(source.getNftOwner(tokenId)).toBe(alice.pub);
+
+    const aliceChain = [...source.getAccountChain(alice.pub)];
+    // What a proof-claiming node actually persisted of bob: everything EXCEPT
+    // the final nft-send (registered in memory at claim time).
+    const bobPersisted = source.getAccountChain(bob.pub).filter(b => b.hash !== back.block!.hash);
+
+    for (const aliceFirst of [true, false]) {
+      const replay = new EngineLedger('testnet');
+      for (const b of aliceFirst ? [...aliceChain, ...bobPersisted] : [...bobPersisted, ...aliceChain]) {
+        replay.addBlock(b);
+      }
+      // Custody is per-account and index-ordered, so alice's receive is her
+      // latest word and bob's receive is his — ambiguous until his send is
+      // restored, which is exactly why the node now persists it.
+      replay.restoreVerifiedBlock(back.block!);
+      expect(replay.getNftOwner(tokenId)).toBe(alice.pub);
+      expect(replay.getNftsOwnedBy(bob.pub)).toHaveLength(0);
+    }
+  });
+
+  it('a proof-claimed NFT survives reload: kept mint + send blocks re-seat it', async () => {
+    // A proof claim holds NONE of the counterparty chains, so on reload
+    // addBlock rejects those blocks and the token would render as nothing.
+    const source = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    const bob = generateKeyPair();
+    await openAcct(source, alice, 'alice', 'human-alice');
+    await openAcct(source, bob, 'bob', 'human-bob');
+    const mint = await source.createMintNft(alice.pub, 'cid-art', { name: 'Piece' }, alice);
+    const tokenId = mint.block!.tokenId!;
+    const out = await source.createTransferNft(alice.pub, tokenId, bob.pub, alice);
+
+    // Bob claims by proof, holding nothing of alice's chain.
+    const bobLedger = new EngineLedger('testnet');
+    await openAcct(bobLedger, bob, 'bob', 'human-bob');
+    bobLedger.registerVerifiedMint(source.buildMintProof(alice.pub, tokenId)!, tokenId);
+    bobLedger.registerVerifiedSend(source.buildCounterpartyPacket(alice.pub, out.block!.hash)!, bob.pub);
+    await bobLedger.createReceiveNft(bob.pub, out.block!.hash, bob);
+    expect(bobLedger.getNftsOwnedBy(bob.pub)).toHaveLength(1);
+
+    // Reload: bob's OWN chain replays; the retained foreign blocks do not.
+    const reloaded = new EngineLedger('testnet');
+    for (const b of bobLedger.getAccountChain(bob.pub)) reloaded.addBlock(b);
+    expect(reloaded.addBlock(mint.block!).success).toBe(false);   // no minter chain
+    expect(reloaded.getNftsOwnedBy(bob.pub)).toHaveLength(0);     // owned but unrenderable
+
+    expect(reloaded.restoreVerifiedBlock(mint.block!)).toBe(true);
+    const owned = reloaded.getNftsOwnedBy(bob.pub);
+    expect(owned).toHaveLength(1);
+    expect(owned[0]).toMatchObject({ tokenId, contentRef: 'cid-art', minter: alice.pub });
+
+    // Tampered blocks are refused by the restore path too, and restoring a
+    // send already claimed must not re-offer it.
+    const fresh = new EngineLedger('testnet');
+    expect(fresh.restoreVerifiedBlock({ ...mint.block!, contentRef: 'cid-evil' })).toBe(false);
+    expect(reloaded.restoreVerifiedBlock(out.block!)).toBe(true);
+    expect(reloaded.getUnclaimedNftsForAccount(bob.pub)).toHaveLength(0);
+    expect(reloaded.getNftOwner(tokenId)).toBe(bob.pub);
+  });
+
   it('still rejects a genuine non-owner nft-send forgery', async () => {
     const ledger = new EngineLedger('testnet');
     const alice = generateKeyPair();

@@ -707,7 +707,15 @@ export class NeuronNode extends EventEmitter {
     }
     // Phase 1: replay persisted engine blocks (sorted open→dependent) so received
     // cross-node state survives reload. Idempotent vs main.ts's per-wallet open replay.
-    for (const block of await this.net.loadAllEngineBlocks()) this.ledger.addBlock(block);
+    for (const block of await this.net.loadAllEngineBlocks()) {
+      const applied = this.ledger.addBlock(block);
+      // A foreign nft-mint kept from a proof-verified claim has no chain
+      // context here (we hold none of the minter's chain), so addBlock rejects
+      // it — but its token info is the difference between the NFT rendering
+      // and coming back as an empty tile. Re-seat info only; ownership still
+      // comes from our own receive block.
+      if (!applied.success) this.ledger.restoreVerifiedBlock(block);
+    }
     // A7: faceAccountCount is maintained incrementally by addBlock - no rebuild needed
     // Sync heartbeat counts to the current rolling window (uses Date.now() as reference).
     this.ledger.refreshHeartbeatCounts();
@@ -1233,11 +1241,19 @@ export class NeuronNode extends EventEmitter {
           const mint = await fetchMintProof(this.relayResolveBases(), tokenId, this.ledger.network);
           if (!mint) return false;                                  // fall back to the chain pull
           if (!this.ledger.registerVerifiedMint(mint, tokenId).ok) return false;
+          // Persist it: we hold none of the minter's chain, so nothing else
+          // would rebuild this token's content/metadata after a reload and the
+          // NFT would come back as an empty tile (restored in start()).
+          await this.net.saveEngineBlock(mint.mintBlock).catch(() => {});
         }
       }
 
       const reg = this.ledger.registerVerifiedSend(packet, recipientPub);
       if (!reg.ok) return reg.error === 'already claimed'; // claimed ⇒ nothing left to do
+      // Persist the proven send. It is the only record of the sender's own-chain
+      // INDEX for this transfer — i.e. the evidence they gave it up. Without it a
+      // reload sees only their older receive and hands an NFT back to them.
+      await this.net.saveEngineBlock(packet.sendBlock).catch(() => {});
       this.net.subscribeEngineShard(this.ledger.getShardOf(senderId)); // fraud-evidence watch
       await this.autoReceiveEngine(packet.sendBlock);
       return true;
