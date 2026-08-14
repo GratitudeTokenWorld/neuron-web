@@ -707,8 +707,12 @@ Each phase is independently benchmarkable; do not advance until its invariant ho
   foreign bytes and refills to declared capacity, and per-node storage stays
   bounded by that declared capacity rather than by everything it ever held.
 - **Phase 4 — Scale hardening.** Relay federation/directory; incentive payouts to
-  super-nodes/relays; adaptive limits/compression; security bounds.
-  *Validate:* sustained load test at target write rates with the invariant intact.
+  super-nodes/relays — paid for **proven, current custody only**, so an offline
+  node earns nothing for bytes the network has re-homed and stale parked copies
+  cannot farm rewards (Subsystem 4); adaptive limits/compression; security
+  bounds. *Validate:* sustained load test at target write rates with the
+  invariant intact, and a storage node that goes offline stops earning within
+  `MAX_OFFLINE`.
 
 ---
 
