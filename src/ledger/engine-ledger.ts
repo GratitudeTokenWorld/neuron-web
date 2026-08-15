@@ -728,6 +728,16 @@ export class EngineLedger extends EventEmitter {
     }
   }
 
+  /**
+   * Install the provider set learned from the archives (see
+   * engine/content/provider-discovery). Kept apart from the providers whose
+   * chains we hold: discovered records are verified SIGNATURES, not verified
+   * chain state, so they feed selection and never reward validation.
+   */
+  setDiscoveredProviders(records: readonly StorageProviderState[]): void {
+    this.providerLedger.setDiscovered(records);
+  }
+
   /** Is this provider's custody lease live right now? (Never "did it once register".) */
   isProviderLive(pub: string, now = Date.now()): boolean {
     return this.providerLedger.isLive(pub, now);

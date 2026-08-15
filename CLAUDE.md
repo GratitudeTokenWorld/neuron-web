@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **339 tests / 63 files passing**, `npm run build` clean.
+Current baseline: **353 tests / 64 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -70,6 +70,18 @@ inherited:
   honest jitter must never be refused. `MAX_HEARTBEATS_PER_DAY_HARD` (24/epoch,
   4× honest) is the sole mid-chain rejection, set where only a padding chain
   reaches it. Uptime credit comes only from counted renewals.
+- **Providers are DISCOVERED by asking, not by broadcast** (`GET /providers`,
+  `engine/content/provider-discovery.ts`). Storage blocks gossip on their
+  account's shard topic, so on a 4096-shard network a node only ever sees its
+  own providers — two devices could not see each other at all. Re-broadcasting
+  globally is the `O(N)` firehose the legacy path used, so clients ask the
+  archives and verify the answer: relays serve the PROVIDER's own signed
+  register + heartbeat blocks, so a relay can choose what to show but cannot
+  invent, inflate or forge, and asking several relays takes the union. Bounded
+  by `limit` (default 20, cap 50) — an unbounded answer is the firehose over
+  HTTP. Discovered records are held **separately** from chains we hold: they are
+  verified signatures, not verified chain state, so they feed selection and
+  never reward validation (`isAuthoritative`).
 - **A reward bills the day before its own block, and only that day**
   (`claimableEpochDay`, enforced in `validate`). Billing the running day paid a
   partial day and closed the epoch for good (polling every 30 min locked in 1/6);
@@ -93,7 +105,8 @@ below constrain all of it:
    the tab destroys the content. `checkPublishFeasibility` is real now (it
    counts live leases with free space) but only *warns*.
 3. **File index → DHT provider records** — the remaining `O(N)` violation in
-   storage (a global gossiped file index today).
+   storage (a global gossiped file index today). Note **provider** discovery is
+   already done (`GET /providers`, below); this item is now only the FILE index.
 4. **Measure repair-rate vs churn** in `src/engine/sim/archival.ts`: it models
    assignment and churn but NOT lease expiry/repair, so "durability is a flow"
    is currently asserted, not measured.

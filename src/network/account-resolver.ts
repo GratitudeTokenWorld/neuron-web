@@ -197,6 +197,50 @@ export async function fetchPendingSends(
 }
 
 /**
+ * Storage-provider discovery (GET /providers) — the union across relays.
+ *
+ * Storage blocks gossip on their account's SHARD topic, so a node only ever
+ * sees providers whose shard it holds; on a 4096-shard network that is
+ * effectively only its own. Re-broadcasting them globally is the `O(N)`
+ * firehose this project removed, so providers are ASKED for instead, exactly
+ * like accounts under G1.
+ *
+ * The relays serve the PROVIDER's own signed blocks, never their own opinion —
+ * decoding happens here and verification in `foldProviderBlocks`, so a lying
+ * relay wastes a fetch and nothing more. Asking every relay and taking the union
+ * means one relay cannot hide a provider either.
+ */
+export async function fetchProviders(
+  bases: readonly string[],
+  network: string,
+  limit = 20,
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<Block[]> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(
+        `${base}/providers?network=${encodeURIComponent(network)}&limit=${encodeURIComponent(String(limit))}`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) throw new Error(`providers ${res.status}`);
+      return (await res.json()) as { blocks?: string[] };
+    }),
+  );
+  const byHash = new Map<string, Block>();
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    for (const hex of r.value?.blocks ?? []) {
+      try {
+        const block = decodeBlock(hexToBytes(hex));
+        byHash.set(block.hash, block);   // union across relays, deduped
+      } catch { /* undecodable row — the fold would reject it anyway */ }
+    }
+  }
+  return [...byHash.values()];
+}
+
+/**
  * G2 — fetch a counterparty proof packet (GET /head-proof) from the relays'
  * archives: the sender's open + head + the send (hex) with the two RFC-6962
  * audit paths. Decoded here; VERIFICATION happens in the ledger

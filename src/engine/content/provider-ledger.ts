@@ -159,6 +159,15 @@ export class ProviderLedger {
   readonly providers = new Map<string, StorageProviderState>();
 
   /**
+   * Providers learned by ASKING an archive rather than by holding their chain
+   * (see provider-discovery.ts). Kept separate from `providers` on purpose:
+   * these records are verified signatures, not verified chain state, so they may
+   * feed *selection* but must never be mistaken for the authoritative view that
+   * reward validation reads. Where both know a provider, authoritative wins.
+   */
+  private discovered = new Map<string, StorageProviderState>();
+
+  /**
    * Per-account facts that **deregistering must not erase**.
    *
    * The heartbeat interval is what turns 6 heartbeats into a proof of 24 hours
@@ -194,7 +203,7 @@ export class ProviderLedger {
    * alive.
    */
   isLive(pub: string, now: number): boolean {
-    const p = this.providers.get(pub);
+    const p = this.get(pub);
     if (!p || p.capacityGB <= 0) return false;
     // A provider that registered but has not heartbeated yet is inside its initial
     // grace: the lease runs from registration until the first renewal is due.
@@ -202,30 +211,61 @@ export class ProviderLedger {
     return now - since < MAX_OFFLINE_MS;
   }
 
+  /**
+   * A provider's record — the chain-backed one if we hold it, else whatever
+   * discovery taught us. Every liveness/capacity question goes through here so
+   * the two views cannot answer differently.
+   */
+  get(pub: string): StorageProviderState | undefined {
+    return this.providers.get(pub) ?? this.discovered.get(pub);
+  }
+
   /** When this provider's lease lapses (0 if it holds no lease at all). */
   leaseExpiresAt(pub: string): number {
-    const p = this.providers.get(pub);
+    const p = this.get(pub);
     if (!p || p.capacityGB <= 0) return 0;
     return (p.lastHeartbeat > 0 ? p.lastHeartbeat : p.registeredAt) + MAX_OFFLINE_MS;
   }
 
   /** Every provider whose lease is live, best score first. */
   liveProviders(now: number): StorageProviderState[] {
-    return [...this.providers.values()]
-      .filter(p => p.capacityGB > 0 && this.isLive(p.pub, now))
-      .sort((a, b) => b.score - a.score);
+    return this.allProviders().filter(p => this.isLive(p.pub, now));
   }
 
-  /** Every registered provider regardless of lease state, best score first. */
+  /**
+   * Every known registered provider, best score first — chains we hold plus
+   * anything discovery taught us, with the authoritative record winning on
+   * conflict. This is the selection pool; it is deliberately the widest view,
+   * because a provider you have never heard of is one you can never hand
+   * content to.
+   */
   allProviders(): StorageProviderState[] {
-    return [...this.providers.values()]
+    const merged = new Map<string, StorageProviderState>();
+    for (const [pub, p] of this.discovered) merged.set(pub, p);
+    for (const [pub, p] of this.providers) merged.set(pub, p);   // authoritative wins
+    return [...merged.values()]
       .filter(p => p.capacityGB > 0)
       .sort((a, b) => b.score - a.score);
   }
 
+  /**
+   * Replace what discovery knows. A whole-set replace rather than a merge, so a
+   * provider that has deregistered actually disappears instead of lingering on a
+   * stale record forever — the same "expand-only is wrong here" reasoning the
+   * lease itself rests on.
+   */
+  setDiscovered(records: readonly StorageProviderState[]): void {
+    this.discovered = new Map(records.map(r => [r.pub, r]));
+  }
+
+  /** Is this provider one we hold the chain for, or only heard about? */
+  isAuthoritative(pub: string): boolean {
+    return this.providers.has(pub);
+  }
+
   /** Free bytes a provider is offering: declared capacity minus what it reports holding. */
   freeBytes(pub: string): number {
-    const p = this.providers.get(pub);
+    const p = this.get(pub);
     if (!p) return 0;
     return Math.max(0, p.capacityGB * GB_BYTES - p.lastActualStoredBytes);
   }
@@ -534,6 +574,7 @@ export class ProviderLedger {
   /** Drop all state (ledger reset). */
   clear(): void {
     this.providers.clear();
+    this.discovered.clear();
     this.durable.clear();
     this.epochs.clear();
     this.capacityHistory.clear();

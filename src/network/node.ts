@@ -1,7 +1,8 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof, fetchProviders } from './account-resolver';
+import { foldProviderBlocks } from '../engine/content/provider-discovery';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -31,6 +32,12 @@ export function getDeviceId(): string {
 const COUNTRY_CODE_KEY = 'neuronchain_country_code';
 const COUNTRY_CODE_TS_KEY = 'neuronchain_country_code_ts';
 const COUNTRY_CODE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // re-check weekly
+/**
+ * How often to re-ask the archives which storage providers exist. Matched to the
+ * heartbeat interval, because that is the rate at which a provider's liveness can
+ * actually change — polling faster would just re-fetch identical records.
+ */
+const PROVIDER_DISCOVERY_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
 let _countryCode: string | null | undefined = undefined; // undefined = not yet resolved
 
@@ -92,6 +99,7 @@ export class NeuronNode extends EventEmitter {
   private resyncDebounce: ReturnType<typeof setTimeout> | null = null;
   private publishDebounce: ReturnType<typeof setTimeout> | null = null;
   private pendingInboundTimer: ReturnType<typeof setInterval> | null = null;
+  private providerDiscoveryTimer: ReturnType<typeof setInterval> | null = null;
   /** P2/C3: blocks waiting for their parent to arrive, keyed by previousHash. Entries older than 5 min are evicted. */
   private pendingBlocks: Map<string, { blocks: AccountBlock[]; addedAt: number }> = new Map();
   /** Phase 1: engine blocks waiting for their parent, keyed by previousHash (same TTL/eviction). */
@@ -756,6 +764,16 @@ export class NeuronNode extends EventEmitter {
     setTimeout(() => this.sweepUnclaimedReceives(), 4000);
     // P7: dial known peers that were discovered in previous sessions
     setTimeout(() => this.connectToKnownPeers(), 5000);
+    // Learn about storage providers outside our own shards. Storage blocks
+    // gossip per shard, so without this a node's selection pool is only itself
+    // and no content can ever be handed to anyone. Delayed so relay connections
+    // form first; then on the heartbeat cadence, which is the rate at which a
+    // provider's liveness can actually change.
+    setTimeout(() => { void this.refreshStorageProviders(); }, 8000);
+    this.providerDiscoveryTimer = setInterval(
+      () => { void this.refreshStorageProviders(); },
+      PROVIDER_DISCOVERY_INTERVAL_MS,
+    );
     // Slice 4c: bootstrap — pull our own accounts' chains from holders (the
     // super-node archive serves them), so a fresh/recovered device restores its
     // balance without waiting for a periodic re-broadcast. Delayed so relay/peer
@@ -915,6 +933,7 @@ export class NeuronNode extends EventEmitter {
     if (this.publishInterval) { clearInterval(this.publishInterval); this.publishInterval = null; }
     if (this.relayLivenessInterval) { clearInterval(this.relayLivenessInterval); this.relayLivenessInterval = null; }
     if (this.pendingInboundTimer) { clearInterval(this.pendingInboundTimer); this.pendingInboundTimer = null; }
+    if (this.providerDiscoveryTimer) { clearInterval(this.providerDiscoveryTimer); this.providerDiscoveryTimer = null; }
     if (this.resyncDebounce) { clearTimeout(this.resyncDebounce); this.resyncDebounce = null; }
     if (this.publishDebounce) { clearTimeout(this.publishDebounce); this.publishDebounce = null; }
     this.storage.stop();
@@ -1024,6 +1043,26 @@ export class NeuronNode extends EventEmitter {
     const payload = `inbox:${block.hash}:${block.accountId}:${block.recipient}:${amount}`;
     const signature = engineSign(payload, engineKeysFromAppPrivate(appKeys.priv).priv);
     this.net.publishInboxSignal(block.recipient, block.accountId, block.hash, amount, signature);
+  }
+
+  /**
+   * Learn about storage providers outside our own shards, by asking the relay
+   * archives and verifying their signatures (see engine/content/provider-discovery).
+   *
+   * Without this a node only ever sees providers whose shard it holds — its own,
+   * in practice — so it can never hand content to anyone. Best-effort: discovery
+   * failing means a smaller selection pool, never a broken publish.
+   */
+  async refreshStorageProviders(limit = 20): Promise<number> {
+    try {
+      const blocks = await fetchProviders(this.relayResolveBases(), this.ledger.network, limit);
+      const records = foldProviderBlocks(blocks);
+      this.ledger.setDiscoveredProviders(records);
+      this.emit('storage:providers-updated');
+      return records.length;
+    } catch {
+      return 0;   // offline or no archive reachable — keep whatever we had
+    }
   }
 
   /** Register as a storage provider. capacityGB = 0 deregisters. */

@@ -47,7 +47,8 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // Super-node archival (Slice 4a): the relay persists every engine block it sees
 // (via topic mirroring) and serves delta requests, so account chains are durably
 // held even when light clients holding a shard go offline.
-import { decodeBlock, verifyBlock } from '../src/engine/core/block.js';
+import { decodeBlock, encodeBlock, verifyBlock } from '../src/engine/core/block.js';
+import { selectDiscoveryBlocks } from '../src/engine/content/provider-discovery.js';
 import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
 // vitest can pin them (this file is covered by no typecheck and no test — keep
@@ -776,6 +777,40 @@ async function main() {
           faceVerifyUrl: '',
           operators,                    // first-N accountIds allowed to reset
           generation: currentGeneration, // current reset epoch (clients converge to it)
+        }));
+
+      } else if (req.url?.startsWith('/providers')) {
+        // Storage-provider discovery: GET /providers?network=<n>&limit=<k>
+        //
+        // Storage blocks gossip on their account's SHARD topic and a node holds
+        // only the shards it cares about, so two providers on different shards
+        // never learn of each other. Broadcasting them all again is the O(N)
+        // firehose this project removed, so clients ASK instead — same shape as
+        // /resolve, and untrusted for the same reason: what is served is the
+        // PROVIDER's own signed blocks, which the client verifies itself. This
+        // relay cannot invent a provider, inflate a capacity, or forge a
+        // liveness claim; it can only choose which real records to show, and a
+        // client asking several relays sees the union.
+        //
+        // Bounded on purpose (`limit`, hard-capped): an unbounded answer would
+        // be the same firehose delivered over HTTP.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const limit = Math.min(Math.max(Number(q.get('limit')) || 20, 1), 50);
+        const blocks = [];
+        for (const row of engineBlockStore.values()) {
+          if (row.network !== network) continue;
+          // `type` is denormalized on archive. Rows predating that field lack it,
+          // but storage blocks postdate it entirely, so a missing type means
+          // "not a storage block" and skipping is correct — and avoids decoding
+          // the whole archive on every request.
+          if (!String(row.type || '').startsWith('storage-')) continue;
+          try { blocks.push(decodeBlock(hexToBytes(row.blockHex))); } catch { /* skip bad row */ }
+        }
+        const selected = selectDiscoveryBlocks(blocks, limit);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({
+          blocks: selected.map(b => bytesToHex(encodeBlock(b))),
         }));
 
       } else if (req.url?.startsWith('/resolve?')) {

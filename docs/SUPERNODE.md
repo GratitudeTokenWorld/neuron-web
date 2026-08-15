@@ -50,6 +50,7 @@ tier answer queries without becoming an authority.
 | `GET /head-proof?pub=&send=&network=` | counterparty proof packet (**G2**): sender's open + head + send blocks with two RFC-6962 audit paths | `verifyPacket` — verified-human genesis, signed head, send inclusion |
 | `GET /token?id=&network=` | an NFT's mint proof (**G2**): the MINTER's open + head + `nft-mint` blocks with audit paths | `verifyMintProof` — token id match, mint inclusion on a verified-human chain |
 | `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
+| `GET /providers?network=&limit=` | storage providers this archive knows: each one's latest `storage-register` + `storage-heartbeat`, hex-encoded. Bounded (default 20, cap 50) | each block verified client-side (`foldProviderBlocks`) — the relay serves the PROVIDER's own signatures, so it can choose what to show but cannot invent, inflate or forge. Ask several relays for the union |
 | `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
 | `POST /keyblob` \| `GET /keyblob?username=\|pub=&network=` | targeted key-blob store/fetch (replaced the global `keyblobs` gossip topic 2026-08-15 — an O(N) broadcast and harvesting surface) | blob opens only with face+PIN+share (v3); `linkedAnchor` re-checked against the on-chain record at recovery. Per-IP limited |
 | `POST /recovery-share` | store this relay's **Shamir 2-of-n share** of the account's v3 secret, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{x}:{share}:{ts}` by the account's engine key (the x-coordinate is inside the signature so it cannot be stripped/renumbered); newest signed `ts` wins |
@@ -210,6 +211,7 @@ server {
   location /head-proof    { proxy_pass http://127.0.0.1:9092; }
   location /token         { proxy_pass http://127.0.0.1:9092; }
   location /block         { proxy_pass http://127.0.0.1:9092; }
+  location /providers     { proxy_pass http://127.0.0.1:9092; }
 
   # the web app (static dist) — if served from here
   location / { root /home/admin/domains/neuronweb.org/dist; try_files $uri /index.html; }
