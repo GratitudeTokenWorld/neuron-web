@@ -3885,10 +3885,17 @@ function refreshStorage() {
       // number is how "0% uptime, score 1.000" ended up on screen, with every
       // node ranking itself below every stranger.
       const unknown = p.discovered === true;
-      const dash = '<span style="color:var(--text-muted)" title="not measured — we hold none of this provider’s chain">&mdash;</span>';
-      const uptime = unknown ? dash : `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
-      const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
-      const spotCheck = unknown ? dash : `${Math.round(p.spotCheckPassRate * 100)}%`;
+      const dash = (why: string) => `<span style="color:var(--text-muted)" title="${why}">&mdash;</span>`;
+      const noChain = dash('not measured — we hold none of this provider’s chain');
+      // Latency and spot-check come from RECEIPTS, which only exist once this
+      // node has actually fetched a block from that provider. With no receipts
+      // they are unmeasured for everyone, self included — the 100% shown before
+      // was the default value, not a result.
+      const measuredPerf = node.storage.getReceipts(p.pub).length > 0;
+      const noProbe = dash('not measured — no content has been fetched from this provider yet');
+      const uptime = unknown ? noChain : `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
+      const latency = measuredPerf && p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : noProbe;
+      const spotCheck = measuredPerf ? `${Math.round(p.spotCheckPassRate * 100)}%` : noProbe;
       const scoreColor = p.score >= 0.8 ? 'var(--success)' : p.score >= 0.4 ? 'var(--warning)' : 'var(--danger)';
       return `<tr${isMine ? ' style="background:rgba(34,211,238,0.04);"' : ''}>
         <td>${copyBtn(p.pub)}${isMine ? ' <span style="color:var(--accent);font-size:11px;">(you)</span>' : ''}</td>
@@ -3896,9 +3903,9 @@ function refreshStorage() {
         <td>${uptime}</td>
         <td>${latency}</td>
         <td>${spotCheck}</td>
-        <td>${unknown ? dash : `<strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong>`}</td>
-        <td>${unknown ? dash : formatUNIT(p.earningRate)}</td>
-        <td>${unknown ? dash : formatUNIT(p.totalEarned)}</td>
+        <td>${unknown ? noChain : `<strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong>`}</td>
+        <td>${unknown ? noChain : formatUNIT(p.earningRate)}</td>
+        <td>${unknown ? noChain : formatUNIT(p.totalEarned)}</td>
       </tr>`;
     }).join('');
   }
