@@ -129,6 +129,25 @@ describe('verifyTrajectory — the attacks it exists to stop', () => {
     expect(verifyTrajectory(SEQ, noT).ok).toBe(false);
   });
 
+  it('REGRESSION: pose/expression-shifted descriptors are what the band rejects', () => {
+    // The false rejection of a real user, 2026-08-15: descriptors captured at
+    // the ACTION PEAK measured 0.501 apart for one person (face-api is barely
+    // pose-invariant). The verifier is right to reject that — the FIX was to
+    // capture at rest (main.ts recoveryProofCapture), not to widen the band.
+    // This pins the rule so a future "just raise the threshold" cannot land
+    // without confronting the comment on DESCRIPTOR_MAX_PAIRWISE.
+    const base = face(10);
+    const posed = honestProof(base);
+    // Simulate a peak-captured (pose-shifted) descriptor on action 2.
+    const shifted = base.map((x, i) => x + Math.sin(i * 0.9) * 0.05);
+    const n = Math.hypot(...shifted);
+    posed.actions[2] = { ...posed.actions[2], descriptor: shifted.map(x => x / n) };
+    const v = verifyTrajectory(SEQ, posed);
+    if (!v.ok) expect(v.reason).toContain('not one person');
+    // At-rest capture of the same run stays inside the band.
+    expect(verifyTrajectory(SEQ, honestProof(base)).ok).toBe(true);
+  });
+
   it('boundary: ratio exactly at the floor passes, just under fails', () => {
     const at = honestProof(face(9));
     at.actions[0].ratio = MIN_ACTION_RATIO;

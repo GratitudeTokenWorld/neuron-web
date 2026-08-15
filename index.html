@@ -1133,7 +1133,11 @@
         <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
         <button class="camera-modal-close" id="cameraModalClose">&times;</button>
       </div>
-      <!-- Step tracker: 0 = setup, 1-5 = the five challenge actions. -->
+      <!-- Step tracker. Boxes are rendered by setCaptureStepCount() because the
+           count VARIES: enrollment is 7 (setup + 5 actions + capture) while a
+           fresh-device v3 recovery is 2 + however many actions the relays
+           demand between them. These are the enrollment default, replaced on
+           each run. -->
       <div class="capture-steps" id="captureSteps">
         <i>0</i><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i><i>6</i>
       </div>

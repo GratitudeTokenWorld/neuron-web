@@ -1020,6 +1020,21 @@ function setCaptureSteps(done: number, active = -1): void {
   });
 }
 
+/**
+ * Render the tracker for a run of `n` phases.
+ *
+ * The count is NOT fixed: enrollment is 7 (setup + 5 actions + capture), but a
+ * fresh-device v3 recovery performs one relay-drawn sequence per relay, so it
+ * is 2 + the total demanded actions (8 for two relays × 3). The markup used to
+ * hardcode seven boxes, which silently clamped the recovery tracker to 0-6 and
+ * made the longer flow look identical to enrollment.
+ */
+function setCaptureStepCount(n: number): void {
+  const host = document.getElementById('captureSteps');
+  if (!host) return;
+  host.innerHTML = Array.from({ length: Math.max(1, n) }, (_, i) => `<i>${i}</i>`).join('');
+}
+
 /** Clear bar + guide between phases so a stale animation never lingers. */
 function resetCaptureCue(): void {
   stopProgressTone();
@@ -1101,6 +1116,8 @@ async function challengeAndCapture(
     [sequence[i], sequence[j]] = [sequence[j], sequence[i]];
   }
   addLog(`FaceID: challenge sequence ${sequence.join(' → ')}`, 'info');
+  // setup + one box per action + capture
+  setCaptureStepCount(sequence.length + 2);
 
   // SETUP first: frame the head, prove it is 3D by moving it, check nothing else
   // is in shot, and only then measure the relaxed face — once, at a known-good
@@ -1150,7 +1167,7 @@ async function challengeAndCapture(
   // terminal 100% cue used to paint in the same tick the caller tore the modal
   // down, so the last state a user actually saw was 2/3 — the bar looked like
   // it never reached the edges.
-  setCaptureSteps(7);
+  setCaptureSteps(sequence.length + 2);   // derived, not 7: the box count is per-run now
   await new Promise(resolve => setTimeout(resolve, CAPTURE_DONE_DWELL_MS));
   return { faceMap };
 }
@@ -1176,6 +1193,7 @@ async function recoveryProofCapture(
 ): Promise<{ proofs: Map<string, TrajectoryProof>; faceMap: import('./core/face-verify').FaceMap } | { failure: FaceCaptureFailure }> {
   const presence = newPresenceGuard();
   const totalSteps = challenges.reduce((n, c) => n + c.sequence.length, 0) + 2; // setup + actions + capture
+  setCaptureStepCount(totalSteps);
 
   setCaptureSteps(0, 0);
   const setup = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
@@ -1207,18 +1225,36 @@ async function recoveryProofCapture(
         addLog(`FaceID: ${presence.lost ? 'out of frame or too dark' : `challenge "${action}" not detected`}`, 'error');
         return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
       }
-      // Descriptor at the pass moment — proves the SAME person performed it.
-      const shot = await captureFaceDescriptor(video);
-      if (shot === 'multi') return { failure: { kind: 'setup', reason: 'multi-face' } };
-      if (!shot) return { failure: { kind: 'capture' } };
-      actions.push({ action, ratio: peak, t: Date.now(), descriptor: shot.data });
-
+      // `t` is the PASS moment (what the pacing check judges); the descriptor
+      // is taken a beat later, at rest — see below.
+      const passedAt = Date.now();
       setCaptureSteps(++step, step);
       renderCaptureCue({ label: 'Relax your face', guide: 'hold', left: 0, right: 0 });
       if (!await holdPresence(video, 1000, presence, cue => renderCaptureCue(cue))) {
         addLog('FaceID: out of frame or too dark between checks', 'error');
         return { failure: { kind: 'presence' } };
       }
+
+      // RECOGNITION DESCRIPTOR IS CAPTURED AT REST, NOT AT THE ACTION PEAK.
+      //
+      // face-api's descriptor is only partly expression-invariant and barely
+      // pose-invariant: measured on a real run, a descriptor grabbed mid-action
+      // and another grabbed during a head turn — SAME person, same session,
+      // same lighting — came out 0.501 apart, past the 0.45 that separates two
+      // different people. Capturing at the peak therefore false-rejected the
+      // legitimate owner (and would have failed the relay's nid match too,
+      // which compares against the enrolled frontal/neutral descriptor at the
+      // same 0.45). The relax hold above is exactly the window where the face
+      // is back to neutral, so the identity evidence is taken there.
+      //
+      // This does not weaken the proof: the ratio still attests that the action
+      // was performed, the presence guard ties this frame to the same
+      // continuously-visible face, and the descriptor is now comparable to the
+      // enrolled one — which is the whole point of submitting it.
+      const shot = await captureFaceDescriptor(video);
+      if (shot === 'multi') return { failure: { kind: 'setup', reason: 'multi-face' } };
+      if (!shot) return { failure: { kind: 'capture' } };
+      actions.push({ action, ratio: peak, t: passedAt, descriptor: shot.data });
     }
     proofs.set(ch.base, { neutralDescriptor: neutralShot.data, actions });
   }
@@ -2478,6 +2514,15 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     let recoveryShare: Uint8Array | undefined;
     let challenges: RelayRecoveryChallenge[] = [];
     const needsRelease = blob.pinVersion === 3 && !(recoveryShare = (await getCachedRecoveryShare(blob.pub)) ?? undefined);
+    // Say which path is taken and WHY — "why did I get the short sequence?" is
+    // otherwise invisible, and the answer (cached share vs legacy blob) decides
+    // whether the relay gate was exercised at all.
+    addLog(
+      needsRelease
+        ? `Recovery: v3 blob, no cached share on this device → relay release required`
+        : `Recovery: ${blob.pinVersion === 3 ? 'share already cached on this device' : `legacy blob (pinVersion=${blob.pinVersion})`} → no relay release`,
+      'info',
+    );
     if (needsRelease) {
       setCameraStatus('<span class="spinner"></span> Asking relays for recovery challenges...');
       challenges = await fetchRecoveryChallenges(node.relayHttpBases(), node.ledger.network);

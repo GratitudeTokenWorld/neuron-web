@@ -1035,6 +1035,10 @@ async function main() {
         const sequence = drawRecoverySequence();
         const now = Date.now();
         challengeSessions.set(challengeId, { type: 'recovery', sequence, createdAt: now, ip: getClientIp(req), used: false });
+        // Logged: without this a recovery attempt is invisible here until the
+        // release is tried, so "did the client even reach the gate?" could not
+        // be answered from the relay side.
+        console.log(`[Recovery] challenge drawn ${sequence.join('→')} ip=${getClientIp(req)}`);
         if (challengeSessions.size % 200 === 0) {
           for (const [id, s] of challengeSessions) {
             if (now - s.createdAt > CHALLENGE_TTL_MS) challengeSessions.delete(id);

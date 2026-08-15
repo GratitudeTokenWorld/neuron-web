@@ -87,6 +87,17 @@ export const MAX_TOTAL_MS = 10 * 60 * 1000;
  * consecutive frames of a still face measure ~0.05-0.15 apart and we must never
  * reject a real user for holding admirably still. (A fabricator adds noise and
  * clears this — see the module header for what this gate does and does not buy.)
+ *
+ * ⚠ THIS BAND ONLY HOLDS FOR DESCRIPTORS CAPTURED AT REST. Measured on a real
+ * run 2026-08-15: descriptors grabbed at the ACTION PEAK (mid-expression, and
+ * especially mid head-turn) measured **0.501 apart for one person in one
+ * session** — face-api's descriptor is only partly expression-invariant and
+ * barely pose-invariant, so peak-captured evidence false-rejects the owner.
+ * The client therefore captures each action's descriptor during the relax hold
+ * that follows it (see recoveryProofCapture in main.ts). Do not "fix" a future
+ * false rejection by raising this number: the relay's nid match runs at the
+ * same 0.45 against the enrolled frontal/neutral descriptor, so a pose-shifted
+ * descriptor fails there too — the capture point is the thing to keep correct.
  */
 export const DESCRIPTOR_MAX_PAIRWISE = 0.45;
 export const DESCRIPTOR_MIN_PAIRWISE = 0.001;
