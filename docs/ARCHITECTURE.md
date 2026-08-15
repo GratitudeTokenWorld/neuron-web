@@ -568,6 +568,74 @@ built yet — see CLAUDE.md → *Where to pick up*.
   The general shape to watch for: **any anti-abuse clock an account can reset by
   destroying its own record is not a clock.**
 
+### Fan-IN: the invariant read from the other direction (decided 2026-08-15)
+
+The scale invariant is usually stated as a bound on what one node must *hold*.
+Lucian's point is that it is equally a bound on what one node must *answer*: a
+popular provider — or a CID with ten million subscribers — must not do work
+proportional to its audience. Everything below follows from that, and one of
+the recommendations above did not survive it.
+
+**The failed recommendation, kept as the worked example.** The natural way to
+learn a provider's uptime is to subscribe to its shard and watch its heartbeats
+arrive. It looks interest-scoped: you follow only the `k` providers holding your
+content, and gossip fans out over a mesh, so the provider still publishes once.
+But a **shard is a partition of accounts, not a unit of interest.** Subscribing
+to one to watch a single account means ingesting every message for every account
+in it — `O(N / numShards)`, which is ~2.4M accounts at the 10B target. Following
+`k` providers is bounded; following `k` *shards* is not. Interest must be
+addressed per-object, never per-partition.
+
+**What replaces it.** Split the question in two, because the halves have very
+different costs:
+
+- **Liveness** (safety-critical: is this holder still there?) is already
+  answered by the lease. `GET /providers` carries each provider's latest signed
+  heartbeat, so freshness is directly checkable, and the answer is **identical
+  for every asker** — see the caching rule below.
+- **Uptime history** (a quality signal: how reliable has it been?) is the
+  expensive half, and it is the one to give up on network-wide. A node scores
+  the providers it actually uses from its **own** spot-checks and receipts —
+  measurements that are naturally bounded by its own usage, and the only ones a
+  relay cannot bias. Providers it has not used are scored on a neutral prior
+  (`UNKNOWN_SCORE`), not on a number fetched from someone else.
+
+**Principles, in the order they bite:**
+
+1. **Identical answers absorb fan-in; per-asker work does not.** A signed,
+   self-verifying response to a popular query can be cached and re-served by any
+   archive, any relay, or any peer that already has it — the origin serves it
+   once. This is why every archive query returns the *subject's own signature*
+   rather than the responder's opinion: it makes the answer safe to copy, which
+   is what makes it safe to be popular.
+2. **Popularity must add serving capacity, not just load.** Anyone who fetched a
+   CID can serve it. Assigned holders guarantee *durability* (they are leased and
+   spot-checked); opportunistic caches provide *bandwidth* and are never counted
+   toward `REDUNDANCY_TARGET`. The two roles are already separated above — this
+   is the reason the separation matters. The replica target for hot content
+   should rise with demand, sub-linearly.
+3. **Verify lazily, on use, rather than continuously.** Continuous monitoring
+   costs `O(watchers × watched)`. Discovering a dead holder when a fetch fails,
+   and repairing then, costs `O(actual use)` — and content nobody reads is
+   exactly the content whose holder liveness matters least to a reader (its
+   durability is still the repair loop's job, driven by the lease, not by
+   watchers).
+4. **Aggregate at the tier that is allowed to be big, and require none of it.**
+   Archives absorb fan-in by design. Because their answers are verifiable, no
+   particular archive is load-bearing: any of them, or a peer holding a cached
+   copy, is an equally good source. "No role is required to hold everything"
+   applies to answering as much as to storing.
+5. **Poll intervals must scale with population, and jitter.** A million clients
+   on a fixed 10-minute timer synchronise into a thundering herd. Cadence should
+   fall as observed population rises, with jitter — the same reasoning as the
+   heartbeat's `±5 min` jitter, applied to queries.
+
+**Not yet implemented.** Points 2, 3 and 5 are design constraints on the repair
+loop and the publish handoff, which is where they should land — see CLAUDE.md →
+*Where to pick up*. The current 10-minute provider poll is fine for a two-relay
+dev network and is exactly the kind of fixed cadence point 5 says must not
+survive contact with scale.
+
 ### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
 
 A storage node's disk is an implementation detail behind one small CID-native

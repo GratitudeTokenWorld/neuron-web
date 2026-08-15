@@ -100,6 +100,16 @@ below constrain all of it:
    `REDUNDANCY_TARGET`. The lease half exists (`isLive`, `MAX_OFFLINE_MS`); the
    repair half does not, and `StorageManager.deregisterStaleLocalProviders`
    still uses its own 24h rule rather than the lease.
+
+   Build it under ARCHITECTURE.md → *Fan-IN* (decided 2026-08-15): repair on
+   **use/failure** rather than by continuously watching holders, let popularity
+   add serving capacity (caches serve bandwidth, only leased holders count for
+   durability), and make poll cadences population-scaled + jittered. **Do not**
+   subscribe to a provider's shard to watch its heartbeats — that was the
+   obvious design and it fails: a shard is a partition of accounts, so following
+   one account costs `O(N / numShards)` (~2.4M accounts at 10B). Network-wide
+   uptime history is deliberately abandoned; score providers you use from your
+   OWN spot-checks/receipts, and everyone else on a neutral prior.
 2. **Publish handoff:** a publish is incomplete until minimum replicas confirm;
    until then the uploader's copy is staging and must be retried, or closing
    the tab destroys the content. `checkPublishFeasibility` is real now (it
