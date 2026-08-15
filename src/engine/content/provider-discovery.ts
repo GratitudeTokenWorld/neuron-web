@@ -77,6 +77,23 @@ export interface DiscoveredProvider extends StorageProviderState {
 }
 
 /**
+ * Score given to a provider we have no history for.
+ *
+ * Explicitly NOT 1.0, which is what this used to be. Score drives provider
+ * selection (weight = capacity × score), so scoring the unknown as *perfect*
+ * made every node rank every stranger above the providers it had real evidence
+ * about — including itself — and would have routed content preferentially to
+ * the least-verified nodes on the network. It also produced the visibly absurd
+ * row of "0% uptime, score 1.000".
+ *
+ * A neutral prior instead: unknown providers are neither favoured nor punished,
+ * and a provider we HAVE watched overtakes it by actually being reliable. The
+ * UI shows this as "—" rather than as a number, because it is a placeholder for
+ * a measurement, not a measurement.
+ */
+export const UNKNOWN_SCORE = 0.5;
+
+/**
  * Verify a batch of provider blocks and fold them into provider records.
  *
  * Input is whatever a relay served; everything unverifiable is dropped
@@ -115,14 +132,14 @@ export function foldProviderBlocks(blocks: readonly Block[]): DiscoveredProvider
       capacityGB,
       lastActualStoredBytes: live?.storage?.storedBytes ?? 0,
       lastHeartbeat: live?.timestamp ?? 0,
-      heartbeatsLast24h: 0,        // unknown without the chain; scoring stays local
+      heartbeatsLast24h: 0,        // no history without the chain — shown as "—"
       lastRewardEpoch: 0,
       totalEarned: 0,
       smokeAddr: live?.storage?.smokeAddr,
       countryCode: live?.storage?.countryCode,
       avgLatencyMs: 0,
       spotCheckPassRate: 1,
-      score: 1,
+      score: UNKNOWN_SCORE,
       earningRate: 0,
       discovered: true,
     });

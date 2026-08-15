@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { foldProviderBlocks, selectDiscoveryBlocks } from './provider-discovery.js';
+import { foldProviderBlocks, selectDiscoveryBlocks, UNKNOWN_SCORE } from './provider-discovery.js';
 import { ProviderLedger, GB_BYTES, MAX_OFFLINE_MS } from './provider-ledger.js';
 import { createBlock, GENESIS_PREV, type Block, type StoragePayload } from '../core/block.js';
 import { AccountAccumulator } from '../core/accumulator.js';
@@ -107,6 +107,49 @@ describe('foldProviderBlocks', () => {
     const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 7 });
     const junk = { type: 'storage-register', accountId: 'nope', index: 0 } as unknown as Block;
     expect(foldProviderBlocks([junk, reg])).toHaveLength(1);
+  });
+});
+
+describe('scoring the unknown', () => {
+  it('does NOT score a provider it has no history for as perfect', () => {
+    // Score weights provider selection (capacity × score). Scoring the unknown
+    // at 1.0 ranked every stranger above every provider we had real evidence
+    // about — including ourselves — and put "0% uptime, score 1.000" on screen.
+    const p = generateKeyPair();
+    const [rec] = foldProviderBlocks([signed(p, 'storage-register', 1, DAY, { capacityGB: 10 })]);
+    expect(rec!.score).toBe(UNKNOWN_SCORE);
+    expect(rec!.score).toBeLessThan(1);
+    expect(rec!.discovered).toBe(true);       // so the UI can render it as "—"
+  });
+
+  it('lets a provider we have actually watched outrank the unknown', () => {
+    const pl = new ProviderLedger();
+    const good = generateKeyPair();
+    pl.apply(signed(good, 'storage-register', 1, DAY, { capacityGB: 10 }), DAY);
+    pl.apply(signed(good, 'storage-heartbeat', 2, DAY, {}), DAY);
+    pl.refresh(DAY + 1000);
+    pl.setDiscovered(foldProviderBlocks([
+      signed(generateKeyPair(), 'storage-register', 1, DAY, { capacityGB: 10 }),
+    ]));
+    const ranked = pl.allProviders();
+    expect(ranked[0]!.pub).toBe(good.pub);            // measured reliability wins
+    expect(ranked[0]!.score).toBeGreaterThan(UNKNOWN_SCORE);
+  });
+
+  it('does not punish a provider for having only just registered', () => {
+    // One heartbeat an hour after registering is a PERFECT record — only one was
+    // due. Dividing by a flat 6/day scored it 0.167 and made every healthy new
+    // provider look broken for its first day.
+    const pl = new ProviderLedger();
+    const p = generateKeyPair();
+    pl.apply(signed(p, 'storage-register', 1, DAY, { capacityGB: 10 }), DAY);
+    pl.apply(signed(p, 'storage-heartbeat', 2, DAY, {}), DAY);
+    pl.refresh(DAY + 60 * 60 * 1000);                 // one hour in
+    expect(pl.get(p.pub)!.score).toBe(1);
+
+    // A day later with still only that one heartbeat, it IS unreliable.
+    pl.refresh(DAY + 24 * 60 * 60 * 1000);
+    expect(pl.get(p.pub)!.score).toBeCloseTo(1 / 6, 3);
   });
 });
 

@@ -130,6 +130,13 @@ export interface StorageProviderState {
   spotCheckPassRate: number;
   score: number;
   earningRate: number;
+  /**
+   * True when this record came from discovery rather than from a chain we hold
+   * (see provider-discovery.ts). Its `score`, `heartbeatsLast24h` and
+   * `totalEarned` are NOT measurements — we have no history for it — so they
+   * must be shown as unknown, not as fact.
+   */
+  discovered?: boolean;
 }
 
 interface EpochRecord {
@@ -497,7 +504,7 @@ export class ProviderLedger {
     // interval old, and a window anchored on it reads high, then drops on the next
     // restart when the count is recomputed against the wall clock.
     p.heartbeatsLast24h = this.countHeartbeatsLast24h(pub, now);
-    this.updateScore(p);
+    this.updateScore(p, now);
   }
 
   private applyReward(block: Block): void {
@@ -557,7 +564,7 @@ export class ProviderLedger {
   refresh(now: number): void {
     for (const p of this.providers.values()) {
       p.heartbeatsLast24h = this.countHeartbeatsLast24h(p.pub, now);
-      this.updateScore(p);
+      this.updateScore(p, now);
     }
   }
 
@@ -567,8 +574,23 @@ export class ProviderLedger {
    * reward at the current score, metered on bytes actually held (capped by declared
    * capacity) — declared-but-empty capacity earns nothing.
    */
-  updateScore(p: StorageProviderState): void {
-    const uptimeFactor = Math.max(0.1, Math.min(1, p.heartbeatsLast24h / MAX_HEARTBEATS_PER_DAY));
+  updateScore(p: StorageProviderState, now: number = Date.now()): void {
+    // Uptime is scored against the heartbeats this provider could actually have
+    // sent since it registered, not against a flat 6-a-day. A node registered an
+    // hour ago can only ever have sent one, so dividing by 6 scored a perfectly
+    // behaved new provider at 0.167 and left it looking broken for its first
+    // day — while every provider we knew nothing about scored 1.0.
+    //
+    // NOTE this is deliberately NOT how the REWARD is metered. Pay is
+    // counted/6, because a fraction of a day's custody earns a fraction of a
+    // day's pay. Score answers a different question — how reliable is this
+    // provider — and that has to account for how long it has been around.
+    const elapsed = Math.max(0, Math.min(now - p.registeredAt, REWARD_EPOCH_MS));
+    const expected = Math.max(1, Math.min(
+      MAX_HEARTBEATS_PER_DAY,
+      Math.floor(elapsed / HEARTBEAT_INTERVAL_MS) + 1,
+    ));
+    const uptimeFactor = Math.max(0.1, Math.min(1, p.heartbeatsLast24h / expected));
     const latencyFactor = p.avgLatencyMs > 0
       ? Math.max(0.1, Math.min(1, 1_000 / p.avgLatencyMs))
       : 1;

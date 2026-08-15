@@ -3843,11 +3843,15 @@ function refreshStorage() {
     const freeGB = Math.max(0, totalCapGB - storedBytes / 1_073_741_824);
     const fileIndex = node.storage.getFileIndex();
     const fileCount = fileIndex.size;
-    const avgUptime = active.length
-      ? active.reduce((s, p) => s + (p.heartbeatsLast24h / 6), 0) / active.length
+    // Average only over providers we actually measure — folding in the neutral
+    // placeholder score of a discovered provider would report a network average
+    // that is partly made up.
+    const measured = active.filter(p => p.discovered !== true);
+    const avgUptime = measured.length
+      ? measured.reduce((s, p) => s + (p.heartbeatsLast24h / 6), 0) / measured.length
       : 0;
-    const avgScore = active.length
-      ? active.reduce((s, p) => s + p.score, 0) / active.length
+    const avgScore = measured.length
+      ? measured.reduce((s, p) => s + p.score, 0) / measured.length
       : 0;
     const totalEarned = providers.reduce((s, p) => s + p.totalEarned, 0);
     const fmtGB = (gb: number) => gb >= 1024 ? `${(gb / 1024).toFixed(2)} TB` : `${gb.toFixed(1)} GB`;
@@ -3875,9 +3879,16 @@ function refreshStorage() {
     const myPubs = new Set(localAccounts.map(a => a.pub));
     providersList.innerHTML = providers.map(p => {
       const isMine = myPubs.has(p.pub);
-      const uptime = `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
+      // A DISCOVERED provider is one we only heard about from an archive: we
+      // hold none of its chain, so uptime/score/earnings are not measurements
+      // and must not be rendered as if they were. Showing the unknown as a
+      // number is how "0% uptime, score 1.000" ended up on screen, with every
+      // node ranking itself below every stranger.
+      const unknown = p.discovered === true;
+      const dash = '<span style="color:var(--text-muted)" title="not measured — we hold none of this provider’s chain">&mdash;</span>';
+      const uptime = unknown ? dash : `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
       const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
-      const spotCheck = `${Math.round(p.spotCheckPassRate * 100)}%`;
+      const spotCheck = unknown ? dash : `${Math.round(p.spotCheckPassRate * 100)}%`;
       const scoreColor = p.score >= 0.8 ? 'var(--success)' : p.score >= 0.4 ? 'var(--warning)' : 'var(--danger)';
       return `<tr${isMine ? ' style="background:rgba(34,211,238,0.04);"' : ''}>
         <td>${copyBtn(p.pub)}${isMine ? ' <span style="color:var(--accent);font-size:11px;">(you)</span>' : ''}</td>
@@ -3885,9 +3896,9 @@ function refreshStorage() {
         <td>${uptime}</td>
         <td>${latency}</td>
         <td>${spotCheck}</td>
-        <td><strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong></td>
-        <td>${formatUNIT(p.earningRate)}</td>
-        <td>${formatUNIT(p.totalEarned)}</td>
+        <td>${unknown ? dash : `<strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong>`}</td>
+        <td>${unknown ? dash : formatUNIT(p.earningRate)}</td>
+        <td>${unknown ? dash : formatUNIT(p.totalEarned)}</td>
       </tr>`;
     }).join('');
   }
