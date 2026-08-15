@@ -1,7 +1,35 @@
 import { defineConfig } from 'vite';
 import { libp2pRelay } from './relay/vite-plugin';
+import { deriveDevAttesters, devAttesterBases } from './src/network/dev-attester-proxy';
 
-export default defineConfig({
+/** The bootstrap relays baked into the client (see `__BOOTSTRAP_ADDRS__` below). */
+const BOOTSTRAP_ADDRS = [
+  ...(process.env.LOCAL_ONLY ? [] : [
+    '/ip4/80.97.27.224/tcp/9090/ws/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh',
+    '/ip4/80.97.27.112/tcp/9090/ws/p2p/12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU',
+  ]),
+  ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
+];
+
+export default defineConfig(({ command }) => {
+  // ⚠ DEV SERVER ONLY — MUST NOT REACH ANY BUILD, TESTNET INCLUDED.
+  // See src/network/dev-attester-proxy.ts for what this is and why it must go.
+  // `command === 'serve'` is the structural guard: `npm run build` derives an
+  // empty list, so the proxies do not exist and the client map bakes as {}.
+  const devAttesters = command === 'serve' ? deriveDevAttesters(BOOTSTRAP_ADDRS) : [];
+  if (command !== 'serve' && devAttesters.length > 0) {
+    throw new Error('dev attester proxy must never be baked into a build — see dev-attester-proxy.ts');
+  }
+  const devAttesterProxy = Object.fromEntries(devAttesters.map(a => [
+    a.path,
+    {
+      target: a.target,
+      changeOrigin: true,
+      rewrite: (p: string) => p.replace(new RegExp(`^${a.path}`), '') || '/',
+    },
+  ]));
+
+  return {
   root: '.',
   publicDir: 'public',
   plugins: [libp2pRelay()],
@@ -46,6 +74,10 @@ export default defineConfig({
       '/keyblob': {
         target: 'http://localhost:9092',
       },
+      // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION — same-origin routes to the raw-IP
+      // dev super-nodes so the HTTPS tunnel (the only way to reach a camera on a
+      // phone) can attest against more than one relay. Empty in every build.
+      ...devAttesterProxy,
     },
   },
   build: {
@@ -69,13 +101,11 @@ export default defineConfig({
     // each — docs/CLOUD.md). Raw-IP ws/http endpoints: reachable from http://localhost
     // dev pages only (mixed content blocks them from https pages — docs/TESTPLAN.md).
     // The previous production relays (neuronweb.org, akashicrecords.dev) are replaced.
-    __BOOTSTRAP_ADDRS__: JSON.stringify([
-      ...(process.env.LOCAL_ONLY ? [] : [
-        '/ip4/80.97.27.224/tcp/9090/ws/p2p/12D3KooWQdg5zSBAJrUmxVReJ4WkhRjCw7LQudL3PosBH7R21dUh',
-        '/ip4/80.97.27.112/tcp/9090/ws/p2p/12D3KooWBmGKkfC9C9fGLhdCn7uSVGMcfD2urSpnULbWe7vuVymU',
-      ]),
-      ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
-    ]),
+    __BOOTSTRAP_ADDRS__: JSON.stringify(BOOTSTRAP_ADDRS),
+    // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION — peerId → same-origin proxy base, so
+    // the client can reach a raw-IP attester from an HTTPS tunnel. `{}` in every
+    // build, which makes the client-side lookup inert. See dev-attester-proxy.ts.
+    __DEV_ATTESTER_BASES__: JSON.stringify(devAttesterBases(devAttesters)),
     // Personhood attesters required to open an account. 1 for an isolated
     // LOCAL_ONLY dev stack (single local relay), 2 in production (two super-nodes).
     // Override with REQUIRED_ATTESTERS=<n>.
@@ -114,4 +144,5 @@ export default defineConfig({
       'buffer',
     ],
   },
+}
 });

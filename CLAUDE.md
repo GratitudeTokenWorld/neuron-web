@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **330 tests / 62 files passing**, `npm run build` clean.
+Current baseline: **336 tests / 63 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -422,6 +422,34 @@ instances / 128 vCPU / 160 GB RAM. Cheapest flavor: `b2i.2c-2g`.
 **Confirm with the user before creating, resizing, or deleting any cloud resource** —
 they are billable and outward-facing. Read-only commands (`list`, `show`, `token issue`)
 are fine unprompted.
+
+## ⚠ Remove before production — including testnet
+
+Deliberate, temporary workarounds that **must not ship in any built bundle**.
+Check this list before any deploy that is not a dev server.
+
+- **Dev attester proxy** (`src/network/dev-attester-proxy.ts`, added 2026-08-15,
+  Lucian's call). The Vite dev server proxies each raw-IP bootstrap relay under
+  `/dev-attester/<n>` so the HTTPS tunnel can attest against more than one of
+  them. Needed because face capture requires a secure context, so a phone can
+  only reach the app over the tunnel, and an HTTPS page may not fetch the
+  relays' plain-`http://` endpoints — mixed content silently reduced account
+  creation to *"1 of 2 attesters responded"*.
+
+  **Why it cannot ship:** it routes attestation through the page's own origin.
+  An attester is supposed to be an INDEPENDENT party, so this makes 2-of-N
+  collapse to trusting one server — exactly the property k-of-N exists to
+  provide. It also bakes dev topology into the client.
+
+  **The real fix:** TLS in front of the relays and a real `faceVerifyUrl` in
+  `/relay-info` (the field exists and is empty today). Production needs that
+  regardless, and it fixes every HTTPS origin at once.
+
+  Structurally dev-only already: `vite.config.ts` derives it only when
+  `command === 'serve'`, so a build bakes `__DEV_ATTESTER_BASES__` as `{}` and
+  the client lookup is inert — verified by grepping `dist/` for `dev-attester`.
+  `dev-attester-proxy.test.ts` pins the empty-input contract. **Delete it
+  anyway** rather than relying on the guard.
 
 ## Development mode — data is disposable
 

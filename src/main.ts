@@ -2110,7 +2110,30 @@ function attesterCandidates(): import('./network/libp2p-network').KnownRelayReco
       addr, peerId: peerIdFromMultiaddr(addr),
       lastSeen: 0, failCount: 0, announcerPub: '',
     })) as import('./network/libp2p-network').KnownRelayRecord[];
-  return [...known, ...extra];
+  return withDevAttesterBases([...known, ...extra]);
+}
+
+/**
+ * ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION (see network/dev-attester-proxy.ts).
+ *
+ * Point raw-IP attesters at the dev server's same-origin proxy, so an HTTPS
+ * tunnel — the only way to reach a camera on a phone — is not cut down to a
+ * single attester by mixed-content blocking. Applied by peerId so it catches a
+ * relay however it was learned (baked or gossiped), and never overrides a
+ * `faceVerifyUrl` a relay announced for itself.
+ *
+ * `__DEV_ATTESTER_BASES__` is `{}` in every build, so this is a no-op there.
+ */
+declare const __DEV_ATTESTER_BASES__: Record<string, string> | undefined;
+function withDevAttesterBases(
+  relays: import('./network/libp2p-network').KnownRelayRecord[],
+): import('./network/libp2p-network').KnownRelayRecord[] {
+  const bases = typeof __DEV_ATTESTER_BASES__ !== 'undefined' ? __DEV_ATTESTER_BASES__ : {};
+  if (!bases || Object.keys(bases).length === 0) return relays;
+  return relays.map(r => {
+    const base = r.peerId ? bases[r.peerId] : undefined;
+    return base && !r.faceVerifyUrl ? { ...r, faceVerifyUrl: base } : r;
+  });
 }
 
 /**
@@ -2128,7 +2151,12 @@ async function withAttesterKeys(
 ): Promise<import('./network/libp2p-network').KnownRelayRecord[]> {
   return Promise.all(relays.map(async r => {
     if (r.signingPub) return r;
-    const base = relayHttpBase(r.addr);
+    // The SAME base the attestation itself will use — `/relay-info` lives beside
+    // `/face-verify` on the relay's HTTP API. Using the raw multiaddr base here
+    // while attesting through another is what left the dev-proxy path
+    // half-connected: enrichment blocked as mixed content, so the relay never
+    // gained a signingPub and was filtered out before it was ever asked.
+    const base = relayFaceVerifyBase(r);
     if (!base) return r; // same-origin relay is handled by the /relay-info fallback
     try {
       const res = await fetch(`${base}/relay-info`, { signal: AbortSignal.timeout(4000) });
