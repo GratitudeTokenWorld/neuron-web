@@ -519,7 +519,15 @@ built yet — see CLAUDE.md → *Where to pick up*.
   the legacy code kept two copies in sync by comment. Capacity is priced as
   declared at **epoch start** (a bump minutes before claiming pays nothing),
   metered on bytes actually reported held, capped by that declaration, scaled by
-  counted heartbeats / 6.
+  counted heartbeats / 6. **Holding nothing earns nothing** — declared capacity
+  is self-asserted, so paying for it pays for a claim rather than for custody.
+  (This originally fell back to declared capacity when no bytes were reported, a
+  backward-compatibility rule inherited from the legacy ledger whose premise —
+  heartbeats predating the `storedBytes` field — does not exist for a block type
+  that has always carried it. Since the field is optional, the fallback paid a
+  full-capacity reward to anyone who simply omitted it. Reported by Lucian,
+  2026-08-15.) The projected `earningRate` shown in the UI is computed by the
+  same rule, so the displayed rate cannot promise what the reward will refuse.
 - **A reward bills the day before its own block, and only that day**
   (`claimableEpochDay`, enforced in `validate`). Two problems collapse into one
   rule. Pricing the *running* day paid whatever fraction had elapsed, and since

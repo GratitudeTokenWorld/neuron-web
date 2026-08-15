@@ -241,6 +241,33 @@ describe('reward terms', () => {
     expect(terms.storedGB).toBe(10);   // priced at the 10GB that was declared all day
   });
 
+  it('pays NOTHING for declared capacity that holds no bytes', () => {
+    // Declared capacity is self-asserted. Paying for it pays for a claim, not
+    // for custody — a provider could declare 1000GB, store nothing, and collect
+    // the full rate forever.
+    const pl = registered(1000, DAY - REWARD_EPOCH_MS);
+    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
+      pl.apply(blk('storage-heartbeat', ts, { storedBytes: 0 }), ts);
+    }
+    expect(pl.rewardTerms(PUB, 100)).toMatch(/zero/);
+    pl.refresh(DAY + REWARD_EPOCH_MS - 1);
+    expect(pl.providers.get(PUB)!.earningRate).toBe(0);   // the bar agrees with the till
+  });
+
+  it('pays nothing when a heartbeat OMITS the byte count', () => {
+    // `storedBytes` is optional, so "no bytes reported" must mean no reward.
+    // Treating it as "assume full capacity" handed a free full-rate reward to
+    // anyone who simply left the field out.
+    const pl = registered(1000, DAY - REWARD_EPOCH_MS);
+    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
+      pl.apply(blk('storage-heartbeat', ts, {}), ts);      // no storedBytes at all
+    }
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);  // uptime is real
+    expect(pl.rewardTerms(PUB, 100)).toMatch(/zero/);                     // custody is not
+  });
+
   it('owes nothing for an epoch with no heartbeats, or one already claimed', () => {
     const pl = registered(10, DAY - REWARD_EPOCH_MS);
     expect(pl.rewardTerms(PUB, 100)).toMatch(/no heartbeats/);

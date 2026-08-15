@@ -309,11 +309,20 @@ export class ProviderLedger {
     const heartbeatCount = this.heartbeatsInEpoch(pub, epochDay);
     if (heartbeatCount === 0) return 'no heartbeats recorded in this epoch';
 
-    // Pay for what is actually held, capped by what was declared. Falling back to
-    // declared capacity when nothing was reported keeps pre-`storedBytes` chains
-    // claimable, and the cap means the fallback can never pay more than the cap.
+    // Pay ONLY for bytes actually held, capped by what was declared at epoch
+    // start. Storing nothing earns nothing — declared capacity is self-asserted,
+    // so paying for it pays for a claim rather than for custody.
+    //
+    // This used to fall back to declared capacity when no bytes were reported, a
+    // backward-compatibility rule carried over from the legacy ledger, where
+    // heartbeats predating the `storedBytes` field had to stay claimable. That
+    // premise does not exist here: `storage-heartbeat` is a new block type and
+    // has carried `storedBytes` since its first line, so there are no such
+    // chains. What the fallback actually did was pay a provider its full
+    // declared rate for storing nothing — and, because the field is optional,
+    // hand a free full-capacity reward to anyone who simply omitted it.
     const actualGB = this.storedGBInEpoch(pub, epochDay);
-    const effectiveGB = actualGB > 0 ? Math.min(actualGB, capacityAtStart) : capacityAtStart;
+    const effectiveGB = Math.min(actualGB, capacityAtStart);
     const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1);
     const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
     if (amount <= 0) return 'calculated reward is zero';
@@ -565,9 +574,10 @@ export class ProviderLedger {
       : 1;
     const spotFactor = Math.max(0.1, Math.min(1, p.spotCheckPassRate));
     p.score = uptimeFactor * latencyFactor * spotFactor;
-    const effectiveGB = p.lastActualStoredBytes > 0
-      ? Math.min(p.lastActualStoredBytes / GB_BYTES, p.capacityGB)
-      : p.capacityGB;
+    // Metered on bytes HELD, never on capacity offered — and by exactly the rule
+    // `rewardTerms` pays by, so the projected rate cannot promise what the reward
+    // will refuse. A provider holding nothing shows 0, which is what it earns.
+    const effectiveGB = Math.min(p.lastActualStoredBytes / GB_BYTES, p.capacityGB);
     p.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * p.score);
   }
 
