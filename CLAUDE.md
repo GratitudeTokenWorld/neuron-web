@@ -43,7 +43,66 @@ npm run typecheck    # engine + src/storage; NOT the app layer — see below
 Current baseline: **270 tests / 58 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
-## Where to pick up (as of 2026-08-10)
+## Where to pick up (as of 2026-08-15)
+
+**Phase 3 has STARTED — do not rebuild the seam.** `ede2dd8` landed the
+storage backend split: `BlockBackend` + `MemoryBackend`
+(`src/engine/content/backend.ts`), `ContentStore` now composes a backend and is
+**async** (with `release()` for lease cleanup and `open()` to adopt an existing
+disk), and `src/storage/fs-backend.ts` is the filesystem adapter (own
+`tsconfig.storage.json`, inside `npm run typecheck`).
+
+**What remains, in this order** — the decisions in *Storage custody rules*
+below constrain all of it:
+
+1. **Parity:** the four `EngineLedger.createStorage*` `deferred()` stubs
+   (register / deregister / **heartbeat** / reward). `createStorageHeartbeat`
+   *is* the lease renewal — the on-chain liveness proof the custody model rests
+   on, not just a parity item.
+2. **Lease + repair** on top of heartbeat: `MAX_OFFLINE`, rejoin discard +
+   refill from declared capacity, and counting only *verified-live* replicas
+   toward `REDUNDANCY_TARGET`.
+3. **Publish handoff:** a publish is incomplete until minimum replicas confirm;
+   until then the uploader's copy is staging and must be retried, or closing
+   the tab destroys the content.
+4. **File index → DHT provider records** — the remaining `O(N)` violation in
+   storage (a global gossiped file index today).
+5. **Measure repair-rate vs churn** in `src/engine/sim/archival.ts`: it models
+   assignment and churn but NOT lease expiry/repair, so "durability is a flow"
+   is currently asserted, not measured.
+6. **S3 client adapter** — opt-in, operator-configured, never a default.
+7. **TESTPLAN T8 (storage)** — write it *with* the parity work; today it would
+   only test stubs returning errors.
+
+`storage-manager.ts` (1379 lines) is still fully on the legacy `DAGLedger` and
+has more callers than the ledger did — enumerate them before changing what it
+broadcasts (see the free-rider trap below).
+
+### Storage custody rules (decided; they constrain Phase 3)
+
+- **Durability is a FLOW property.** Content survives because the network
+  re-distributes the minimum replica count faster than holders are lost
+  (repair ≥ churn) — not because many copies exist.
+- **Replicas are held under a liveness LEASE, not owned.** Discard + refill
+  from declared capacity after `MAX_OFFLINE`.
+- **Authorship is not custody.** Published content is handed to the network;
+  the publisher keeps no copy by default and is not automatically a replica
+  (except while the network finishes replicating it). Ownership is on-chain,
+  custody is a network assignment — no authorship exemption from lease rules.
+- **Backends are pluggable and OPERATOR-CONFIGURED.** Filesystem is the
+  zero-dependency bottom layer and the CI target. Nothing in the core may
+  require an object store, and no default config may point at one. We do not
+  implement an S3 *server* (commodity work; it competes with the lease/repair
+  logic that is the actual novelty).
+- **No role is required to hold everything** — archival super-nodes included.
+  Full mirrors are an opt-in bonus, never load-bearing.
+
+The custody repair loop in `src/network/recovery-share.ts` is the same shape as
+Phase 3's content repair and was debugged the hard way (see *Key custody*
+below): expand-only, generation-aware, never trust a partial write. Reuse that
+shape rather than rediscovering it.
+
+### Already closed — don't re-derive these
 
 **Both scale gaps are closed, deployed and manually re-tested.** The
 `src/engine/sim` baseline ran first (incl. a 10B projection — ARCHITECTURE.md →
@@ -64,18 +123,42 @@ Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
   record (`GET /token`) against the **minter's** chain — so no counterparty
   chain is held at all.
 
-TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
-`npx tsx scripts/g1-resolve-smoke.mts` (40 checks) after every relay deploy.
+- **G3** (found + closed 2026-08-15) — the global `keyblobs` topic, same shape
+  as G1 and missed by its sweep because it hid behind a security rationale
+  ("gossiped for peer-independent recovery"). Every client received every
+  account's encrypted-key blob. Blobs now move over targeted HTTP only
+  (`POST`/`GET /keyblob`, per-IP limited).
 
-**Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
-`src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`
-stubs), then Phase 4. See ARCHITECTURE.md → *Where this stands*.
+**Identity/custody was reworked on 2026-08-15** (see *Key custody* under
+Security-critical areas — read it before touching `face-store.ts`,
+`recovery-share.ts` or the relay's recovery endpoints). Short version:
+`pinVersion=3` seals the keys under `XOR(face, PIN, relay-held share)`, the
+share is Shamir 2-of-n across the attesters, and release is gated by a
+relay-verified action sequence under server-side backoff.
 
-Two lessons from this round worth carrying into the next: removing an `O(N)`
-crutch breaks whatever was quietly free-riding on it (offline discovery, TX
-search, and a wiped device's own-chain sync all were), and any epoch/authority
-state must be read as an aggregate **across relays** — reading only the
-same-origin relay split the brain twice (see SUPERNODE.md → *Resets*).
+TESTPLAN T1–T7 green; T1, T5 and T5.3 re-verified on v3 (2026-08-15) with all
+four T5 sub-checks including photo-refusal and lockout-survives-a-wipe. Run the
+live probe `npx tsx scripts/g1-resolve-smoke.mts` (41 checks) after every relay
+deploy.
+
+Lessons from these rounds worth carrying into Phase 3:
+
+- Removing an `O(N)` crutch breaks whatever was quietly free-riding on it
+  (offline discovery, TX search, a wiped device's own-chain sync, NFT mint
+  records all were). **Enumerate the readers before you stop broadcasting.**
+- "Everyone should hold this so nobody depends on anyone" always decays into
+  "everyone holds everything" — three times now (`accounts`, `keyblobs`, and
+  the reflex to gossip the file index). **Redundancy must be a bounded
+  assignment (k named holders), never a broadcast.**
+- Any epoch/authority state must be read as an aggregate **across relays** —
+  reading only the same-origin relay split the brain twice (SUPERNODE.md →
+  *Resets*).
+- A rule worth writing in a comment is worth a test. The share-refresh
+  ordering was described correctly in a comment, shipped without the guard, and
+  destroyed a live account's redundancy within the hour.
+- `relay/` edits need a **relay restart**, not just a Vite reload — the plugin
+  spawns it once. A stale local relay silently rejected its share and left
+  accounts at reduced redundancy.
 
 `vitest.config.ts` is deliberately separate from `vite.config.ts` so the test run does
 not load the libp2p plugin (which spawns a relay).

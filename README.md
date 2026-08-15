@@ -1,8 +1,9 @@
 # neuron-web
 
 The scalable social-dApp build: the **neuronchain app** (UI, P2P transport,
-face+PIN identity, relay) carried over and being re-platformed onto a new
-**sharded, age-weighted-personhood engine** designed to scale to 10B users.
+face+PIN+network-share identity, relay) carried over and being re-platformed
+onto a new **sharded, age-weighted-personhood engine** designed to scale to 10B
+users.
 
 - `npm run dev` runs the app exactly like neuronchain (same UI).
 - `src/engine/` is the new scalable core — a tested library that the app's
@@ -60,11 +61,18 @@ src/
   **270 tests passing, engine + storage typechecked**, all 7 scale-invariants
   demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
   `EngineLedger` (`src/network/node.ts`).
-- **Scale invariant restored** — the two known `O(N)` violations are closed
+- **Scale invariant restored** — three `O(N)` violations closed. G1 + G2
   (2026-08-10): accounts resolve on demand from an archive tier instead of a
   global gossip topic, and payments *and* NFTs claim from `O(log n)` Merkle
-  proofs instead of replicating counterparty chains. Live on the two-relay dev
-  network; manual matrix green.
+  proofs instead of replicating counterparty chains. G3 (2026-08-15): the
+  global `keyblobs` topic, which handed every account's encrypted-key blob to
+  every node, replaced by targeted HTTP. Live on the two-relay dev network;
+  manual matrix green.
+- **Key custody split** (2026-08-15) — account keys are sealed under
+  `XOR(face, PIN, relay-held share)`; the share is Shamir 2-of-n across the
+  attesters and released only to a relay-verified live action sequence under
+  server-side backoff. The previous scheme was PIN-strength only, which a test
+  in `src/core/face-match.test.ts` still demonstrates as the control case.
 - **Next** — Phase 3 (storage): the CID-native backend seam and a filesystem
   adapter are in (`src/storage/`); still to do are the on-chain storage-provider
   ops, replica leases + repair, and the file index → DHT. Then Phase 4, and the

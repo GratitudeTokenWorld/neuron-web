@@ -644,7 +644,7 @@ component in the system.
 
 ---
 
-## Where this stands (updated 2026-08-09)
+## Where this stands (updated 2026-08-15)
 
 Phase status against the plan below, and what a new session should pick up.
 
@@ -656,7 +656,9 @@ Phase status against the plan below, and what a new session should pick up.
 | 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10** | backend seam done: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Still to do: the four `EngineLedger.createStorage*` `deferred()` stubs (register/deregister/**heartbeat**/reward — heartbeat *is* the lease renewal), lease+repair logic, file index → DHT, `storage-manager.ts` off the legacy `DAGLedger` |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
-| G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 21/21 |
+| G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 41/41 |
+| G3 (a third `O(N)` violation, found later) | **CLOSED 2026-08-15** | the global `keyblobs` topic broadcast every account's encrypted-key blob to every node — G1's shape, hidden behind a security rationale. Replaced by targeted `POST`/`GET /keyblob`. See *Scale-invariant gaps* below |
+| Key custody (identity, not a numbered phase) | **REWORKED 2026-08-15** | `pinVersion=3`: keys under `XOR(face, PIN, relay-held share)`, share Shamir 2-of-n across attesters, release gated by a relay-verified action sequence under server-side backoff, custody self-heals. Replaced a scheme that was PIN-strength only. Subsystem 5 + SUPERNODE.md |
 
 The simulation baseline has been run and extended (see *Measured baseline*
 below): the engine's block layer holds the invariant exactly, and the harness
@@ -681,11 +683,14 @@ mechanism:
 | Transfer routed to a destroyed account | stale pre-reset record survived locally and outranked the live one | generation filter at the cache boundary + relay-first username resolution + newest-registration ranking |
 | "Reset testnet" did nothing to the network | operator gate read only the same-origin relay | epoch/operator aggregation across relays + relay generation follower |
 
-Next, in order: **Phase 3 wiring** (`storage-manager.ts` off the legacy
-`DAGLedger`; `EngineLedger.createStorage*` are deliberate `deferred()` stubs),
-then **Phase 4**. The migration seam (~182 app-layer type errors; see CLAUDE.md)
-can be paid down alongside, per caller, as each one is moved off the `DAGLedger`
-compatibility surface.
+Next, in order — **Phase 3 continues** (its backend seam already landed; see the
+phase table above and CLAUDE.md → *Where to pick up* for the full ordered list):
+the four `EngineLedger.createStorage*` `deferred()` stubs (heartbeat *is* the
+lease renewal), then lease+repair, publish handoff, file index → DHT, measuring
+repair-vs-churn in `sim/archival.ts`, and `storage-manager.ts` off the legacy
+`DAGLedger`. Then **Phase 4**. The migration seam (~182 app-layer type errors;
+see CLAUDE.md) can be paid down alongside, per caller, as each one is moved off
+the `DAGLedger` compatibility surface.
 
 ---
 
@@ -842,7 +847,7 @@ silently overloading validators.
 > manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network,
 > including the NFT round trip through the proof path).
 > Payments **and NFTs** now claim via proof packets — no counterparty chain is
-> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (40 checks
+> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (41 checks
 > — run it after every relay deploy).
 
 **G3 — the global `keyblobs` topic (found and closed 2026-08-15, with the v3

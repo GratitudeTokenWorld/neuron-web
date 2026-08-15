@@ -49,6 +49,22 @@ Rules that will save you a debugging session:
 The build defaults to `REQUIRED_ATTESTERS=2` (non-LOCAL_ONLY), so account creation
 *must* reach two distinct attesters or fail with "Need 2 independent attesters".
 
+> **Expect `3 attestation(s) collected`, not 2** — that is correct, and it
+> confuses everyone once. The dev topology has **three** attesters: the two
+> cloud relays *plus your auto-spawned local dev relay*, which is a full
+> attester with its own key and `signingPub`. `REQUIRED_ATTESTERS` is the
+> quorum *minimum*; the client collects from every attester it can reach.
+> Browsers never attest — a browser node has no signing key and no
+> `/face-verify` endpoint, so a second browser profile adds nothing here.
+> Production builds bake only the two cloud relays.
+>
+> Since v3 the same three relays also each receive a **Shamir share** of the
+> account's recovery secret (`[Recovery] share stored … nid=…` in each log).
+> Creation **aborts** if fewer than `REQUIRED_ATTESTERS` accept a share — an
+> account whose share can never be reconstructed is unrecoverable by
+> construction. Creating while a relay is down yields a narrower split; the
+> client self-heals it later (SUPERNODE.md → share refresh).
+
 1. Browser A → Create Account → username `alice` → face + PIN enrollment.
    The capture UI shows a **seven-box step tracker** (0 = setup, 1–5 = the five
    actions, 6 = capture; each turns green with a checkmark as it completes), a
@@ -307,7 +323,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 covers everything about the archive API that does *not* need a face:
 
 ```sh
-npx tsx scripts/g1-resolve-smoke.mts    # 40 checks; expect ALL CHECKS PASSED
+npx tsx scripts/g1-resolve-smoke.mts    # 41 checks; expect ALL CHECKS PASSED
 ```
 
 It publishes a signed account record and a real signed sender chain to relay-1
