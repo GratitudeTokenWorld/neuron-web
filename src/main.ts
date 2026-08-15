@@ -1339,8 +1339,10 @@ $$('.tab-btn').forEach((btn) => {
 });
 
 function setNodeDependentTabs(enabled: boolean) {
-  // Contracts + Storage are deferred to the dApp phase (no engine equivalent yet).
-  const tabs = ['account', 'transfer'];
+  // Contracts stay deferred (no VM by design). Storage is live as of the Phase 3
+  // parity work — it needs a running node because registering checks the store
+  // is started and the register block has to reach peers.
+  const tabs = ['account', 'transfer', 'storage'];
   tabs.forEach((t) => {
     const btn = document.querySelector(`.tab-btn[data-tab="${t}"]`) as HTMLButtonElement;
     if (btn) btn.disabled = !enabled;
