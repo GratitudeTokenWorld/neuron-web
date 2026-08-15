@@ -35,7 +35,36 @@ export type BlockType =
   | 'nft-mint'
   | 'nft-send'
   | 'nft-receive'
-  | 'nft-burn';
+  | 'nft-burn'
+  // Storage economy (Phase 3): a provider declares capacity, proves liveness on a
+  // ~4h cadence (the heartbeat IS the custody lease renewal), and self-issues a
+  // daily reward metered by that evidence. See engine/content/provider-ledger.
+  | 'storage-register'
+  | 'storage-deregister'
+  | 'storage-heartbeat'
+  | 'storage-reward';
+
+/**
+ * Payload for the four `storage-*` block types. One optional object rather than
+ * six flat fields, so the storage economy stays legible next to the payment and
+ * NFT fields — `canonicalJson` sorts nested keys, so hashing stays deterministic.
+ */
+export interface StoragePayload {
+  /** register: declared capacity in GB — an upper bound offered, not usage. */
+  capacityGB?: number;
+  /** register: stable device id. Custody is per-device, not per-account. */
+  deviceId?: string;
+  /** heartbeat: current smoke/WebRTC address peers fetch blocks from. */
+  smokeAddr?: string;
+  /** heartbeat: bytes actually held right now — what the reward is metered on. */
+  storedBytes?: number;
+  /** heartbeat: ISO 3166-1 alpha-2, self-reported; feeds geographic diversity. */
+  countryCode?: string;
+  /** reward: the epoch claimed, plus the evidence its amount was derived from. */
+  epochDay?: number;
+  storedGB?: number;
+  heartbeatCount?: number;
+}
 
 /** The signed content of a block (everything except the derived root/hash/sig). */
 export interface BlockContent {
@@ -73,6 +102,9 @@ export interface BlockContent {
   recipientName?: string;
   senderPub?: Hex;
   senderName?: string;
+  // storage-*: the provider payload. `amount` (above) carries the minted
+  // milli-UNIT on a storage-reward, exactly as it carries value on a send.
+  storage?: StoragePayload;
 }
 
 export interface Block extends BlockContent {
@@ -124,6 +156,16 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
     out.senderName = c.senderName;
   } else if (c.type === 'nft-burn') {
     out.tokenId = c.tokenId;
+  } else if (
+    c.type === 'storage-register' || c.type === 'storage-deregister' || c.type === 'storage-heartbeat'
+  ) {
+    out.storage = c.storage;
+  } else if (c.type === 'storage-reward') {
+    // The claim AND the minted amount are both signed: a reward's whole security
+    // argument is that the amount can be re-derived from on-chain evidence and
+    // compared against what the signer committed to.
+    out.storage = c.storage;
+    out.amount = c.amount?.toString();
   }
   return out;
 }

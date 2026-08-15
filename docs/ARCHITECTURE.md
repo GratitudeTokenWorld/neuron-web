@@ -411,7 +411,8 @@ server-mode + content routing, deterministic relay federation/directory.
 **Current limits:** global gossiped file index replicated to every node
 ([libp2p-network.ts:236,1479](src/network/libp2p-network.ts#L236)); 100MB uploads
 crash on IDB quota ([smoke-store.ts store/cache paths]); `REDUNDANCY_TARGET=10`
-push model; DHT unused for content.
+push model; DHT unused for content. The provider **economy** is no longer a
+limit — see *What of this is implemented* below.
 
 **Target design**
 - **DHT provider records replace the global index.** On store, call
@@ -495,6 +496,44 @@ of the existing push-replication code:
 The rewards layer must follow the same rule: pay for *proven, current*
 custody, so an offline node earns nothing for bytes the network has already
 re-homed, and cannot park stale copies to farm storage rewards.
+
+#### What of this is implemented (2026-08-15)
+
+The **on-chain half** — the lease and the evidence that prices it. Four engine
+block types on the provider's own account chain (`storage-register`,
+`-deregister`, `-heartbeat`, `-reward`; payload in `block.storage`), with the
+registry, lease liveness and reward arithmetic in the pure
+`src/engine/content/provider-ledger.ts`. The **repair half** (consequences 1's
+rejoin-discard, 2's publish handoff, 3's verified-live replica counting) is not
+built yet — see CLAUDE.md → *Where to pick up*.
+
+- **The heartbeat IS the lease renewal.** `MAX_OFFLINE_MS` = 3 heartbeat
+  intervals = 12h: two missed renewals of slack, so a reboot or a flaky hour
+  costs nothing, while a departed node stops counting within half a day. Before
+  the first heartbeat the lease runs from registration. `isLive()` /
+  `liveProviders()` answer every custody question; the unfiltered
+  `getStorageProviders()` answers routing ones (an address worth trying is not
+  the same claim as a holder worth counting).
+- **Reward = f(on-chain evidence), one function.** `rewardTerms()` is used both
+  to issue a reward and to validate someone else's, so the two cannot drift —
+  the legacy code kept two copies in sync by comment. Capacity is priced as
+  declared at **epoch start** (a bump minutes before claiming pays nothing),
+  metered on bytes actually reported held, capped by that declaration, scaled by
+  counted heartbeats / 6.
+- **Rewards settle a day behind** (`claimableEpochDay`). Pricing the *running*
+  day paid whatever fraction had elapsed, and since a claim closes the epoch
+  permanently, a provider polling for eligibility every 30 min locked in 1/6 of
+  what it earned. A completed day is also the only day whose uptime is a fact.
+- **An early heartbeat is accepted and not counted — never rejected.** Rejecting
+  a validly-signed, correctly-linked block mid-chain truncates it, and every
+  later block then fails as non-sequential (the failure that made NFTs vanish on
+  reload). So heartbeat spam applies to the chain and earns nothing; safety
+  comes from the reward ceiling, which counts only renewals.
+- **Two independent guards on the mint.** A `storage-reward` is the only block
+  type that creates UNIT, and its chain stays single and valid — so neither
+  fraud proofs nor committees ever look at it. `addBlock` enforces balance
+  conservation (`balance == head.balance + amount`) *and* the evidence ceiling;
+  either alone is bypassable, and both are tested adversarially.
 
 ### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
 
@@ -653,7 +692,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 0 — Foundations | **done** | `src/engine/core` — accumulator, light-verify, identity/nullifier, attestations, partition |
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
-| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10** | backend seam done: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Still to do: the four `EngineLedger.createStorage*` `deferred()` stubs (register/deregister/**heartbeat**/reward — heartbeat *is* the lease renewal), lease+repair logic, file index → DHT, `storage-manager.ts` off the legacy `DAGLedger` |
+| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10, parity done 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Provider economy on-chain: four `storage-*` engine block types, `src/engine/content/provider-ledger.ts` (registry + **lease liveness** + reward evidence, 23 tests), reward minting guarded by balance conservation *and* an on-chain evidence ceiling (`src/ledger/storage-ledger.test.ts`, 15 tests), `storage-manager.ts` off the legacy `DAGLedger`. Still to do: repair loop, publish handoff, file index → DHT |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 41/41 |
@@ -683,14 +722,14 @@ mechanism:
 | Transfer routed to a destroyed account | stale pre-reset record survived locally and outranked the live one | generation filter at the cache boundary + relay-first username resolution + newest-registration ranking |
 | "Reset testnet" did nothing to the network | operator gate read only the same-origin relay | epoch/operator aggregation across relays + relay generation follower |
 
-Next, in order — **Phase 3 continues** (its backend seam already landed; see the
-phase table above and CLAUDE.md → *Where to pick up* for the full ordered list):
-the four `EngineLedger.createStorage*` `deferred()` stubs (heartbeat *is* the
-lease renewal), then lease+repair, publish handoff, file index → DHT, measuring
-repair-vs-churn in `sim/archival.ts`, and `storage-manager.ts` off the legacy
-`DAGLedger`. Then **Phase 4**. The migration seam (~182 app-layer type errors;
-see CLAUDE.md) can be paid down alongside, per caller, as each one is moved off
-the `DAGLedger` compatibility surface.
+Next, in order — **Phase 3 continues** (its backend seam and provider-economy
+parity have both landed; see the phase table above and CLAUDE.md → *Where to
+pick up* for the full ordered list): the repair loop on top of the lease,
+publish handoff, file index → DHT, and measuring repair-vs-churn in
+`sim/archival.ts`. Then **Phase 4**. The migration seam (~123 app-layer type
+errors; see CLAUDE.md) can be paid down alongside, per caller, as each one is
+moved off the `DAGLedger` compatibility surface — `storage-manager.ts` was
+moved this way and took the count from 182 to 123.
 
 ---
 

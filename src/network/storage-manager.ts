@@ -18,12 +18,16 @@
  */
 
 import { EventEmitter } from '../core/events';
-import { DAGLedger, StorageProvider } from '../core/dag-ledger';
+import { EngineLedger } from '../ledger/engine-ledger';
+import type { StorageProviderState as StorageProvider } from '../engine/content/provider-ledger';
 import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
 import { AccountBlock, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY, REWARD_EPOCH_MS } from '../core/dag-block';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
 import { getDeviceId, getCountryCode } from './node';
+import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
+import { claimableEpochDay } from '../engine/content/provider-ledger';
+import type { Block as EngineBlock } from '../engine/core/block';
 
 const HEARTBEAT_JITTER_MS = 5 * 60 * 1000;          // ±5 min jitter so nodes don't all fire at once
 const REWARD_CHECK_INTERVAL_MS = 30 * 60 * 1000;    // check every 30 min whether today's reward is due
@@ -99,7 +103,7 @@ export interface ReplaceRequest {
 }
 
 export class StorageManager extends EventEmitter {
-  private ledger: DAGLedger;
+  private ledger: EngineLedger;
   private net: Libp2pNetwork;
   private store: SmokeStore;
   private localKeys: Map<string, KeyPair>;
@@ -139,7 +143,7 @@ export class StorageManager extends EventEmitter {
   private startedAt = 0;
 
   constructor(
-    ledger: DAGLedger,
+    ledger: EngineLedger,
     net: Libp2pNetwork,
     store: SmokeStore,
     localKeys: Map<string, KeyPair>,
@@ -427,7 +431,7 @@ export class StorageManager extends EventEmitter {
       if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
       if (provider.lastHeartbeat === 0) continue; // never heartbeated — still in grace period
       if (Date.now() - provider.lastHeartbeat < REWARD_EPOCH_MS) continue;
-      const result = await this.ledger.createStorageDeregister(pub, keys);
+      const result = await this.ledger.createStorageDeregister(pub, engineKeysFromAppPrivate(keys.priv));
       if (result.block) {
         await this.submitBlock(result.block);
         console.log(`[StorageManager] Auto-deregistered ${pub.slice(0, 12)}… (offline >24h)`);
@@ -450,7 +454,10 @@ export class StorageManager extends EventEmitter {
     const smokeAddr = await this.store.getSmokeHostname();
     const actualStoredBytes = this.store.isStarted() ? await this.store.storageUsedBytes() : 0;
     const countryCode = await getCountryCode();
-    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr, actualStoredBytes, countryCode);
+    // localKeys holds app (WebCrypto JWK) keys; the engine signs with its own.
+    const result = await this.ledger.createStorageHeartbeat(
+      pub, engineKeysFromAppPrivate(keys.priv), smokeAddr, actualStoredBytes, countryCode,
+    );
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
@@ -494,21 +501,22 @@ export class StorageManager extends EventEmitter {
     for (const [pub, keys] of this.localKeys) {
       const provider = this.ledger.storageProviders.get(pub);
       if (!provider || provider.capacityGB === 0) continue;
-      const epochDay = Math.floor(Date.now() / REWARD_EPOCH_MS);
+      // Rewards settle a day behind — the running day's uptime isn't known yet
+      // (see claimableEpochDay). Comparing against the *current* day here would
+      // leave this polling every 30 min for a claim that is already made.
+      const epochDay = claimableEpochDay(Date.now());
       if (provider.lastRewardEpoch >= epochDay) continue;
 
-      const result = await this.ledger.createStorageReward(pub, keys);
+      const result = await this.ledger.createStorageReward(pub, engineKeysFromAppPrivate(keys.priv));
       if (!result.block) {
         // Not yet eligible (no heartbeats today, or already claimed) - log and continue
         continue;
       }
       const submitResult = await this.submitBlock(result.block);
       if (submitResult.success) {
-        try {
-          const data = JSON.parse(result.block.contractData!);
-          console.log(`[StorageManager] Reward issued: ${data.amount} milli-UNIT for ${pub.slice(0, 12)}...`);
-          this.emit('storage:reward-issued', { pub, amount: data.amount, epochDay });
-        } catch { /* ignore */ }
+        const amount = Number(result.block.amount ?? 0);
+        console.log(`[StorageManager] Reward issued: ${amount} milli-UNIT for ${pub.slice(0, 12)}...`);
+        this.emit('storage:reward-issued', { pub, amount, epochDay });
       }
     }
   }
@@ -1291,9 +1299,13 @@ export class StorageManager extends EventEmitter {
 
   // ── Block submission (via ledger + net, same as current impl) ────────────
 
-  private async submitBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.addBlock(block);
-    if (result.success) this.net.publishBlock(block);
+  private async submitBlock(block: AccountBlock | EngineBlock): Promise<{ success: boolean; error?: string }> {
+    const eb = block as unknown as EngineBlock;
+    const result = await this.ledger.addBlock(eb);
+    // Storage blocks are engine blocks now — they gossip on the engine topic, not
+    // the legacy one. `addBlock` is idempotent for a block we just created and
+    // applied locally, so this is the propagation step, not a second apply.
+    if (result.success) this.net.publishEngineBlock(eb);
     return result;
   }
 

@@ -7,6 +7,7 @@ import {
   verifyBlockSignature,
   GENESIS_PREV,
   type Block,
+  type StoragePayload,
 } from '../engine/core/block.js';
 import { AccountAccumulator } from '../engine/core/accumulator.js';
 import {
@@ -21,6 +22,10 @@ import { ValidatorRegistry } from '../engine/consensus/validators.js';
 import { EpochSeeds } from '../engine/consensus/seed.js';
 import { CommitteeFinality, type CommitteeVote, type WeightSource } from '../engine/consensus/finality.js';
 import { hashHex, utf8ToBytes, type Hex } from '../engine/core/hash.js';
+import {
+  ProviderLedger, claimableEpochDay, HEARTBEAT_INTERVAL_MS, HEARTBEAT_GRACE_MS,
+  type StorageProviderState,
+} from '../engine/content/provider-ledger.js';
 
 /**
  * Minimal signer shape the engine block builders need (compressed P-256 pub +
@@ -176,6 +181,12 @@ export class EngineLedger extends EventEmitter {
    * snapshots older than the retention window are pruned.
    */
   private epochWeightSnapshots = new Map<number, { total: number; byId: Map<string, number> }>();
+  /**
+   * Phase 3 (storage economy): provider registrations, lease liveness, and the
+   * reward evidence. Pure engine module — the ledger only signs blocks and enforces
+   * balance conservation on top of it.
+   */
+  private readonly providerLedger = new ProviderLedger();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -582,6 +593,146 @@ export class EngineLedger extends EventEmitter {
     return out;
   }
 
+  // ── Storage economy (Phase 3) ────────────────────────────────────────────────
+  //
+  // Four owner-signed block types on the provider's own chain. The heartbeat is
+  // the load-bearing one: it is the **lease renewal**, the on-chain liveness proof
+  // the whole custody model rests on ("durability is a flow" — a replica is held
+  // under a lease that expires, never owned). Reward blocks mint, so every rule
+  // that bounds the mint lives in `ProviderLedger.rewardTerms` and is enforced
+  // identically here (issuing) and in `addBlock` (accepting someone else's).
+
+  /** Declare storage capacity — registering, or revising an existing declaration. */
+  async createStorageRegister(
+    pub: string, capacityGB: number, keys: SignerKeys, deviceId?: string,
+  ): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    if (!Number.isFinite(capacityGB) || capacityGB <= 0) return { error: 'capacityGB must be a positive number' };
+    return this.appendStorageBlock(pub, keys, 'storage-register', head.balance, {
+      capacityGB,
+      ...(deviceId ? { deviceId } : {}),
+    });
+  }
+
+  /** Release the lease and leave the storage ledger. */
+  async createStorageDeregister(pub: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const provider = this.providerLedger.providers.get(pub);
+    if (!provider || provider.capacityGB <= 0) return { error: 'Not a registered storage provider' };
+    return this.appendStorageBlock(pub, keys, 'storage-deregister', head.balance, {
+      capacityGB: provider.capacityGB,
+    });
+  }
+
+  /**
+   * Renew the custody lease: the periodic proof this provider is still here and
+   * still holding what it says it holds.
+   *
+   * Refuses to build one early. `addBlock` deliberately *accepts* an early
+   * heartbeat from a peer (rejecting mid-chain would truncate their chain) and
+   * simply doesn't count it — but there is no reason for us to emit one, and the
+   * error tells the caller when to come back.
+   */
+  async createStorageHeartbeat(
+    pub: string, keys: SignerKeys, smokeAddr?: string, storedBytes?: number, countryCode?: string,
+  ): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const provider = this.providerLedger.providers.get(pub);
+    if (!provider || provider.capacityGB <= 0) return { error: 'Not a registered storage provider' };
+    const now = Date.now();
+    if (!this.providerLedger.countsAsRenewal(pub, now)) {
+      const dueIn = provider.lastHeartbeat + HEARTBEAT_INTERVAL_MS - HEARTBEAT_GRACE_MS - now;
+      return { error: `Heartbeat interval not reached (next in ${Math.ceil(dueIn / 60_000)}min)` };
+    }
+    return this.appendStorageBlock(pub, keys, 'storage-heartbeat', head.balance, {
+      ...(smokeAddr ? { smokeAddr } : {}),
+      ...(typeof storedBytes === 'number' ? { storedBytes } : {}),
+      ...(countryCode ? { countryCode } : {}),
+    });
+  }
+
+  /**
+   * Self-issue the day's storage reward. The amount is not a choice: it is derived
+   * from on-chain evidence (capacity declared at epoch start, counted heartbeats,
+   * bytes actually reported held) by the same function every other node uses to
+   * check it.
+   */
+  async createStorageReward(pub: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
+    const epochDay = claimableEpochDay(Date.now());
+    const terms = this.providerLedger.rewardTerms(pub, epochDay);
+    if (typeof terms === 'string') return { error: `Storage reward: ${terms}` };
+    return this.appendStorageBlock(
+      pub, keys, 'storage-reward', head.balance + BigInt(terms.amount),
+      { epochDay, storedGB: terms.storedGB, heartbeatCount: terms.heartbeatCount },
+      BigInt(terms.amount),
+    );
+  }
+
+  /** Sign, apply, and index one storage block on the account's own chain. */
+  private appendStorageBlock(
+    pub: string, keys: SignerKeys, type: Block['type'], balance: bigint,
+    storage: StoragePayload, amount?: bigint,
+  ): { block?: Block; error?: string } {
+    const head = this.getAccountHead(pub)!;
+    const h = this.held.get(pub)!;
+    const block = createBlock(
+      {
+        accountId: pub, index: head.index + 1, type, previousHash: head.hash, shard: head.shard,
+        timestamp: Date.now(), balance, storage, ...(amount !== undefined ? { amount } : {}),
+      },
+      keys.priv,
+      h.acc,
+    );
+    h.chain.push(block);
+    this.allBlocks.set(block.hash, block);
+    this.providerLedger.apply(block, Date.now());
+    this.emitStorageEvent(block);
+    this.emit('block:added', block);
+    this.emit('block:confirmed', block);
+    return { block };
+  }
+
+  /** DAGLedger-compatible storage events — StorageManager listens for these. */
+  private emitStorageEvent(block: Block): void {
+    switch (block.type) {
+      case 'storage-register':
+        this.emit('storage:registered', { pub: block.accountId, capacityGB: block.storage?.capacityGB ?? 0 });
+        break;
+      case 'storage-deregister':
+        this.emit('storage:deregistered', { pub: block.accountId });
+        break;
+      case 'storage-heartbeat':
+        this.emit('storage:heartbeat', { pub: block.accountId, timestamp: block.timestamp });
+        break;
+      case 'storage-reward':
+        this.emit('storage:reward', {
+          pub: block.accountId,
+          amount: Number(block.amount ?? 0n),
+          epochDay: block.storage?.epochDay ?? 0,
+        });
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Is this provider's custody lease live right now? (Never "did it once register".) */
+  isProviderLive(pub: string, now = Date.now()): boolean {
+    return this.providerLedger.isLive(pub, now);
+  }
+
+  /** Providers whose lease is live — the only ones that may count toward redundancy. */
+  liveStorageProviders(now = Date.now()): StorageProviderState[] {
+    return this.providerLedger.liveProviders(now);
+  }
+
   // ── Applying remote blocks (from the network) ────────────────────────────────
 
   /**
@@ -684,6 +835,22 @@ export class EngineLedger extends EventEmitter {
         if (!block.tokenId) return { success: false, error: 'nft-burn missing token' };
         if (this.nftOwner.get(block.tokenId) !== block.accountId) return { success: false, error: 'nft-burn: not the owner' };
       }
+      // Storage economy. Balance conservation FIRST and separately from the
+      // provider rules: a storage-reward is the one block type that mints, so
+      // without this arithmetic a validly-signed reward block could name any
+      // balance it liked. Nothing else in the stack catches it — the chain is
+      // single and valid, so neither fraud proofs nor committees ever look.
+      if (block.type === 'storage-register' || block.type === 'storage-deregister' || block.type === 'storage-heartbeat') {
+        if (block.balance !== head.balance) return { success: false, error: `${block.type} must preserve balance` };
+      }
+      if (block.type === 'storage-reward') {
+        if (block.amount === undefined || block.amount <= 0n) return { success: false, error: 'storage-reward amount must be positive' };
+        if (block.balance !== head.balance + block.amount) return { success: false, error: 'storage-reward balance inconsistent' };
+      }
+      if (block.type.startsWith('storage-')) {
+        const err = this.providerLedger.validate(block, Date.now());
+        if (err) return { success: false, error: err };
+      }
     }
     if (h.acc.rootWithHex(block.hash) !== block.accumulatorRoot) return { success: false, error: 'accumulator root mismatch' };
     h.acc.append(block.hash);
@@ -707,6 +874,9 @@ export class EngineLedger extends EventEmitter {
       this.applyNftReceive(block);
     } else if (block.type === 'nft-burn') {
       this.applyNftBurn(block);
+    } else if (block.type.startsWith('storage-')) {
+      this.providerLedger.apply(block, Date.now());
+      this.emitStorageEvent(block);
     }
     this.allBlocks.set(block.hash, block);
     this.appliedAt.set(block.hash, Date.now());  // foreign block enters the challenge window
@@ -1054,8 +1224,14 @@ export class EngineLedger extends EventEmitter {
   get accounts(): Map<string, LedgerAccount> {
     return this.accountsByPub;
   }
-  /** Deferred: storage-provider economy. */
-  readonly storageProviders = new Map<string, unknown>();
+  /**
+   * Live provider profiles by pub. Exposed as the underlying map (not a copy)
+   * because StorageManager writes off-chain telemetry — latency, spot-check
+   * results, observed bytes — onto these objects in place.
+   */
+  get storageProviders(): Map<string, StorageProviderState> {
+    return this.providerLedger.providers;
+  }
   /** Deferred: smart contracts. */
   readonly contracts = new Map<string, unknown>();
   /** Deferred: fork voting (optimistic confirmation is used). */
@@ -1079,8 +1255,18 @@ export class EngineLedger extends EventEmitter {
     }
     return 'confirmed';
   }
-  getStorageProviders(): unknown[] {
-    return [];
+  /**
+   * Registered providers, best score first — the selection pool.
+   *
+   * Deliberately NOT lease-filtered: callers such as `buildFallbackAddrs` want
+   * every address worth trying, and StorageManager applies its own warmup-aware
+   * staleness rule (right after start it hasn't heard a heartbeat cycle yet, so a
+   * live provider loaded from disk looks stale). Use `liveStorageProviders()` when
+   * the question is custody — anything that counts replicas toward a redundancy
+   * target must count only live leases.
+   */
+  getStorageProviders(): StorageProviderState[] {
+    return this.providerLedger.allProviders();
   }
   getMaxAccountsPerFace(): number {
     return this.network === 'mainnet' ? 1 : 3;
@@ -1091,23 +1277,53 @@ export class EngineLedger extends EventEmitter {
   estimateBlockchainSizeBytes(): number {
     return this.allBlocks.size * 600;
   }
-  countHeartbeatsLast24h(): number {
-    return 0;
+  countHeartbeatsLast24h(pub: string, refTime = Date.now()): number {
+    return this.providerLedger.countHeartbeatsLast24h(pub, refTime);
   }
   getBlocksSince(): Block[] {
     return [];
   }
-  checkPublishFeasibility(): { feasible: boolean; reason?: string } {
-    return { feasible: true };
+  /**
+   * Can the network actually take custody of a file of this size right now?
+   *
+   * Counts only providers with a LIVE lease and enough free space — declared
+   * capacity from a node that stopped heartbeating yesterday is not somewhere
+   * content can live. This is the check the publish handoff hangs off: a publish
+   * is not complete until minimum replicas confirm.
+   */
+  checkPublishFeasibility(fileSizeBytes: number, minCopies = 2): {
+    feasible: boolean;
+    providersWithCapacity: number;
+    activeProviders: number;
+    warning?: string;
+  } {
+    // "Active" is the LEASE, not a 24h heartbeat window: a provider that stopped
+    // renewing is not somewhere content can live, whatever it once declared.
+    const live = this.providerLedger.liveProviders(Date.now());
+    const withSpace = live.filter(p => this.providerLedger.freeBytes(p.pub) >= fileSizeBytes);
+    const feasible = withSpace.length >= minCopies;
+    return {
+      feasible,
+      providersWithCapacity: withSpace.length,
+      activeProviders: live.length,
+      warning: feasible ? undefined
+        : `Only ${withSpace.length} live provider(s) have enough free space (need ≥ ${minCopies} for redundancy). Upload may not be fully replicated.`,
+    };
   }
   castVote(): void {
     /* optimistic confirmation — no fork voting in this slice */
   }
   processConflicts(): void {}
-  refreshHeartbeatCounts(): void {}
-  updateProviderScore(): void {}
+  /** Recompute 24h heartbeat counts against the wall clock. Call after a chain replay. */
+  refreshHeartbeatCounts(): void {
+    this.providerLedger.refresh(Date.now());
+  }
+  updateProviderScore(provider: StorageProviderState): void {
+    this.providerLedger.updateScore(provider);
+  }
   purgeAccount(pub: string): void {
     this.held.delete(pub);
+    this.providerLedger.providers.delete(pub);
     const acc = this.accountsByPub.get(pub);
     if (acc) this.usernameToPub.delete(acc.username);
     this.accountsByPub.delete(pub);
@@ -1127,6 +1343,7 @@ export class EngineLedger extends EventEmitter {
     this.allBlocks.clear();
     this.equivocated.clear();
     this.appliedAt.clear();
+    this.providerLedger.clear();
     this.validatorRegistry = new ValidatorRegistry(MINT);
     this.seeds = new EpochSeeds();
     this.epoch = 0;
@@ -1141,17 +1358,5 @@ export class EngineLedger extends EventEmitter {
   }
   createCall(): { error: string } {
     return this.deferred('Contracts');
-  }
-  createStorageRegister(): { error: string } {
-    return this.deferred('Storage providers');
-  }
-  createStorageDeregister(): { error: string } {
-    return this.deferred('Storage providers');
-  }
-  createStorageHeartbeat(): { error: string } {
-    return this.deferred('Storage providers');
-  }
-  createStorageReward(): { error: string } {
-    return this.deferred('Storage providers');
   }
 }

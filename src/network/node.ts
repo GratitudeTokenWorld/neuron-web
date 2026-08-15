@@ -1028,7 +1028,9 @@ export class NeuronNode extends EventEmitter {
 
   /** Register as a storage provider. capacityGB = 0 deregisters. */
   async registerStorage(pub: string, capacityGB: number, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.createStorageRegister(pub, capacityGB, keys, getDeviceId());
+    const result = await this.ledger.createStorageRegister(
+      pub, capacityGB, engineKeysFromAppPrivate(keys.priv), getDeviceId(),
+    );
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
@@ -1049,7 +1051,7 @@ export class NeuronNode extends EventEmitter {
 
   /** Deregister from the storage ledger entirely. */
   async deregisterStorage(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.createStorageDeregister(pub, keys);
+    const result = await this.ledger.createStorageDeregister(pub, engineKeysFromAppPrivate(keys.priv));
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {

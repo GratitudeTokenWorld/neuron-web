@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **270 tests / 58 files passing**, `npm run build` clean.
+Current baseline: **308 tests / 60 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -52,31 +52,50 @@ storage backend split: `BlockBackend` + `MemoryBackend`
 disk), and `src/storage/fs-backend.ts` is the filesystem adapter (own
 `tsconfig.storage.json`, inside `npm run typecheck`).
 
+**Step 1 (parity) is DONE — 2026-08-15.** The four `createStorage*` methods are
+real: storage blocks are engine block types (`storage-register` /
+`-deregister` / `-heartbeat` / `-reward`, payload in `block.storage`), and the
+provider registry, lease liveness and reward evidence live in the pure
+`src/engine/content/provider-ledger.ts`. `storage-manager.ts` is **off the
+legacy `DAGLedger`** — it takes an `EngineLedger` and gossips storage blocks on
+the engine topic. Three things there are load-bearing and were decided, not
+inherited:
+
+- **The heartbeat is the lease renewal.** `isLive()` / `liveStorageProviders()`
+  answer custody questions; `getStorageProviders()` (unfiltered) answers routing
+  ones. `MAX_OFFLINE_MS` = 3 heartbeat intervals = 12h.
+- **An early heartbeat is accepted and not counted, never rejected.** Rejecting
+  a validly-signed block mid-chain truncates it and strands every later block as
+  non-sequential — the failure that made NFTs vanish on reload. Safety comes
+  from the reward ceiling, which only counts renewals.
+- **Rewards settle a day behind** (`claimableEpochDay`). Pricing the running day
+  paid whatever fraction had elapsed, and a claim closes the epoch for good — so
+  a provider polling every 30 min locked in 1/6 of what it earned.
+
 **What remains, in this order** — the decisions in *Storage custody rules*
 below constrain all of it:
 
-1. **Parity:** the four `EngineLedger.createStorage*` `deferred()` stubs
-   (register / deregister / **heartbeat** / reward). `createStorageHeartbeat`
-   *is* the lease renewal — the on-chain liveness proof the custody model rests
-   on, not just a parity item.
-2. **Lease + repair** on top of heartbeat: `MAX_OFFLINE`, rejoin discard +
-   refill from declared capacity, and counting only *verified-live* replicas
-   toward `REDUNDANCY_TARGET`.
-3. **Publish handoff:** a publish is incomplete until minimum replicas confirm;
+1. **Lease + repair** on top of heartbeat: rejoin discard + refill from declared
+   capacity, and counting only *verified-live* replicas toward
+   `REDUNDANCY_TARGET`. The lease half exists (`isLive`, `MAX_OFFLINE_MS`); the
+   repair half does not, and `StorageManager.deregisterStaleLocalProviders`
+   still uses its own 24h rule rather than the lease.
+2. **Publish handoff:** a publish is incomplete until minimum replicas confirm;
    until then the uploader's copy is staging and must be retried, or closing
-   the tab destroys the content.
-4. **File index → DHT provider records** — the remaining `O(N)` violation in
+   the tab destroys the content. `checkPublishFeasibility` is real now (it
+   counts live leases with free space) but only *warns*.
+3. **File index → DHT provider records** — the remaining `O(N)` violation in
    storage (a global gossiped file index today).
-5. **Measure repair-rate vs churn** in `src/engine/sim/archival.ts`: it models
+4. **Measure repair-rate vs churn** in `src/engine/sim/archival.ts`: it models
    assignment and churn but NOT lease expiry/repair, so "durability is a flow"
    is currently asserted, not measured.
-6. **S3 client adapter** — opt-in, operator-configured, never a default.
-7. **TESTPLAN T8 (storage)** — write it *with* the parity work; today it would
-   only test stubs returning errors.
+5. **S3 client adapter** — opt-in, operator-configured, never a default.
+6. **TESTPLAN T8 (storage)** — the parity work is testable end-to-end now
+   (register → heartbeat → reward → deregister across two devices).
 
-`storage-manager.ts` (1379 lines) is still fully on the legacy `DAGLedger` and
-has more callers than the ledger did — enumerate them before changing what it
-broadcasts (see the free-rider trap below).
+`storage-manager.ts` (1379 lines) has more callers than the ledger did —
+enumerate them before changing what it broadcasts (see the free-rider trap
+below).
 
 ### Storage custody rules (decided; they constrain Phase 3)
 
@@ -184,7 +203,8 @@ src/
                    counterparty-proof (G2 transfer + mint proofs)
     node/          partial replication, delta sync, archival tiering, snapshots
     consensus/     VRF (RFC 9381), sortition, committees, weight, slashing, fraud
-    content/       CIDs, chunking, provider DHT, replication
+    content/       CIDs, chunking, provider DHT, replication, block backends,
+                   provider-ledger (storage registry + custody LEASE + rewards)
     economy/       capped reward inflation
     net/           relay federation (rendezvous hashing)
     sim/           scale-invariant harness: scenario (interest routing),
@@ -211,15 +231,16 @@ the single most important thing to know about the codebase:
   `src/storage` is the one place `node:*` imports are legitimate, so it has its
   own `tsconfig.storage.json` with node types). It does NOT cover the app layer:
   running `tsc -p tsconfig.json`
-  surfaces ~180 errors in `main.ts`, `node.ts`, `neuronchain-api.ts` — the app layer
+  surfaces ~123 errors in `main.ts`, `node.ts`, `neuronchain-api.ts` — the app layer
   still speaks the legacy `AccountBlock`/`Account` shapes while the engine speaks
   `Block`/`LedgerAccount` (`accountPub` vs `accountId` + `shard` + `accumulatorRoot`).
   Vite does not typecheck, so this builds and runs anyway. **Type errors in app files
-  are not proof your change is wrong — but never add new ones.**
-- `storage-manager.ts` is still fully on the legacy `DAGLedger`; the matching
-  `createStorage*` methods on `EngineLedger` are deliberate `deferred()` stubs.
-  Contracts are stubbed too and are **out of scope by design** (no general VM —
-  see ARCHITECTURE.md).
+  are not proof your change is wrong — but never add new ones.** (Take a per-file
+  count before and after: the total dropping does not prove your file didn't gain
+  errors. Storage parity cut it 182 → 123 while adding four in `storage-manager`.)
+- Contracts remain deliberate `deferred()` stubs and are **out of scope by
+  design** (no general VM — see ARCHITECTURE.md). Storage no longer is:
+  `storage-manager.ts` runs on `EngineLedger` as of 2026-08-15.
 - `EngineLedger` carries a "DAGLedger compatibility surface" (`allBlocks`, `accounts`,
   `votes`, no-op `castVote`, …) so app code can treat it like the old ledger. When you
   migrate a caller, prefer deleting its use of that surface over extending it.

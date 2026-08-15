@@ -58,7 +58,7 @@ src/
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
 - **Engine** (`src/engine/` + `src/ledger/`) — phases 0–2 done, Phase 2 consensus
   (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
-  **270 tests passing, engine + storage typechecked**, all 7 scale-invariants
+  **308 tests passing, engine + storage typechecked**, all 7 scale-invariants
   demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
   `EngineLedger` (`src/network/node.ts`).
 - **Scale invariant restored** — three `O(N)` violations closed. G1 + G2
