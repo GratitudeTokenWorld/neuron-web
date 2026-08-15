@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 244 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 260 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
@@ -842,7 +842,7 @@ silently overloading validators.
 > manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network,
 > including the NFT round trip through the proof path).
 > Payments **and NFTs** now claim via proof packets — no counterparty chain is
-> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (30 checks
+> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (38 checks
 > — run it after every relay deploy).
 
 **G3 — the global `keyblobs` topic (found and closed 2026-08-15, with the v3

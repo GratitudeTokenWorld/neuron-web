@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **244 tests / 55 files passing**, `npm run build` clean.
+Current baseline: **260 tests / 57 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -65,7 +65,7 @@ Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
   chain is held at all.
 
 TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
-`npx tsx scripts/g1-resolve-smoke.mts` (30 checks) after every relay deploy.
+`npx tsx scripts/g1-resolve-smoke.mts` (38 checks) after every relay deploy.
 
 **Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
 `src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`
@@ -206,12 +206,30 @@ Changes here need adversarial tests, not just happy-path ones.
   `POST /recovery-share/release` to a live face the relay itself matches, under
   server-side exponential backoff — the one rate limit a client wipe cannot
   reset. Devices cache the share after proving themselves (pin-crypto IDB), so
-  relays are needed for *fresh-device recovery only*, not daily use. Rogue-relay
-  blast radius = the old v2 bar (share+blob still needs the PIN). The keyblobs
+  relays are needed for *fresh-device recovery only*, not daily use. The keyblobs
   gossip topic is REMOVED (it broadcast every blob to every node — O(N) and a
   harvesting surface); blobs move via `POST/GET /keyblob` only. Never put the
   biometric in the public account record under any single factor, and never
   create new v2 blobs.
+- **The share is Shamir 2-of-n across the attesters** (`src/core/shamir.ts`), so
+  no single relay holds the third factor at all — a rogue/compromised/subpoenaed
+  relay learns nothing from its own disk, and an attacker must pass TWO
+  face-gated, backoff-limited releases. Any 2 of n reconstruct, so one-relay-down
+  recovery still works (dev has 3 attesters: 2 cloud + the auto-spawned local
+  dev relay — which is also why account creation logs 3 attestations). The
+  x-coordinate is inside the signed store payload; shares from different splits
+  combine into silent garbage, hence the same-`ts` guard client-side. A single
+  reachable relay falls back to a legacy full-secret record.
+- **Release requires a trajectory proof, not a descriptor** (`recovery-challenge.ts`,
+  pure + vitest-pinned because relay/server.ts is covered by nothing). The relay
+  draws an ordered 3-of-5 action sequence per attempt; the client submits its
+  detector's own peak ratios, timestamps and a per-action descriptor, and the
+  relay checks order, ratio floor, human pacing, and that EVERY descriptor
+  matches the account's nid. This kills the still-photo attack and stolen-session
+  replay. **Documented ceiling:** the numbers are client-computed, so custom
+  tooling around a photo-derived descriptor can still fabricate them — closing
+  that needs the verifier to see trusted sensor data (heavy). Do not describe
+  this gate as liveness-proof; it raises cost, it does not prove personhood.
 - **Neither descriptor spread nor luma separates good lighting from bad — the
   cross-session distance is the only number that decides recoverability.**
   Measured 2026-08-15, same face and camera: a dim room lit by a phone flashlight

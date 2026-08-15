@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 244-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 260-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
@@ -191,12 +191,16 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 ## T5 — Recovery after wipe (redundant durability)
 
 > **Changed by the v3 custody split (2026-08-15) — the whole flow needs a
-> re-run.** Accounts are now sealed under face+PIN+**recovery share**; the share
-> lives only on the relays and is released by `POST /recovery-share/release`
-> after the RELAY matches the live face, under server-side exponential backoff.
-> The old keyblobs gossip is gone: the blob arrives via `GET /keyblob`. Watch
-> the relay log during recovery — expect `[Recovery] share released acct=…`
-> (and `[Recovery] release DENIED … fails=N` on a wrong face).
+> re-run.** Accounts are sealed under face+PIN+**recovery share**; the share is
+> **Shamir 2-of-n across the attesters**, so recovery must satisfy **two**
+> relays. Each draws its OWN ordered action sequence
+> (`POST /recovery-share/challenge`) and the capture performs both back to back
+> in one presence-guarded session — so on a fresh device expect a **longer
+> sequence than enrollment** (setup + 3 actions per relay + 3 capture samples),
+> with the drawn sequences written to the app log. The old keyblobs gossip is
+> gone: the blob arrives via `GET /keyblob`. Watch the relay logs — expect
+> `[Recovery] share released acct=… x=N` on both, and
+> `[Recovery] release DENIED … (trajectory rejected: …)` on a refused attempt.
 
 1. Browser B: note bob's balance. Wipe site data completely (DevTools → Application
    → Clear storage), or use a third profile.
@@ -211,6 +215,14 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
      face does not match this account", relay logs `release DENIED`, and after
      3+ attempts the relay answers with a lockout (`locked - try again in Ns`) —
      wiping the browser must NOT reset that timer (it lives on the relay).
+   - **Photo release (the attack the trajectory gate closes):** hold a printed
+     or on-screen photo of bob and attempt recovery with the right PIN. It should
+     fail at the capture stage (the depth sweep or an expression it cannot
+     perform); if a photo ever gets past the client, the relay must still refuse
+     with `trajectory rejected: …`. **Pass:** no share released, either way.
+   - **One relay down still recovers** (Shamir any-2-of-3): stop one cloud relay,
+     recover — the local dev relay + the remaining cloud relay supply the two
+     shares. **Pass:** recovery completes.
    - PIN-only offline attack is dead by construction (pinned by the v2-control
      test in `src/core/face-match.test.ts`) — nothing to test manually.
 3. **PIN change / face change on a fresh device** (v3): both require the cached
@@ -295,7 +307,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 covers everything about the archive API that does *not* need a face:
 
 ```sh
-npx tsx scripts/g1-resolve-smoke.mts    # 30 checks; expect ALL CHECKS PASSED
+npx tsx scripts/g1-resolve-smoke.mts    # 38 checks; expect ALL CHECKS PASSED
 ```
 
 It publishes a signed account record and a real signed sender chain to relay-1

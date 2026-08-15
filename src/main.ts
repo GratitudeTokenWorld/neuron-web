@@ -6,9 +6,10 @@ import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
 import { bakedBootstrapAddrs, peerIdFromMultiaddr } from './network/libp2p-network';
-import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, captureFaceDescriptor, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey, deriveTripleKey, generateRecoveryShare } from './core/face-store';
-import { storeRecoveryShare, releaseRecoveryShare } from './network/recovery-share';
+import { storeRecoveryShare, releaseRecoveryShare, fetchRecoveryChallenges, type RelayRecoveryChallenge } from './network/recovery-share';
+import type { TrajectoryProof, ActionProof, RecoveryAction } from './core/recovery-challenge';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
 import { sign as engineSignRecord } from './engine/core/keys';
@@ -1154,6 +1155,90 @@ async function challengeAndCapture(
   return { faceMap };
 }
 
+/**
+ * Recovery capture with per-relay trajectory proofs (v3 hardening).
+ *
+ * Differs from `challengeAndCapture` in one way that matters: the action
+ * sequences are DICTATED BY THE RELAYS, not drawn locally, and each action's
+ * detector numbers + a fresh descriptor are recorded so each relay can verify
+ * its own ordered draw (src/core/recovery-challenge.ts). A still photo cannot
+ * produce the expression deltas; a stolen packet cannot match a fresh draw.
+ *
+ * All relays' sequences run in ONE camera session under ONE presence guard —
+ * two sessions would mean two independent liveness runs to splice, and the
+ * shared guard is what ties every proof to the same continuously-present face.
+ * Setup (framing, 3D depth sweep, one-face check, neutral baseline) runs first
+ * exactly as in enrollment, and the neutral descriptor is captured there.
+ */
+async function recoveryProofCapture(
+  video: HTMLVideoElement,
+  challenges: readonly RelayRecoveryChallenge[],
+): Promise<{ proofs: Map<string, TrajectoryProof>; faceMap: import('./core/face-verify').FaceMap } | { failure: FaceCaptureFailure }> {
+  const presence = newPresenceGuard();
+  const totalSteps = challenges.reduce((n, c) => n + c.sequence.length, 0) + 2; // setup + actions + capture
+
+  setCaptureSteps(0, 0);
+  const setup = await calibrateNeutral(video, cue => renderCaptureCue(cue), presence);
+  if (!setup.ok) {
+    addLog(`FaceID: setup failed (${setup.reason})`, 'error');
+    return { failure: setup.reason === 'presence' ? { kind: 'presence' } : { kind: 'setup', reason: setup.reason } };
+  }
+  setCaptureSteps(1, 1);
+
+  // Neutral descriptor: the relaxed-face anchor every relay compares against.
+  const neutralShot = await captureFaceDescriptor(video);
+  if (neutralShot === 'multi' || !neutralShot) {
+    addLog('FaceID: could not capture the neutral reference', 'error');
+    return { failure: neutralShot === 'multi' ? { kind: 'setup', reason: 'multi-face' } : { kind: 'capture' } };
+  }
+
+  const proofs = new Map<string, TrajectoryProof>();
+  let step = 1;
+  for (const ch of challenges) {
+    const actions: ActionProof[] = [];
+    for (const action of ch.sequence) {
+      let peak = 0;
+      const done = await detectChallenge(
+        video, action as unknown as ChallengeAction, 12000,
+        cue => renderCaptureCue(cue), presence, setup.neutral,
+        (ratio) => { peak = ratio; },
+      );
+      if (!done) {
+        addLog(`FaceID: ${presence.lost ? 'out of frame or too dark' : `challenge "${action}" not detected`}`, 'error');
+        return { failure: presence.lost ? { kind: 'presence' } : { kind: 'challenge', action } };
+      }
+      // Descriptor at the pass moment — proves the SAME person performed it.
+      const shot = await captureFaceDescriptor(video);
+      if (shot === 'multi') return { failure: { kind: 'setup', reason: 'multi-face' } };
+      if (!shot) return { failure: { kind: 'capture' } };
+      actions.push({ action, ratio: peak, t: Date.now(), descriptor: shot.data });
+
+      setCaptureSteps(++step, step);
+      renderCaptureCue({ label: 'Relax your face', guide: 'hold', left: 0, right: 0 });
+      if (!await holdPresence(video, 1000, presence, cue => renderCaptureCue(cue))) {
+        addLog('FaceID: out of frame or too dark between checks', 'error');
+        return { failure: { kind: 'presence' } };
+      }
+    }
+    proofs.set(ch.base, { neutralDescriptor: neutralShot.data, actions });
+  }
+
+  // Finally the 3-sample enrollment capture: this is the descriptor that
+  // unlocks the blob locally (the biometric gate in recoverKeysWithFace).
+  const faceMap = await enrollFace(video, (_s, _t, cue) => renderCaptureCue(cue), presence);
+  if (faceMap === 'low-quality') {
+    addLog('FaceID: capture quality too poor (samples disagree — add light, hold still)', 'error');
+    return { failure: { kind: 'quality' } };
+  }
+  if (!faceMap) {
+    addLog(`FaceID: ${presence.lost ? 'out of frame or too dark during capture' : 'capture failed'}`, 'error');
+    return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
+  }
+  setCaptureSteps(totalSteps);
+  await new Promise(resolve => setTimeout(resolve, CAPTURE_DONE_DWELL_MS));
+  return { proofs, faceMap };
+}
+
 // Close modal via X button
 $('#cameraModalClose').addEventListener('click', () => {
   hideCameraModal();
@@ -2168,16 +2253,21 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // blob without a releasable share is unrecoverable by construction. The
     // attesters were just reached for the attestations, so the same bases and
     // the same quorum requirement apply.
+    // Shamir-split across every attester we reached (2-of-n), so no single
+    // relay holds the third factor, then require ≥REQUIRED_ATTESTERS accepted —
+    // a v3 blob whose share can't be reconstructed later is unrecoverable by
+    // construction, and k=2 needs two releasable custodians.
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Storing recovery share with attesters...</span>';
     const recoveryShare = generateRecoveryShare();
     const shareBases = [...new Set(pendingChallenges.map(c => c.faceVerifyBase))];
-    const sharesStored = await storeRecoveryShare(shareBases, accountId, node.ledger.network, recoveryShare, engineKeys.priv);
-    if (sharesStored < REQUIRED_ATTESTERS) {
-      addLog(`Recovery: share stored on ${sharesStored}/${REQUIRED_ATTESTERS} relays — aborting creation`, 'error');
+    const shareResult = await storeRecoveryShare(shareBases, accountId, node.ledger.network, recoveryShare, engineKeys.priv);
+    if (shareResult.stored < REQUIRED_ATTESTERS) {
+      addLog(`Recovery: share stored on ${shareResult.stored}/${REQUIRED_ATTESTERS} relays (${shareResult.mode}) — aborting creation`, 'error');
       toast('Could not store recovery share on enough relays', 'error');
-      statusEl.innerHTML = `<span style="color:var(--danger)">The recovery share reached only ${sharesStored}/${REQUIRED_ATTESTERS} relays. Without it a wiped device could never recover this account, so creation was aborted. Check relay connectivity and try again.</span>`;
+      statusEl.innerHTML = `<span style="color:var(--danger)">The recovery share reached only ${shareResult.stored}/${REQUIRED_ATTESTERS} relays. Without it a wiped device could never recover this account, so creation was aborted. Check relay connectivity and try again.</span>`;
       restoreCreateBtn(); return;
     }
+    addLog(`Recovery: share ${shareResult.mode === 'shamir' ? `2-of-${shareResult.stored} split` : 'stored'} across ${shareResult.stored} relay(s)`, 'success');
 
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Encrypting keys with face + PIN + share...</span>';
     const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin, accountId, recoveryShare);
@@ -2378,41 +2468,72 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // bin. Averaging still matters because the live scan is the biometric GATE
     // (compareFaces vs the stored canonical), and a single frame is far noisier
     // than a 3-sample mean — it spends match budget for nothing.
-    const capturedR = await challengeAndCapture(video);
-    hideCameraModal();
-    if ('failure' in capturedR) {
-      toast(capturedR.failure.kind === 'presence' ? 'Out of frame / Too dark!'
-        : capturedR.failure.kind === 'quality' ? 'Not enough light — face not captured cleanly' : 'Face check failed', 'error');
-      statusEl.innerHTML = faceCaptureErrorHtml(capturedR.failure);
-      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
-    }
-    const faceMap = capturedR.faceMap;
-
-    // v3: obtain the recovery share — the factor that is deliberately NOT in
-    // the blob. Cached on a device that already proved itself; otherwise
-    // released by a relay after IT matches the live face against the enrolled
-    // identity, under server-side backoff. The release uses the descriptor the
-    // liveness sequence just produced, so the relay sees the same face the
-    // local gate is about to check.
+    // v3: the share is the factor deliberately NOT in the blob. A device that
+    // already proved itself has it cached; otherwise the relays release it —
+    // each after verifying ITS OWN server-drawn action sequence (which is why
+    // the challenges must be fetched BEFORE the camera runs) and matching every
+    // descriptor in the proof to the enrolled identity, under server-side
+    // backoff. With Shamir 2-of-n we must satisfy two relays, so both sequences
+    // run back-to-back in one presence-guarded session.
     let recoveryShare: Uint8Array | undefined;
-    if (blob.pinVersion === 3) {
-      recoveryShare = (await getCachedRecoveryShare(blob.pub)) ?? undefined;
-      if (!recoveryShare) {
-        statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Requesting recovery share from relays...</span>';
-        const released = await releaseRecoveryShare(
-          node.relayHttpBases(), blob.pub, node.ledger.network, faceMap.canonical,
-        );
-        if (!released.ok) {
-          const lockMsg = released.retryAfterS
-            ? ` The relay has locked further attempts for ${released.retryAfterS}s (server-side backoff).`
-            : '';
-          addLog(`Recovery: share release refused — ${released.reason}`, 'error');
-          toast('Relays refused to release the recovery share', 'error');
-          statusEl.innerHTML = `<span style="color:var(--danger)">No relay released the recovery share: ${escHtml(released.reason)}.${lockMsg}</span>`;
-          finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
-        }
-        recoveryShare = released.share;
+    let challenges: RelayRecoveryChallenge[] = [];
+    const needsRelease = blob.pinVersion === 3 && !(recoveryShare = (await getCachedRecoveryShare(blob.pub)) ?? undefined);
+    if (needsRelease) {
+      setCameraStatus('<span class="spinner"></span> Asking relays for recovery challenges...');
+      challenges = await fetchRecoveryChallenges(node.relayHttpBases(), node.ledger.network);
+      if (!challenges.length) {
+        hideCameraModal();
+        addLog('Recovery: no relay issued a recovery challenge', 'error');
+        toast('No relay is reachable for recovery', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">No relay issued a recovery challenge — the network is unreachable, or these relays predate the recovery-share release endpoint. Check connectivity and retry.</span>';
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
       }
+      addLog(`Recovery: ${challenges.length} relay challenge(s): ${challenges.map(c => c.sequence.join('→')).join(' | ')}`, 'info');
+    }
+
+    // The two capture helpers return different success shapes, so the proofs
+    // are pulled out where each call site knows its own type — narrowing a
+    // union of the two afterwards degrades `proofs` to `{}`.
+    let captureProofs: Map<string, TrajectoryProof> | null = null;
+    let faceMap: import('./core/face-verify').FaceMap;
+    if (needsRelease) {
+      const r = await recoveryProofCapture(video, challenges);
+      hideCameraModal();
+      if ('failure' in r) {
+        toast(r.failure.kind === 'presence' ? 'Out of frame / Too dark!'
+          : r.failure.kind === 'quality' ? 'Not enough light — face not captured cleanly' : 'Face check failed', 'error');
+        statusEl.innerHTML = faceCaptureErrorHtml(r.failure);
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+      }
+      captureProofs = r.proofs;
+      faceMap = r.faceMap;
+    } else {
+      const r = await challengeAndCapture(video);
+      hideCameraModal();
+      if ('failure' in r) {
+        toast(r.failure.kind === 'presence' ? 'Out of frame / Too dark!'
+          : r.failure.kind === 'quality' ? 'Not enough light — face not captured cleanly' : 'Face check failed', 'error');
+        statusEl.innerHTML = faceCaptureErrorHtml(r.failure);
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+      }
+      faceMap = r.faceMap;
+    }
+
+    if (needsRelease && captureProofs) {
+      statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Requesting recovery share from relays...</span>';
+      const released = await releaseRecoveryShare(
+        challenges, captureProofs, blob.pub, node.ledger.network,
+      );
+      if (!released.ok) {
+        const lockMsg = released.retryAfterS
+          ? ` The relay has locked further attempts for ${released.retryAfterS}s (server-side backoff — clearing browser data does not reset it).`
+          : '';
+        addLog(`Recovery: share release refused — ${released.reason}`, 'error');
+        toast('Relays refused to release the recovery share', 'error');
+        statusEl.innerHTML = `<span style="color:var(--danger)">No relay released the recovery share: ${escHtml(released.reason)}.${lockMsg}</span>`;
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+      }
+      recoveryShare = released.secret;
     }
 
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Decrypting keys with face + PIN...</span>';
@@ -2494,11 +2615,11 @@ $('#btnRecoverFace').addEventListener('click', async () => {
             // rather than failing the upgrade — v2 is still face+PIN, and the
             // next face update retries the v3 upgrade.
             let upgradeShare: Uint8Array | undefined = generateRecoveryShare();
-            const stored = await storeRecoveryShare(
+            const up = await storeRecoveryShare(
               node.relayHttpBases(), accountId, node.ledger.network, upgradeShare, engineKeysFromAppPrivate(keys.priv).priv,
             );
-            if (stored < REQUIRED_ATTESTERS) {
-              addLog(`Recovery: v3 upgrade unavailable (share stored ${stored}/${REQUIRED_ATTESTERS}) — using face+PIN (v2)`, 'info');
+            if (up.stored < REQUIRED_ATTESTERS) {
+              addLog(`Recovery: v3 upgrade unavailable (share stored ${up.stored}/${REQUIRED_ATTESTERS}) — using face+PIN (v2)`, 'info');
               upgradeShare = undefined;
             }
             const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin, accountId, upgradeShare);

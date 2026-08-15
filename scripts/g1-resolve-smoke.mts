@@ -228,9 +228,44 @@ check(
     // Release without a valid challenge session must be refused.
     const rel = await fetch(`${r.http}/recovery-share/release`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
-      body: JSON.stringify({ accountId: keys.pub, challengeId: 'bogus', descriptor: new Array(128).fill(0.1), ephPub: '04' + 'ab'.repeat(64) }),
+      body: JSON.stringify({ accountId: keys.pub, challengeId: 'bogus', proof: {}, ephPub: '04' + 'ab'.repeat(64) }),
     });
     check(rel.status === 400, `${r.name} refuses a release without a valid challenge (400, got ${rel.status})`);
+
+    // A recovery challenge must be drawn server-side, ordered and distinct.
+    const chRes = await fetch(`${r.http}/recovery-share/challenge`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' }, body: '{}',
+    });
+    const ch = chRes.ok ? await chRes.json() as { challengeId?: string; sequence?: string[] } : {};
+    check(
+      !!ch.challengeId && Array.isArray(ch.sequence) && ch.sequence.length === 3 && new Set(ch.sequence).size === 3,
+      `${r.name} draws a 3-action recovery challenge (${ch.sequence?.join('→') ?? 'none'})`,
+    );
+    // A recovery challenge must NOT be spendable on the attestation endpoint
+    // (it is issued without the enrolment IP cap — an unmetered side door).
+    const misuse = await fetch(`${r.http}/face-verify/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
+      body: JSON.stringify({ accountId: keys.pub, challengeId: ch.challengeId, descriptor: new Array(128).fill(0.01), faceMapHash: 'x' }),
+    });
+    check(misuse.status === 400, `${r.name} refuses a recovery challenge for attestation (400, got ${misuse.status})`);
+    // A photo-style proof (no expression movement) must be refused by the
+    // trajectory gate — this is the attack the challenge sequence closes.
+    if (ch.challengeId && ch.sequence) {
+      const flat = new Array(128).fill(0).map((_, i) => Math.sin(i) * 0.08);
+      const photo = await fetch(`${r.http}/recovery-share/release`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
+        body: JSON.stringify({
+          accountId: keys.pub, challengeId: ch.challengeId, ephPub: '04' + 'ab'.repeat(64),
+          proof: {
+            neutralDescriptor: flat,
+            actions: ch.sequence.map((action, i) => ({ action, ratio: 0.03, t: Date.now() + i * 1200, descriptor: flat })),
+          },
+        }),
+      });
+      // 404 (no share for this throwaway account) or 403 (gate refused) — both
+      // mean no share came out; what must never happen is a 200.
+      check(photo.status !== 200, `${r.name} refuses a motionless (photo) trajectory proof (got ${photo.status})`);
+    }
   }
 }
 

@@ -465,7 +465,7 @@ const DARK_LUMA = 45;
  */
 function noFaceLabel(video: HTMLVideoElement, fallback: string): string {
   const luma = frameBrightness(video);
-  if (luma >= 0) debugMetrics(`no face detected; frame luma=${luma.toFixed(0)} (dark below ${DARK_LUMA})`);
+  if (luma >= 0) debugFrames(`no face detected; frame luma=${luma.toFixed(0)} (dark below ${DARK_LUMA})`);
   return luma >= 0 && luma < DARK_LUMA ? 'Too dark, add more light.' : fallback;
 }
 
@@ -837,7 +837,7 @@ export async function calibrateNeutral(
         : (1 - m.frac / startFrac) / (1 - 1 / LEG_SIZE_RATIO);
       const shapeRel = startShape > 0 ? (m.shape / startShape - 1) : 0;
       const shapeProgress = (goIn ? shapeRel : -shapeRel) / SHAPE_DELTA;
-      debugMetrics(`depth leg${leg + 1}/${LEGS.length} ${goIn ? 'in' : 'out'} frac=${m.frac.toFixed(3)}/${startFrac.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)}`);
+      debugFrames(`depth leg${leg + 1}/${LEGS.length} ${goIn ? 'in' : 'out'} frac=${m.frac.toFixed(3)}/${startFrac.toFixed(3)} size=${sizeProgress.toFixed(2)} shapeRel=${shapeRel.toFixed(4)} shape=${shapeProgress.toFixed(2)}`);
 
       if (sizeProgress >= 1 && shapeProgress >= 1) {
         leg++;
@@ -917,14 +917,29 @@ export async function calibrateNeutral(
 }
 
 /**
- * Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics.
+ * Live tuning aid, two verbosity tiers:
+ *   `localStorage.neuron_debug = '1'` → EVENT lines only (one per outcome:
+ *     enroll quality, calibration result, aborts, timeouts, recovery match) —
+ *     readable during normal use.
+ *   `localStorage.neuron_debug = '2'` → adds the PER-FRAME measurement stream
+ *     (~15 lines/s) that threshold tuning needs. The tuning method in CLAUDE.md
+ *     relies on these traces; they were demoted, not deleted, when the
+ *     always-on stream made the app log unusable.
  *
  * Exported so face-store can log the recovery match distance on the same
  * `[face]` channel — that number and the enrollment spread have to be read side
  * by side to mean anything, so they must not land in two different places.
  */
 export function debugMetrics(msg: string): void {
-  try { if (localStorage.getItem('neuron_debug') === '1') console.log(`[face] ${msg}`); } catch { /* no localStorage */ }
+  try {
+    const v = localStorage.getItem('neuron_debug');
+    if (v === '1' || v === '2') console.log(`[face] ${msg}`);
+  } catch { /* no localStorage */ }
+}
+
+/** Per-frame tier — only at neuron_debug='2' (see debugMetrics). */
+function debugFrames(msg: string): void {
+  try { if (localStorage.getItem('neuron_debug') === '2') console.log(`[face] ${msg}`); } catch { /* no localStorage */ }
 }
 
 /**
@@ -952,6 +967,14 @@ export async function detectChallenge(
   onStatus?: (cue: CaptureCue) => void,
   guard?: PresenceGuard,
   neutral?: NeutralBaseline,
+  /**
+   * Recovery-proof hook: called once, at the pass moment, with the PEAK
+   * weakest-signal ratio (measured delta over this detector's own threshold —
+   * ≥ 1 by construction, since arming required the full threshold). The relay's
+   * release gate verifies these ratios (recovery-challenge.ts), so they must be
+   * the detector's real numbers, never recomputed elsewhere.
+   */
+  onPass?: (peakRatio: number) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   // Calibrate by SAMPLE COUNT, not wall-clock. The first inference after a model
@@ -1084,6 +1107,8 @@ export async function detectChallenge(
   };
   let browNeutral = 0;
   let earSdNeutral = 0;
+  /** Peak weakest-signal ratio seen so far — what onPass reports. */
+  let peakRatio = 0;
   // Calibrated neutrals (filled during the calibration frames).
   const earOpenSamples: number[] = [];
   const liftSamples: number[] = [];
@@ -1202,7 +1227,7 @@ export async function detectChallenge(
       const ear = (rightEAR + leftEAR) / 2;
       const closedBelow = (earOpen || 0.30) * BLINK_DROP;
       earMin = Math.min(earMin, ear);
-      debugMetrics(`blink ear=${ear.toFixed(3)} min=${earMin.toFixed(3)} threshold=${closedBelow.toFixed(3)} open=${earOpen.toFixed(3)}`);
+      debugFrames(`blink ear=${ear.toFixed(3)} min=${earMin.toFixed(3)} threshold=${closedBelow.toFixed(3)} open=${earOpen.toFixed(3)}`);
       if (ear < closedBelow) {
         // Only count a closure as a blink once we've confirmed the eyes were open —
         // this requires a real open→closed transition, defeating a static photo.
@@ -1210,6 +1235,7 @@ export async function detectChallenge(
           earBelowCount++;
           if (earBelowCount >= BLINK_FRAMES) {
             onStatus?.({ label: 'Blink detected', guide: 'blink', left: 100, right: 100, state: 'ok' });
+            onPass?.(Math.max(peakRatio, (earOpen - ear) / Math.max(1e-6, earOpen - closedBelow)));
             return true;
           }
         }
@@ -1249,16 +1275,18 @@ export async function detectChallenge(
       const explained = TRANSLATION_YAW_GAIN * driftΔ;
       const rotationDominates = delta >= ROTATION_MARGIN * explained;
       const agree = Math.sign(signed) === Math.sign(skewΔ);
-      debugMetrics(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} explains=${explained.toFixed(4)} agree=${agree}`);
+      debugFrames(`turn jawΔ=${signed.toFixed(4)}/±${YAW_DELTA} skewΔ=${skewΔ.toFixed(4)}/±${SKEW_DELTA} drift=${driftΔ.toFixed(4)}/${CENTRE_DRIFT_MAX} explains=${explained.toFixed(4)} agree=${agree}`);
       // Safety terms (direction agreement, no slide, rotation dominates) are
       // required throughout; only the magnitudes get the hysteresis, so a held
       // turn survives landmark jitter but a slide never sneaks through the hold.
       const safe = agree && stayedPut && rotationDominates;
+      if (safe) peakRatio = Math.max(peakRatio, Math.min(delta / YAW_DELTA, Math.abs(skewΔ) / SKEW_DELTA));
       const armTurn = delta >= YAW_DELTA && Math.abs(skewΔ) >= SKEW_DELTA && safe;
       const holdTurn = delta >= YAW_DELTA * HOLD_FRACTION
         && Math.abs(skewΔ) >= SKEW_DELTA * HOLD_FRACTION && safe;
       if (sustained(armTurn, holdTurn)) {
         onStatus?.({ label: 'Turn detected', guide: 'turn', dir: turnSide, left: 100, right: 100, state: 'ok' });
+        onPass?.(peakRatio);
         return true;
       }
       if (!stayedPut) {
@@ -1290,12 +1318,14 @@ export async function detectChallenge(
       const m = mouthMetrics(pts);
       const liftΔ = m.lift - liftNeutral;
       const widthΔ = m.width - widthNeutral;
-      debugMetrics(`smile liftΔ=${liftΔ.toFixed(4)}/${SMILE_LIFT_DELTA} widthΔ=${widthΔ.toFixed(4)}/${SMILE_WIDTH_DELTA}`);
+      debugFrames(`smile liftΔ=${liftΔ.toFixed(4)}/${SMILE_LIFT_DELTA} widthΔ=${widthΔ.toFixed(4)}/${SMILE_WIDTH_DELTA}`);
       // BOTH must move: corners up AND mouth wider. Either alone is something
       // else — a jaw drop widens nothing, and raised corners with no widening is
       // usually the head tilting.
+      peakRatio = Math.max(peakRatio, Math.min(liftΔ / SMILE_LIFT_DELTA, widthΔ / SMILE_WIDTH_DELTA));
       if (sustained(liftΔ >= SMILE_LIFT_DELTA && widthΔ >= SMILE_WIDTH_DELTA)) {
         onStatus?.({ label: 'Smile detected', guide: 'smile', left: 100, right: 100, state: 'ok' });
+        onPass?.(peakRatio);
         return true;
       }
       // Progress = the weaker of the two, so the bar only fills on a real smile.
@@ -1306,9 +1336,11 @@ export async function detectChallenge(
 
     } else if (type === 'mouth-open') {
       const openΔ = mouthMetrics(pts).open - openNeutral;
-      debugMetrics(`mouth openΔ=${openΔ.toFixed(3)}/${MOUTH_OPEN_DELTA}`);
+      debugFrames(`mouth openΔ=${openΔ.toFixed(3)}/${MOUTH_OPEN_DELTA}`);
+      peakRatio = Math.max(peakRatio, openΔ / MOUTH_OPEN_DELTA);
       if (sustained(openΔ >= MOUTH_OPEN_DELTA)) {
         onStatus?.({ label: 'Mouth open detected', guide: 'mouth', left: 100, right: 100, state: 'ok' });
+        onPass?.(peakRatio);
         return true;
       }
       const pct = Math.max(0, Math.min(99, Math.round((openΔ / MOUTH_OPEN_DELTA) * 100)));
@@ -1335,9 +1367,11 @@ export async function detectChallenge(
         browRefHist.push({ t: Date.now(), v: browNow });
         while (browRefHist.length && Date.now() - browRefHist[0].t > OPEN_REF_MS) browRefHist.shift();
       }
-      debugMetrics(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA} ref=${browRef.toFixed(4)} raw=${browNow.toFixed(4)} n=${browWindow.length}`);
+      debugFrames(`brow browΔ=${browΔ.toFixed(4)}/${BROW_DELTA} ref=${browRef.toFixed(4)} raw=${browNow.toFixed(4)} n=${browWindow.length}`);
+      peakRatio = Math.max(peakRatio, browΔ / BROW_DELTA);
       if (sustained(browΔ >= BROW_DELTA)) {
         onStatus?.({ label: 'Eyebrows detected', guide: 'brow', left: 100, right: 100, state: 'ok' });
+        onPass?.(peakRatio);
         return true;
       }
       const pct = Math.max(0, Math.min(99, Math.round((browΔ / BROW_DELTA) * 100)));
@@ -1397,10 +1431,11 @@ export async function detectChallenge(
       const span = earWindow.length ? now - earWindow[0].t : 0;
       const windowMean = recent.reduce((a, b) => a + b.ear, 0) / (recent.length || 1);
       const held = span >= CLOSE_HOLD_MS && recent.length >= 4;
-      debugMetrics(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
+      debugFrames(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
 
       if (sawEyesOpen && held && windowMean <= closedBelow) {
         onStatus?.({ label: 'Eyes closed detected', guide: 'eyes', left: 100, right: 100, state: 'ok' });
+        onPass?.(Math.max(peakRatio, margin > 0 ? (openRef - windowMean) / margin : 1));
         return true;
       }
       // You cannot watch a progress bar with your eyes shut, so the bar is only

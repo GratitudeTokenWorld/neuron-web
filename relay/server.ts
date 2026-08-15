@@ -49,6 +49,10 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // held even when light clients holding a shard go offline.
 import { decodeBlock, verifyBlock } from '../src/engine/core/block.js';
 import { AccountAccumulator } from '../src/engine/core/accumulator.js';
+// Recovery-share release gate: the acceptance rules live in a PURE module so
+// vitest can pin them (this file is covered by no typecheck and no test — keep
+// every releasable piece of its logic over there, not here).
+import { drawRecoverySequence, verifyTrajectory } from '../src/core/recovery-challenge.js';
 
 // gossipsub 14.x ↔ libp2p 3.x interop shims (fixes A/B/C) — now shared with the
 // BROWSER build, which needs them just as much (clients could send but never
@@ -962,21 +966,32 @@ async function main() {
         // the key owner can (re)bind a share — an unsigned overwrite would be an
         // account-loss DoS. Newest signed ts wins; a replayed older store is
         // rejected, so rotation cannot be undone from a capture.
+        //
+        // `x` (1..255, optional): this relay's Shamir 2-of-n x-coordinate. When
+        // present the stored bytes are one SHARE — informationally independent
+        // of the secret, so even this box's disk yields nothing alone. Absent =
+        // legacy full-secret record (pre-Shamir accounts keep recovering).
         let body;
         try { body = await readJsonBody(req); } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message })); return;
         }
-        const { accountId, share, ts, sig } = body;
+        const { accountId, share, ts, sig, x } = body;
         const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
         if (typeof accountId !== 'string' || !/^0[23][0-9a-f]{64}$/i.test(accountId)
           || typeof share !== 'string' || !/^[0-9a-f]{64}$/i.test(share)
-          || typeof ts !== 'number' || typeof sig !== 'string') {
+          || typeof ts !== 'number' || typeof sig !== 'string'
+          || (x !== undefined && (!Number.isInteger(x) || x < 1 || x > 255))) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'accountId, share (32-byte hex), ts, sig required' })); return;
+          res.end(JSON.stringify({ error: 'accountId, share (32-byte hex), ts, sig (and optional x 1..255) required' })); return;
         }
+        // x is inside the signed payload: a MITM must not be able to strip or
+        // renumber it (renumbering would corrupt reconstruction silently).
+        const payload = x !== undefined
+          ? `recovery-share:${accountId}:${network}:${x}:${share}:${ts}`
+          : `recovery-share:${accountId}:${network}:${share}:${ts}`;
         let sigOk = false;
-        try { sigOk = engineVerify(sig, `recovery-share:${accountId}:${network}:${share}:${ts}`, accountId); } catch { /* bad sig */ }
+        try { sigOk = engineVerify(sig, payload, accountId); } catch { /* bad sig */ }
         if (!sigOk) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'invalid signature' })); return;
@@ -1002,12 +1017,31 @@ async function main() {
           // Lowercased: @noble's hexToBytes (used by the release wrap) throws on
           // uppercase, and a stored share that cannot be released is account loss.
           accountId, nid, network, shareHex: share.toLowerCase(), ts,
+          ...(x !== undefined ? { x } : {}),
           fails: existing?.fails ?? 0, lockedUntil: existing?.lockedUntil ?? 0,
         });
         recoverySharesDirty = true;
         console.log(`[Recovery] share stored acct=${accountId.slice(0, 12)}… nid=${String(nid).slice(0, 8)}…`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
+
+      } else if (req.method === 'POST' && req.url === '/recovery-share/challenge') {
+        // Draw THIS relay's action sequence for a release attempt. Server-drawn
+        // and single-use: a sniffed legit performance satisfies one specific
+        // ordered draw (3 distinct of 5 ≈ 1-in-60), so replaying it against a
+        // fresh challenge fails on order — that, not the descriptor match, is
+        // what a still photo and a stolen packet both break on.
+        const challengeId = globalThis.crypto.randomUUID();
+        const sequence = drawRecoverySequence();
+        const now = Date.now();
+        challengeSessions.set(challengeId, { type: 'recovery', sequence, createdAt: now, ip: getClientIp(req), used: false });
+        if (challengeSessions.size % 200 === 0) {
+          for (const [id, s] of challengeSessions) {
+            if (now - s.createdAt > CHALLENGE_TTL_MS) challengeSessions.delete(id);
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ challengeId, sequence, expiresAt: now + CHALLENGE_TTL_MS }));
 
       } else if (req.method === 'POST' && req.url === '/recovery-share/release') {
         // THE gate. Releases the share only to a live face whose nid matches the
@@ -1020,20 +1054,21 @@ async function main() {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message })); return;
         }
-        const { accountId, challengeId, descriptor, ephPub } = body;
+        const { accountId, challengeId, proof, ephPub } = body;
         const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
         if (typeof accountId !== 'string' || typeof ephPub !== 'string' || !/^04[0-9a-f]{128}$/i.test(ephPub)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'accountId and ephPub (uncompressed P-256 hex) required' })); return;
         }
-        // Session: same single-use challenge store as attestation — no
-        // challenge, no attempt; one challenge, one attempt. (Not IP-bound,
-        // matching /face-verify/verify; the per-IP cap below and the per-account
-        // backoff are the enforced limits.)
+        // Session: must be a RECOVERY challenge this relay drew (it carries the
+        // demanded sequence), single-use. (Not IP-bound, matching
+        // /face-verify/verify; the per-IP cap below and the per-account backoff
+        // are the enforced limits.)
         const session = challengeSessions.get(String(challengeId || ''));
-        if (!session || session.used || Date.now() - session.createdAt > CHALLENGE_TTL_MS) {
+        if (!session || session.used || session.type !== 'recovery' || !Array.isArray(session.sequence)
+          || Date.now() - session.createdAt > CHALLENGE_TTL_MS) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid, used or expired challengeId' })); return;
+          res.end(JSON.stringify({ error: 'invalid, used or expired recovery challengeId' })); return;
         }
         session.used = true;
         if (!checkAndRecordIp(ipReleaseLog, ip, RELEASE_IP_MAX_PER_DAY)) {
@@ -1059,19 +1094,35 @@ async function main() {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: msg }));
         };
-        if (!validateDescriptor(descriptor)) { await fail('descriptor must be 128 finite numbers in (-2, 2)'); return; }
-        // Live-face match, read-only (no count/centroid updates — this is not an
-        // enrollment). Must land on the SAME human the share was bound to.
-        const matched = findMatchingFace(descriptor, network);
-        if (!matched || !matched.nid || matched.nid !== record.nid) { await fail('face does not match this account'); return; }
+        // 1. Trajectory: the client's detector numbers must satisfy THIS
+        //    challenge's ordered draw with human pacing and one-person
+        //    descriptor consistency. Pure verifier, pinned by vitest
+        //    (src/core/recovery-challenge.test.ts) — every rejection reason
+        //    below lands in the log because a refused legit user needs to know
+        //    which bar they missed.
+        const verdict = verifyTrajectory(session.sequence, proof);
+        if (!verdict.ok) { await fail(`trajectory rejected: ${verdict.reason}`); return; }
+        // 2. Identity: EVERY descriptor in the packet must land on the human
+        //    this share was bound to at store time. Read-only matches (no
+        //    count/centroid updates — this is not an enrollment). Checking all
+        //    of them (not just neutral) closes the obvious splice: victim photo
+        //    for the anchor, attacker's own face performing the actions.
+        for (const d of [proof.neutralDescriptor, ...proof.actions.map((a) => a.descriptor)]) {
+          const matched = findMatchingFace(d, network);
+          if (!matched || !matched.nid || matched.nid !== record.nid) {
+            await fail('face does not match this account'); return;
+          }
+        }
         record.fails = 0;
         record.lockedUntil = 0;
         recoverySharesDirty = true;
         // toLowerCase: @noble hexToBytes rejects uppercase hex.
         const wrapped = await wrapShareForClient(record.shareHex, ephPub.toLowerCase());
-        console.log(`[Recovery] share released acct=${accountId.slice(0, 12)}… ip=${ip}`);
+        console.log(`[Recovery] share released acct=${accountId.slice(0, 12)}… ip=${ip}${record.x ? ` x=${record.x}` : ' (legacy full share)'}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(wrapped));
+        // x + ts ride along: the client must combine only same-generation
+        // shares (mixing splits yields garbage — see shamir.test.ts).
+        res.end(JSON.stringify({ ...wrapped, ...(record.x ? { x: record.x } : {}), ts: record.ts }));
 
       } else if (req.method === 'POST' && req.url === '/keyblob') {
         // Targeted replacement for the global keyblobs gossip topic: the owner
@@ -1161,6 +1212,13 @@ async function main() {
         if (!session) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Invalid or expired challengeId' })); return;
+        }
+        // Recovery sessions are issued WITHOUT the attestation IP cap (their
+        // limits live on the release endpoint), so spending one here would be
+        // an unmetered side door into the Sybil-critical attestation flow.
+        if (session.type === 'recovery') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'recovery challenge cannot be used for attestation' })); return;
         }
         if (session.used) {
           res.writeHead(400, { 'Content-Type': 'application/json' });

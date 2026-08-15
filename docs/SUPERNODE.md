@@ -52,8 +52,15 @@ tier answer queries without becoming an authority.
 | `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
 | `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
 | `POST /keyblob` \| `GET /keyblob?username=\|pub=&network=` | targeted key-blob store/fetch (replaced the global `keyblobs` gossip topic 2026-08-15 — an O(N) broadcast and harvesting surface) | blob opens only with face+PIN+share (v3); `linkedAnchor` re-checked against the on-chain record at recovery. Per-IP limited |
-| `POST /recovery-share` | store an account's v3 recovery share, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{share}:{ts}` by the account's engine key; newest signed `ts` wins |
-| `POST /recovery-share/release` | **the recovery gate**: release the share to a live face matching the account's `nid` | server-side per-account exponential backoff (3 free, then 30s·4ⁿ up to 24h) + per-IP cap + single-use challenge session; response ECDH-wrapped to the client's ephemeral key |
+| `POST /recovery-share` | store this relay's **Shamir 2-of-n share** of the account's v3 secret, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{x}:{share}:{ts}` by the account's engine key (the x-coordinate is inside the signature so it cannot be stripped/renumbered); newest signed `ts` wins |
+| `POST /recovery-share/challenge` | draw this relay's ordered action sequence (3 distinct of 5) for one release attempt | single-use session; a stolen performance matches a fresh draw ~1-in-60, under the release backoff |
+| `POST /recovery-share/release` | **the recovery gate**: release this relay's share after verifying the trajectory proof + `nid` match | `verifyTrajectory` (ordered actions, ratio floor, human pacing, one-person descriptors — pure module, vitest-pinned) then every descriptor matched to the account's `nid`; per-account exponential backoff (3 free, then 30s·4ⁿ up to 24h) + per-IP cap; response ECDH-wrapped to the client's ephemeral key |
+
+**Two relays must release before an account recovers.** The secret is Shamir
+2-of-n across the attesters, so this box's `.relay-recovery-shares.json` is
+information-theoretically independent of it: reading the file yields nothing,
+and a single rogue relay cannot reconstruct. Any 2 of n suffice, so one relay
+being down does not block recovery.
 | `POST /log-reload` | dev telemetry sink | — |
 
 **`/recovery-share/release` is the exception to "a relay can serve or withhold,
@@ -96,7 +103,7 @@ the node's identity and breaks the baked bootstrap address).
 | `.relay-face-db.json` | enrolled face descriptors + per-face account counts | face Sybil limit resets |
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
 | `.relay-keyblobs.json` | archived encrypted key-blobs (for peer-independent recovery; arrive via `POST /keyblob`) | recovery impossible until the owner's next blob update re-stores it (no gossip re-fill any more) — the OTHER relay's copy is the redundancy |
-| `.relay-recovery-shares.json` | **v3 recovery shares** — the third key factor per account, nid-bound, with server-side backoff state. Written `0600`; **never** logged or served except via the face-gated release | affected accounts can never complete a fresh-device recovery again (devices with the share cached still work). The other relay's copy is the redundancy — check it before wiping this file |
+| `.relay-recovery-shares.json` | **v3 recovery shares** — this relay's Shamir 2-of-n share of each account's third key factor, nid-bound, with server-side backoff state. Written `0600`; **never** logged or served except via the face-gated release. One share alone reveals nothing about the secret | affected accounts can never complete a fresh-device recovery again once fewer than 2 relays hold a share (devices with the secret cached still work). Check the OTHER relays' copies before wiping this file |
 | `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
 | `.relay-accounts.json` | account-record archive (G1 directory tier): engine-verified records served via `/resolve` | re-fills from owners' 20 s publish ticks; until then clients can't resolve usernames this relay alone knew |
 | `.relay-operators.json` | the first 3 accountIds attested — the only accounts allowed to wipe this relay | anyone could re-claim an operator slot; **kept across wipes** |
