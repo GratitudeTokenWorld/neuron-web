@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 267 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 270 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a

@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 267-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 270-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +

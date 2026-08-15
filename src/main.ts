@@ -43,10 +43,10 @@ const shareRefreshChecked = new Set<string>();
  * moments the client provably holds the secret. Fire-and-forget: it must never
  * delay or fail a user action, and the next session simply retries.
  */
-function repairShareRedundancy(accountId: string, secret: Uint8Array, enginePriv: string): void {
+function repairShareRedundancy(accountId: string, secret: Uint8Array, enginePriv: string, descriptor?: number[]): void {
   if (shareRefreshChecked.has(accountId)) return;
   shareRefreshChecked.add(accountId);
-  void refreshShareRedundancy(node.relayHttpBases(), accountId, node.ledger.network, secret, enginePriv)
+  void refreshShareRedundancy(node.relayHttpBases(), accountId, node.ledger.network, secret, enginePriv, descriptor)
     .then(r => {
       if (r.refreshed) addLog(`Recovery: share redundancy repaired — ${r.reason}`, 'success');
       else if (r.custodians === 0) addLog(`Recovery: share redundancy NOT repaired — ${r.reason}`, 'error');
@@ -2355,7 +2355,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // If some attester was unreachable just now, this account is narrower than
     // the relay fleet — heal it as soon as the missing relay is back, rather
     // than leaving it one custodian loss from unrecoverable.
-    repairShareRedundancy(accountId, recoveryShare, engineKeys.priv);
+    repairShareRedundancy(accountId, recoveryShare, engineKeys.priv, faceMap.canonical);
 
     const pinSalt = keyBlob.pinSalt!;
     const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
@@ -2663,7 +2663,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       await cacheRecoveryShare(blob.pub, shareToHex(recoveryShare));
       // A recovery is the strongest moment to repair custody: the secret is in
       // hand and the relay set was just probed for real.
-      repairShareRedundancy(blob.pub, recoveryShare, engineKeysFromAppPrivate(keys.priv).priv);
+      repairShareRedundancy(blob.pub, recoveryShare, engineKeysFromAppPrivate(keys.priv).priv, faceMap.canonical);
     }
 
     // Reset attempt counter on successful recovery

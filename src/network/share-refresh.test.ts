@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { planShareRefresh, type ShareStatus } from './recovery-share.js';
+import { planShareRefresh, orderRefreshTargets, type ShareStatus } from './recovery-share.js';
 
 /**
  * The refresh decision is the dangerous half of redundancy repair: a careless
@@ -55,5 +55,43 @@ describe('planShareRefresh', () => {
     const plan = planShareRefresh([s('', false), s('http://a', false), s('http://b', false)]);
     expect(plan.shouldRefresh).toBe(true);
     expect(plan.holders).toHaveLength(0);
+  });
+});
+
+describe('orderRefreshTargets — write order IS the safety property', () => {
+  /**
+   * Writing a new-generation share to a relay invalidates the old-generation
+   * share it held (they cannot combine). So a partial write that strands one
+   * new share while leaving the old holders one short turns a healthy account
+   * into an unrecoverable one — which is exactly what happened in dev on
+   * 2026-08-15. Non-holders must therefore be written FIRST: they hold nothing
+   * usable, so their failure costs nothing and tells us whether to touch the
+   * holders at all.
+   */
+  it('puts relays with nothing to lose first', () => {
+    const statuses = [s('', true, 1, 100), s('http://a', false), s('http://b', true, 2, 100)];
+    const order = orderRefreshTargets(statuses, planShareRefresh(statuses));
+    expect(order.nonHolders).toEqual(['http://a']);
+    expect(order.holders).toEqual(['', 'http://b']);
+  });
+
+  it('treats a STALE-generation holder as a non-holder — its share is already dead', () => {
+    // The dev breakage state: local kept the old split, cloud took a new one.
+    // Local must be written first (its old share cannot combine with anything),
+    // and the lone current holder is converted afterwards.
+    const statuses = [s('', true, 1, 100), s('http://a', true, 2, 500), s('http://b', false)];
+    const plan = planShareRefresh(statuses);
+    const order = orderRefreshTargets(statuses, plan);
+    expect(plan.holders).toEqual(['http://a']);
+    expect(order.nonHolders).toEqual(['', 'http://b']);
+    expect(order.holders).toEqual(['http://a']);
+  });
+
+  it('every target appears exactly once, so no relay is skipped or written twice', () => {
+    const statuses = [s('', true, 1, 100), s('http://a', false), s('http://b', true, 2, 100), s('http://c', true, 3, 40)];
+    const order = orderRefreshTargets(statuses, planShareRefresh(statuses));
+    const all = [...order.nonHolders, ...order.holders].sort();
+    expect(all).toEqual(['', 'http://a', 'http://b', 'http://c'].sort());
+    expect(new Set(all).size).toBe(4);
   });
 });

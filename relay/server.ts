@@ -1008,7 +1008,27 @@ async function main() {
         // creation stores the share right after attestation, when the binding
         // is guaranteed fresh (pendingFaceUses), with the persistent username
         // registry as the fallback once the open block has consumed it.
-        const nid = existing?.nid ?? nidForAccount(accountId);
+        // A relay can only custody for a human it can RECOGNISE — the release
+        // gate matches a live face against this binding, so without one the
+        // share could never be released. Three sources, in order of authority:
+        //   1. an existing binding (never overwritten — no rebinding attacks)
+        //   2. this relay's own attestation of the account (pendingFaceUses /
+        //      usernameRegistry), the normal path at creation
+        //   3. a live descriptor matched against this relay's own face DB
+        // (3) is what lets an account heal onto a relay that was DOWN when it
+        // was created: the relay already knows the human from other
+        // enrollments, it just never learned this accountId belongs to them.
+        // Safe because the store is signed by the account key, so a caller can
+        // only ever bind their OWN account, and (1) blocks re-pointing an
+        // existing one.
+        let nid = existing?.nid ?? nidForAccount(accountId);
+        if (!nid && validateDescriptor(body.descriptor)) {
+          const matched = findMatchingFace(body.descriptor, network);
+          if (matched?.nid) {
+            nid = matched.nid;
+            console.log(`[Recovery] bound acct=${accountId.slice(0, 12)}… to known nid=${String(nid).slice(0, 8)}… via live descriptor`);
+          }
+        }
         if (!nid) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'no attested identity for this accountId on this relay' })); return;

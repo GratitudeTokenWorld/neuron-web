@@ -54,6 +54,17 @@ async function storeOnRelay(
   enginePriv: string,
   ts: number,
   timeoutMs: number,
+  /**
+   * Optional live descriptor. A relay binds accountId→nid at store time and
+   * needs that binding to gate the release, so a relay that never attested
+   * this account has nothing to bind and refuses. Passing the descriptor from
+   * a just-completed capture lets it derive the nid from its OWN face DB and
+   * become a custodian — which is how an account heals onto a relay that was
+   * down at creation. Unsigned by design: tampering can only cause a wrong
+   * binding or a refusal on a relay that holds nothing yet, and an existing
+   * binding is never overwritten.
+   */
+  descriptor?: number[],
 ): Promise<boolean> {
   try {
     // x rides inside the signed payload — a MITM must not be able to strip or
@@ -62,7 +73,11 @@ async function storeOnRelay(
       ? `recovery-share:${accountId}:${network}:${x}:${shareHex}:${ts}`
       : `recovery-share:${accountId}:${network}:${shareHex}:${ts}`;
     const sig = engineSign(payload, enginePriv);
-    const res = await postJson(base, '/recovery-share', network, { accountId, share: shareHex, ts, sig, ...(x !== undefined ? { x } : {}) }, timeoutMs);
+    const res = await postJson(base, '/recovery-share', network, {
+      accountId, share: shareHex, ts, sig,
+      ...(x !== undefined ? { x } : {}),
+      ...(descriptor ? { descriptor } : {}),
+    }, timeoutMs);
     return res.ok;
   } catch {
     return false;
@@ -198,13 +213,52 @@ export interface RefreshResult {
 }
 
 /**
+ * Split the targets into the two groups the write order depends on.
+ *
+ * Pure so the ORDER — the thing that makes a refresh safe or destructive — is
+ * unit-testable. A relay holding a stale-generation share counts as a
+ * non-holder: its share cannot combine with the current pair, so it has
+ * nothing to lose and is safe to write first.
+ */
+export function orderRefreshTargets(
+  statuses: readonly ShareStatus[],
+  plan: RefreshPlan,
+): { nonHolders: string[]; holders: string[] } {
+  const holderSet = new Set(plan.holders);
+  return {
+    nonHolders: statuses.map(s => s.base).filter(b => !holderSet.has(b)),
+    holders: statuses.map(s => s.base).filter(b => holderSet.has(b)),
+  };
+}
+
+/**
  * Repair redundancy: re-split the secret across every reachable attester.
  *
- * Safe to call whenever the secret is in hand; it no-ops unless the custodian
- * count would actually grow. On a partial write it retries once, because
- * landing exactly ONE new-generation share is the single dangerous outcome —
- * the relays that kept the old split and the one that took the new one can no
- * longer combine with each other.
+ * ⚠ WRITE ORDER IS THE SAFETY PROPERTY, not an optimisation. Writing a
+ * new-generation share to a relay INVALIDATES the old-generation share it was
+ * holding (they cannot combine), so a naive "write to everyone at once" that
+ * partially fails can strand exactly one new share and leave the old holders
+ * one short — turning a healthy account into an unrecoverable one. That is not
+ * hypothetical: it happened in dev on 2026-08-15, breaking a live account.
+ *
+ * So the write runs in two phases with an invariant: **at every moment, either
+ * the old generation still has ≥2 holders, or the new generation does.**
+ *
+ *  1. Non-holders first — they hold nothing usable, so a failure costs nothing.
+ *     If NONE accepts, abort without touching the holders: there was nothing to
+ *     gain, and touching them could only do harm. (This is the common case when
+ *     a relay refuses because it never attested the account — see below.)
+ *  2. Then convert the holders one at a time. A failed conversion leaves that
+ *     relay's old share intact, so the old generation never drops below its
+ *     starting count except by a conversion that already grew the new one.
+ *     All holders are converted, not just enough to reach two, so the next
+ *     session sees one consistent generation instead of re-triggering forever.
+ *
+ * Note a relay can only custody for a human it has ATTESTED (it binds
+ * accountId→nid at store time and needs that binding to gate the release). A
+ * relay that was down during account creation therefore refuses with 409 and
+ * cannot be healed onto by a session sweep, which has no live descriptor to
+ * offer. Creation and recovery pass one, so those paths can extend custody.
  */
 export async function refreshShareRedundancy(
   bases: readonly string[],
@@ -212,6 +266,7 @@ export async function refreshShareRedundancy(
   network: string,
   secret: Uint8Array,
   enginePriv: string,
+  descriptor?: number[],
   timeoutMs = 6_000,
 ): Promise<RefreshResult> {
   const statuses = await fetchShareStatuses(bases, accountId, network, timeoutMs);
@@ -219,17 +274,36 @@ export async function refreshShareRedundancy(
   if (!plan.shouldRefresh) {
     return { refreshed: false, custodians: plan.holders.length, reason: plan.reason };
   }
-  const targets = statuses.map(s => s.base);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { stored } = await storeRecoveryShare(targets, accountId, network, secret, enginePriv, timeoutMs);
-    if (stored >= 2) {
-      return { refreshed: true, custodians: stored, reason: `re-split across ${stored} of ${targets.length} relays` };
-    }
+  const { nonHolders, holders } = orderRefreshTargets(statuses, plan);
+  const targets = [...nonHolders, ...holders];
+  const ts = Date.now();
+  const shares = shamirSplit(secret, targets.length);
+  const shareFor = new Map(targets.map((b, i) => [b, shares[i]]));
+  const write = (base: string) => {
+    const s = shareFor.get(base)!;
+    return storeOnRelay(base, accountId, network, hex(s.data), s.x, enginePriv, ts, timeoutMs, descriptor);
+  };
+
+  // ── phase 1: relays with nothing to lose ──
+  let newGen = 0;
+  for (const base of nonHolders) if (await write(base)) newGen++;
+  if (newGen === 0) {
+    return {
+      refreshed: false,
+      custodians: plan.holders.length,
+      reason: `no new custodian accepted a share (a relay that never attested this account cannot hold one) — existing set left untouched`,
+    };
   }
-  // Both attempts landed <2 shares: the relays are in worse shape than the
-  // status probe suggested. Report it loudly — the caller logs it, and the
-  // next successful session retries from scratch.
-  return { refreshed: false, custodians: 0, reason: 'refresh could not reach 2 relays — redundancy unchanged or degraded' };
+
+  // ── phase 2: convert current holders, sequentially ──
+  for (const base of holders) if (await write(base)) newGen++;
+
+  if (newGen < 2) {
+    // Only reachable when the account was ALREADY below threshold before this
+    // call (a single current-generation holder), so nothing was made worse.
+    return { refreshed: false, custodians: newGen, reason: `only ${newGen} custodian(s) accepted — account was already below threshold` };
+  }
+  return { refreshed: true, custodians: newGen, reason: `re-split across ${newGen} of ${targets.length} relays` };
 }
 
 /** A relay's drawn recovery challenge, kept with the base that issued it. */
