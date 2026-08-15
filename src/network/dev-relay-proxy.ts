@@ -27,10 +27,10 @@
  *
  * Structurally dev-only: `vite.config.ts` derives these only when
  * `command === 'serve'`, so `npm run build` bakes an empty map and the client
- * lookup is inert. `dev-attester-proxy.test.ts` pins that contract.
+ * lookup is inert. `dev-relay-proxy.test.ts` pins that contract.
  */
 
-export interface DevAttesterProxy {
+export interface DevRelayProxy {
   /** The relay's libp2p peer id — how the client matches a candidate to a path. */
   peerId: string;
   /** Same-origin path the dev server serves this relay under. */
@@ -47,15 +47,15 @@ export interface DevAttesterProxy {
  * not get one. The relay's HTTP API is its ws port + 2 (docs/SUPERNODE.md), the
  * same derivation `relayHttpBase` uses.
  */
-export function deriveDevAttesters(bootstrapAddrs: readonly string[]): DevAttesterProxy[] {
-  const out: DevAttesterProxy[] = [];
+export function deriveDevRelayProxies(bootstrapAddrs: readonly string[]): DevRelayProxy[] {
+  const out: DevRelayProxy[] = [];
   for (const addr of bootstrapAddrs) {
     const ip = addr.match(/\/ip4\/([\d.]+)\/tcp\/(\d+)\/ws(\/|$)/);
     const peer = addr.match(/\/p2p\/([A-Za-z0-9]+)/);
     if (!ip || !peer) continue;
     out.push({
       peerId: peer[1]!,
-      path: `/dev-attester/${out.length}`,
+      path: `/dev-relay/${out.length}`,
       target: `http://${ip[1]}:${Number(ip[2]) + 2}`,
     });
   }
@@ -63,6 +63,35 @@ export function deriveDevAttesters(bootstrapAddrs: readonly string[]): DevAttest
 }
 
 /** peerId → same-origin base, the shape baked into the client. */
-export function devAttesterBases(proxies: readonly DevAttesterProxy[]): Record<string, string> {
+export function devRelayBases(proxies: readonly DevRelayProxy[]): Record<string, string> {
   return Object.fromEntries(proxies.map(p => [p.peerId, p.path]));
+}
+
+// ── Runtime lookups (client side) ────────────────────────────────────────────
+// `{}` in every build, so all of this is inert outside the dev server.
+
+declare const __DEV_RELAY_BASES__: Record<string, string> | undefined;
+
+function bakedBases(): Record<string, string> {
+  return typeof __DEV_RELAY_BASES__ !== 'undefined' && __DEV_RELAY_BASES__ ? __DEV_RELAY_BASES__ : {};
+}
+
+/** The same-origin base a given relay is proxied under, if any. */
+export function devRelayBaseFor(peerId: string | undefined): string | undefined {
+  return peerId ? bakedBases()[peerId] : undefined;
+}
+
+/**
+ * Every proxied relay base.
+ *
+ * Used for the ARCHIVE queries (`/resolve`, `/pending-sends`, `/head-proof`,
+ * `/token`, `/block`, `/providers`), not just attestation — which is why this
+ * is no longer called the attester proxy. Over the HTTPS tunnel the raw-IP
+ * `http://` bases those queries normally use are blocked as mixed content, so
+ * without this a phone falls back to the single same-origin dev relay and
+ * silently loses every other archive: no cross-shard provider discovery, no
+ * counterparty proofs, no directory lookups beyond one node's view.
+ */
+export function allDevRelayBases(): string[] {
+  return Object.values(bakedBases());
 }

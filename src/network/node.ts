@@ -3,6 +3,7 @@ import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccou
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
 import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof, fetchProviders } from './account-resolver';
 import { foldProviderBlocks } from '../engine/content/provider-discovery';
+import { allDevRelayBases } from './dev-relay-proxy';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
@@ -33,11 +34,19 @@ const COUNTRY_CODE_KEY = 'neuronchain_country_code';
 const COUNTRY_CODE_TS_KEY = 'neuronchain_country_code_ts';
 const COUNTRY_CODE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // re-check weekly
 /**
- * How often to re-ask the archives which storage providers exist. Matched to the
- * heartbeat interval, because that is the rate at which a provider's liveness can
- * actually change — polling faster would just re-fetch identical records.
+ * How often to re-ask the archives which storage providers exist.
+ *
+ * Not matched to the 4h heartbeat interval, which was the first instinct: that
+ * is how fast a provider's LIVENESS changes, but a newly REGISTERED provider is
+ * an event peers want promptly, and a 4h poll meant a device that registered a
+ * minute after the last poll stayed invisible for hours. The answer is bounded
+ * (≤50 records, a few KB), so polling this often is cheap; relays can add
+ * caching/ETags if it ever stops being.
  */
-const PROVIDER_DISCOVERY_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const PROVIDER_DISCOVERY_INTERVAL_MS = 10 * 60 * 1000;
+
+/** Early retry delays while the relay connections are still coming up. */
+const PROVIDER_DISCOVERY_RETRIES_MS = [15_000, 30_000, 60_000];
 
 let _countryCode: string | null | undefined = undefined; // undefined = not yet resolved
 
@@ -766,10 +775,12 @@ export class NeuronNode extends EventEmitter {
     setTimeout(() => this.connectToKnownPeers(), 5000);
     // Learn about storage providers outside our own shards. Storage blocks
     // gossip per shard, so without this a node's selection pool is only itself
-    // and no content can ever be handed to anyone. Delayed so relay connections
-    // form first; then on the heartbeat cadence, which is the rate at which a
-    // provider's liveness can actually change.
-    setTimeout(() => { void this.refreshStorageProviders(); }, 8000);
+    // and no content can ever be handed to anyone.
+    //
+    // Retried early rather than attempted once: the first try races relay
+    // connection setup, and a single miss used to mean an empty provider list
+    // for the whole session.
+    setTimeout(() => { void this.discoverProvidersWithRetry(); }, 8000);
     this.providerDiscoveryTimer = setInterval(
       () => { void this.refreshStorageProviders(); },
       PROVIDER_DISCOVERY_INTERVAL_MS,
@@ -1065,6 +1076,20 @@ export class NeuronNode extends EventEmitter {
     }
   }
 
+  /**
+   * Discover, retrying while nothing is found. The first attempt races relay
+   * connection setup, and a single miss used to leave the provider list empty
+   * until the next long-interval poll — a whole session, in practice.
+   */
+  private async discoverProvidersWithRetry(attempt = 0): Promise<void> {
+    const found = await this.refreshStorageProviders();
+    if (found > 0 || attempt >= PROVIDER_DISCOVERY_RETRIES_MS.length) return;
+    setTimeout(
+      () => { void this.discoverProvidersWithRetry(attempt + 1); },
+      PROVIDER_DISCOVERY_RETRIES_MS[attempt]!,
+    );
+  }
+
   /** Register as a storage provider. capacityGB = 0 deregisters. */
   async registerStorage(pub: string, capacityGB: number, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
     const result = await this.ledger.createStorageRegister(
@@ -1163,6 +1188,12 @@ export class NeuronNode extends EventEmitter {
     for (const a of bakedBootstrapAddrs()) addrs.add(a);
     const bases = new Set<string>(['']);
     for (const a of addrs) bases.add(relayHttpBase(a));
+    // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION (see network/dev-relay-proxy.ts).
+    // Over the HTTPS dev tunnel — the only way to reach a camera on a phone —
+    // the raw-IP `http://` bases above are blocked as mixed content, leaving a
+    // phone with just the same-origin dev relay and none of the archive. Empty
+    // in every build.
+    for (const b of allDevRelayBases()) bases.add(b);
     return [...bases];
   }
 

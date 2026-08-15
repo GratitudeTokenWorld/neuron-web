@@ -12,6 +12,7 @@ import { storeRecoveryShare, releaseRecoveryShare, fetchRecoveryChallenges, refr
 import type { TrajectoryProof, ActionProof, RecoveryAction } from './core/recovery-challenge';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
+import { devRelayBaseFor } from './network/dev-relay-proxy';
 import { sign as engineSignRecord } from './engine/core/keys';
 import { relayHttpBase } from './network/account-resolver';
 import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
@@ -1378,7 +1379,9 @@ function refreshTab() {
     case 'transfer': refreshTransfer(); break;
     case 'explorer': refreshExplorer(); break;
     case 'contracts': refreshContracts(); break;
-    case 'storage': refreshStorage(); break;
+    // Re-ask the archives when the tab is opened, so looking at the list is
+    // itself a refresh rather than a view of whenever the last poll happened.
+    case 'storage': refreshStorage(); void node.refreshStorageProviders(); break;
   }
 }
 
@@ -2110,11 +2113,11 @@ function attesterCandidates(): import('./network/libp2p-network').KnownRelayReco
       addr, peerId: peerIdFromMultiaddr(addr),
       lastSeen: 0, failCount: 0, announcerPub: '',
     })) as import('./network/libp2p-network').KnownRelayRecord[];
-  return withDevAttesterBases([...known, ...extra]);
+  return withDevRelayBases([...known, ...extra]);
 }
 
 /**
- * ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION (see network/dev-attester-proxy.ts).
+ * ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION (see network/dev-relay-proxy.ts).
  *
  * Point raw-IP attesters at the dev server's same-origin proxy, so an HTTPS
  * tunnel — the only way to reach a camera on a phone — is not cut down to a
@@ -2122,16 +2125,14 @@ function attesterCandidates(): import('./network/libp2p-network').KnownRelayReco
  * relay however it was learned (baked or gossiped), and never overrides a
  * `faceVerifyUrl` a relay announced for itself.
  *
- * `__DEV_ATTESTER_BASES__` is `{}` in every build, so this is a no-op there.
+ * The archive queries need the same treatment; `node.relayResolveBases()` does
+ * it there. Both are inert in a build.
  */
-declare const __DEV_ATTESTER_BASES__: Record<string, string> | undefined;
-function withDevAttesterBases(
+function withDevRelayBases(
   relays: import('./network/libp2p-network').KnownRelayRecord[],
 ): import('./network/libp2p-network').KnownRelayRecord[] {
-  const bases = typeof __DEV_ATTESTER_BASES__ !== 'undefined' ? __DEV_ATTESTER_BASES__ : {};
-  if (!bases || Object.keys(bases).length === 0) return relays;
   return relays.map(r => {
-    const base = r.peerId ? bases[r.peerId] : undefined;
+    const base = devRelayBaseFor(r.peerId);
     return base && !r.faceVerifyUrl ? { ...r, faceVerifyUrl: base } : r;
   });
 }
@@ -3500,6 +3501,9 @@ function wireNodeEvents() {
   });
   node.storage.on('file:index-updated', () => { refreshStorage(); });
   node.storage.on('storage:providers-updated', () => { refreshStorage(); });
+  // Discovery emits on the NODE, not on StorageManager — listening only on the
+  // latter meant the Storage tab never re-rendered when providers were found.
+  node.on('storage:providers-updated', () => { refreshStorage(); });
   node.ledger.on('storage:deregistered', () => { refreshStorage(); });
   node.on('peer:connected', () => { refreshNode(); });
   node.on('peer:disconnected', () => { refreshNode(); });

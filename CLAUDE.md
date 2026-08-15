@@ -441,13 +441,20 @@ are fine unprompted.
 Deliberate, temporary workarounds that **must not ship in any built bundle**.
 Check this list before any deploy that is not a dev server.
 
-- **Dev attester proxy** (`src/network/dev-attester-proxy.ts`, added 2026-08-15,
+- **Dev relay proxy** (`src/network/dev-relay-proxy.ts`, added 2026-08-15,
   Lucian's call). The Vite dev server proxies each raw-IP bootstrap relay under
-  `/dev-attester/<n>` so the HTTPS tunnel can attest against more than one of
-  them. Needed because face capture requires a secure context, so a phone can
-  only reach the app over the tunnel, and an HTTPS page may not fetch the
-  relays' plain-`http://` endpoints — mixed content silently reduced account
+  `/dev-relay/<n>`. Needed because face capture requires a secure context, so a
+  phone can only reach the app over the tunnel, and an HTTPS page may not fetch
+  the relays' plain-`http://` endpoints — mixed content silently reduced account
   creation to *"1 of 2 attesters responded"*.
+
+  It fronts the **whole relay HTTP API**, not just attestation: the archive
+  queries (`/resolve`, `/pending-sends`, `/head-proof`, `/token`, `/block`,
+  `/providers`) hit the same wall, so on the tunnel a phone was falling back to
+  the single same-origin dev relay and silently losing every other archive — no
+  cross-shard provider discovery, no counterparty proofs, no directory lookups
+  beyond one node's view. `node.relayResolveBases()` adds the proxied bases;
+  `withDevRelayBases()` does the attester half.
 
   **Why it cannot ship:** it routes attestation through the page's own origin.
   An attester is supposed to be an INDEPENDENT party, so this makes 2-of-N
@@ -461,7 +468,7 @@ Check this list before any deploy that is not a dev server.
   Structurally dev-only already: `vite.config.ts` derives it only when
   `command === 'serve'`, so a build bakes `__DEV_ATTESTER_BASES__` as `{}` and
   the client lookup is inert — verified by grepping `dist/` for `dev-attester`.
-  `dev-attester-proxy.test.ts` pins the empty-input contract. **Delete it
+  `dev-relay-proxy.test.ts` pins the empty-input contract. **Delete it
   anyway** rather than relying on the guard.
 
 ## Development mode — data is disposable
