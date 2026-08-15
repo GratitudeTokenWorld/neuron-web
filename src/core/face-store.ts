@@ -1,36 +1,49 @@
 /**
- * Face+PIN combined-key encrypted key storage (pinVersion=2).
+ * Face+PIN(+network share) encrypted key storage.
  *
- * Encryption scheme:
- *   faceBytes  = PBKDF2-SHA256(quantizedDescriptor, "neuronchain-face-v1", 100k)   32 bytes
- *   pinBytes   = PBKDF2-SHA512(pin, pinSalt, 600k)                                 32 bytes
- *   sharedKey  = AES-GCM key derived from XOR(faceBytes, pinBytes)
- *   encryptedKeys = AES-GCM(sharedKey, KeyPairJSON)   ← single layer
+ * Current scheme (pinVersion=3, "custody-split"):
+ *   faceBytes  = PBKDF2-SHA256(quantizedDescriptor, per-account salt, 100k)   32 bytes
+ *   pinBytes   = PBKDF2-SHA512(pin, pinSalt, 600k)                            32 bytes
+ *   shareBytes = 32 random bytes, generated at creation, held by the RELAYS —
+ *                NEVER stored in the blob, released only to a live face that
+ *                matches the account's enrolled identity (nid), rate-limited
+ *                server-side (relay/server.ts → /recovery-share/release)
+ *   encryptedKeys      = AES-GCM(XOR(faceBytes, pinBytes, shareBytes), KeyPairJSON)
+ *   encryptedCanonical = AES-GCM(XOR(pinBytes, shareBytes), canonical descriptor)
  *
- * Both factors are required to derive sharedKey; neither alone can decrypt.
- * The PIN salt and pinVerifier are stored in the blob (enabling UX PIN
- * verification), but the main payload requires the combined key.
+ * Why v3 exists — the v2 lesson, learned by running the attack (2026-08-15):
+ * v2 sealed `encryptedCanonical` under the PIN key ALONE. The PIN therefore
+ * unlocked the face descriptor, and the descriptor was the other half of the
+ * "combined" key — so the 4-digit PIN was the ONLY protection on the account
+ * keys, ~50 min of offline PBKDF2 for anyone holding the public blob, and it
+ * leaked the biometric as a bonus. The face check was client-side policy an
+ * attacker simply deletes. Two factors sealed inside one public blob can never
+ * be more than the weaker factor: the blob hands every input except the PIN to
+ * the attacker by construction.
  *
- * The blob also carries a face-key-encrypted attempt counter so that
- * exponential backoff state transfers to new devices when the blob is
- * fetched from the libp2p network.
+ * v3 fixes this by making the third input LIVE SOMEWHERE ELSE. What each party
+ * gets:
+ *   blob alone                     → nothing (AES under unknown 256-bit keys)
+ *   blob + PIN                     → nothing: encryptedCanonical needs the share,
+ *                                    and the share sits behind a relay-enforced
+ *                                    live-face match with exponential backoff
+ *                                    that clearing site data cannot reset
+ *   blob + share (rogue relay)     → still needs the PIN: 600k-iteration PBKDF2
+ *                                    per guess — i.e. a compromised relay only
+ *                                    degrades to the OLD security level, and the
+ *                                    biometric stays sealed under the PIN
+ *   blob + PIN + live face (owner) → recovery
+ * The pinVerifier still allows offline PIN CONFIRMATION for a blob holder
+ * (kept for local UX); with v3 a confirmed PIN no longer opens anything.
  *
- * ⚠ What that counter is and is NOT. It is sealed under the ENROLLMENT face key,
- * which is only recoverable by decrypting `encryptedCanonical` with the PIN — so
- * it can be read only on a recovery that already succeeded, never as a gate
- * before one. It therefore carries backoff state between a user's own devices;
- * it is not, and cannot be, a defence against PIN guessing. No such defence is
- * possible in the blob: the blob is public by design (gossiped and archived so
- * recovery does not depend on any one peer), so an attacker holding it has
- * exactly the inputs the legitimate user has before the PIN is known, and can in
- * any case brute-force `pinVerifier` offline while ignoring the counter
- * entirely. What actually costs the attacker is the KDF — PBKDF2-SHA-512 at
- * 600k iterations, ~300 ms per guess (see pin-crypto.ts). Enforced rate limiting
- * would have to live on the relay that serves the blob, and does not today.
+ * The blob also carries a face-key-encrypted attempt counter (see field doc):
+ * it transfers local-backoff state between a user's own devices. The ENFORCED
+ * limits are the relay-side ones on /recovery-share/release; the local IDB
+ * counter (`checkPinLockout`) and signed `LockoutNotice` gossip remain as
+ * device-local UX friction.
  *
- * The live enforcement path is local IndexedDB (`checkPinLockout`) plus signed
- * `LockoutNotice` gossip — both in pin-crypto.ts, neither of which reads this
- * field.
+ * pinVersion history: 0 = face-only, 1 = PIN-outer/face-inner layers,
+ * 2 = XOR(face,pin) with PIN-sealed canonical (the flaw above), 3 = current.
  */
 
 import { KeyPair } from './crypto';
@@ -69,7 +82,11 @@ export interface EncryptedKeyBlob {
   linkedAnchor?: string;
   /** base64 32-byte PBKDF2 salt for PIN key derivation */
   pinSalt?: string;
-  /** 0 = legacy face-only, 1 = face+PIN two-layer, 2 = face+PIN combined key (current) */
+  /**
+   * 0 = legacy face-only, 1 = face+PIN two-layer, 2 = face+PIN combined key
+   * (canonical sealed under PIN alone — the flaw), 3 = custody-split: a third
+   * random factor is held by the relays and never appears in this blob.
+   */
   pinVersion?: number;
   /**
    * JSON {failedAttempts, lockedUntil} encrypted with the ENROLLMENT face key
@@ -82,11 +99,15 @@ export interface EncryptedKeyBlob {
   /** AES-GCM(pinKey, "PINOK") - allows verifying PIN without decrypting full key blob */
   pinVerifier?: string;
   /**
-   * AES-GCM(pinKey, JSON(canonical descriptor)) - the pre-quantization averaged
-   * face descriptor, encrypted with the PIN key so recovery is deterministic.
-   * Decrypted with PIN → quantize → derive face key (same key as enrollment).
-   * Without this field the face key must be derived from the live scan, which
-   * is not reliably reproducible across sessions.
+   * The pre-quantization averaged face descriptor — the input the face key is
+   * deterministically derived from (a live scan cannot reproduce quantization
+   * bins, which is why this field exists at all).
+   *
+   * v3: AES-GCM(XOR(pinBytes, shareBytes), JSON(canonical)) — needs the PIN
+   * AND the relay-held share, so neither a PIN-cracker nor a rogue relay can
+   * read the biometric, and neither can reach the key material behind it.
+   * v2/v1: AES-GCM(pinKey, JSON(canonical)) — sealed under the PIN alone,
+   * which is what let a PIN-cracker walk the chain to the account keys.
    */
   encryptedCanonical?: string;
   /**
@@ -100,15 +121,43 @@ export interface EncryptedKeyBlob {
 // ── Combined key derivation ───────────────────────────────────────────────────
 
 /**
- * Derive an AES-256-GCM key from XOR(faceBytes, pinBytes).
- * Used by both createEncryptedKeyBlob and recoverKeysWithFace for pinVersion=2.
- * Also exported so that main.ts can re-derive the combined key for blob updates
- * (face update, PIN change) without re-running the full recovery flow.
+ * XOR any number of 32-byte factors into one AES-256-GCM key.
+ *
+ * XOR is the right combiner here precisely because it is information-theoretic:
+ * with `shareBytes` uniformly random and absent from the blob, the XOR of the
+ * other factors reveals NOTHING about the key — an attacker missing any one
+ * 32-byte input faces the full 2^256 keyspace, not a reduced one. (Contrast
+ * layered encryption, where each layer can be attacked as its outermost shell.)
+ */
+async function xorKey(...parts: Uint8Array[]): Promise<CryptoKey> {
+  const xored = new Uint8Array(32);
+  for (const p of parts) {
+    for (let i = 0; i < 32; i++) xored[i] ^= p[i];
+  }
+  return crypto.subtle.importKey('raw', xored as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+/**
+ * v2 pair key — XOR(faceBytes, pinBytes). Kept for reading v2 blobs and for
+ * main.ts blob-update paths that still handle them.
  */
 export async function deriveCombinedKey(faceBytes: Uint8Array, pinBytes: Uint8Array): Promise<CryptoKey> {
-  const xored = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) xored[i] = faceBytes[i] ^ pinBytes[i];
-  return crypto.subtle.importKey('raw', xored as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  return xorKey(faceBytes, pinBytes);
+}
+
+/** v3 outer key — XOR(faceBytes, pinBytes, shareBytes). All three or nothing. */
+export async function deriveTripleKey(faceBytes: Uint8Array, pinBytes: Uint8Array, shareBytes: Uint8Array): Promise<CryptoKey> {
+  return xorKey(faceBytes, pinBytes, shareBytes);
+}
+
+/**
+ * The recovery share: 32 uniformly random bytes minted at account creation.
+ * Its entire value is WHERE it lives — on the relays, bound to the account's
+ * enrolled identity (nid), behind a live-face release gate — so it must never
+ * be written into the blob, logged, or gossiped.
+ */
+export function generateRecoveryShare(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(32));
 }
 
 // ── linkedAnchor computation ──────────────────────────────────────────────────
@@ -162,14 +211,18 @@ async function readAttemptState(
 // ── Blob creation ─────────────────────────────────────────────────────────────
 
 /**
- * Create a combined-key encrypted key blob (pinVersion=2).
+ * Create an encrypted key blob.
  *
- * If `pin` is provided:
- *   sharedKey     = AES-GCM(XOR(faceBytes, pinBytes))
- *   encryptedKeys = AES-GCM(sharedKey, KeyPair JSON)   ← single layer, both factors required
+ * With `pin` + `recoveryShare` (pinVersion=3, the only mode new accounts use):
+ *   encryptedKeys      = AES-GCM(XOR(faceBytes, pinBytes, shareBytes), KeyPair JSON)
+ *   encryptedCanonical = AES-GCM(XOR(pinBytes, shareBytes), canonical)
+ *   — the share goes to the relays via storeRecoveryShare, NOT into this blob.
  *
- * If `pin` is omitted (legacy face-only path):
- *   encryptedKeys = AES-GCM(face key, KeyPair JSON)
+ * With `pin` alone (pinVersion=2): the legacy combined-key layout. Kept ONLY so
+ * old blobs remain readable and old tests meaningful — do not create new v2
+ * blobs in app code; a v2 blob is PIN-strength only (see module header).
+ *
+ * With neither (pinVersion=0): legacy face-only.
  */
 export async function createEncryptedKeyBlob(
   keys: KeyPair,
@@ -185,7 +238,14 @@ export async function createEncryptedKeyBlob(
    * acc.pub) all stay consistent. Defaults to keys.pub for legacy/test callers.
    */
   accountId: string = keys.pub,
+  /** 32 random bytes from generateRecoveryShare(); presence selects pinVersion=3. */
+  recoveryShare?: Uint8Array,
 ): Promise<EncryptedKeyBlob> {
+  if (recoveryShare && (!pin || recoveryShare.length !== 32)) {
+    // A share without a PIN would make the relay the sole gate on the keys;
+    // a short share would silently shrink the keyspace. Both are caller bugs.
+    throw new Error('recoveryShare requires a PIN and must be 32 bytes');
+  }
   const quantized = quantizeDescriptor(canonicalDescriptor);
   // Enrollment-canonical face key. Seals pinAttemptState (and, for pinVersion=0,
   // the keys themselves). recoverKeysWithFace re-derives exactly this key from
@@ -208,15 +268,28 @@ export async function createEncryptedKeyBlob(
     // One PBKDF2 call for the PIN - reuse pinBytes for both pinKey and combined key
     const pinBytes = await derivePinRawBits(pin, saltBytes);
     const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-
-    // Combined key: XOR(faceBytes, pinBytes) - both factors required to decrypt
     const faceBytes = await deriveFaceRawBits(quantized, accountId);
-    const sharedKey = await deriveCombinedKey(faceBytes, pinBytes);
-    encryptedKeys = await encryptWithPinKey(keysJson, sharedKey);  // single layer
+
+    if (recoveryShare) {
+      // v3: keys under all three factors; canonical under PIN+share, so the
+      // biometric (and the face key derived from it) is out of reach of a
+      // PIN-cracker AND of a rogue relay — each holds one factor, not two.
+      const outerKey = await deriveTripleKey(faceBytes, pinBytes, recoveryShare);
+      encryptedKeys = await encryptWithPinKey(keysJson, outerKey);
+      encryptedCanonical = await encryptWithPinKey(
+        JSON.stringify(canonicalDescriptor),
+        await xorKey(pinBytes, recoveryShare),
+      );
+      pinVersion = 3;
+    } else {
+      // v2 (legacy readers/tests only): XOR(face,pin), canonical under PIN alone.
+      const sharedKey = await deriveCombinedKey(faceBytes, pinBytes);
+      encryptedKeys = await encryptWithPinKey(keysJson, sharedKey);
+      encryptedCanonical = await encryptWithPinKey(JSON.stringify(canonicalDescriptor), pinKey);
+      pinVersion = 2;
+    }
 
     pinVerifier = await encryptWithPinKey('PINOK', pinKey);
-    encryptedCanonical = await encryptWithPinKey(JSON.stringify(canonicalDescriptor), pinKey);
-    pinVersion = 2;
   } else {
     encryptedKeys = await encryptWithFaceKey(keysJson, faceKey);
   }
@@ -307,19 +380,25 @@ export interface RecoveryResult {
 }
 
 /**
- * Recover keys from a blob using a face scan and PIN.
+ * Recover keys from a blob using a face scan, PIN, and (v3) the relay-released
+ * recovery share.
  *
  * Supports:
+ *   pinVersion=3 (custody-split): canonical under XOR(pin,share); keys under
+ *                XOR(face,pin,share). `recoveryShare` is REQUIRED — obtained
+ *                from a relay via the live-face release gate, or from the local
+ *                cache on a device that already recovered once.
  *   pinVersion=2 (combined key): derives sharedKey = AES(XOR(faceBytes, pinBytes))
  *   pinVersion=1 (two-layer legacy): decrypts PIN outer then face inner
  *   pinVersion=0 (face-only legacy): decrypts with face key only
  *
- * Returns null if decryption fails (wrong face or wrong PIN).
+ * Returns null if decryption fails (wrong face, wrong PIN, or wrong share).
  */
 export async function recoverKeysWithFace(
   blob: EncryptedKeyBlob,
   newDescriptor: number[],
   pin?: string,
+  recoveryShare?: Uint8Array,
 ): Promise<RecoveryResult | null> {
   // Live-scan face key. ONLY the legacy pinVersion=0 path may use this: there
   // the payload really is sealed under a live-reproducible key, which is the
@@ -327,6 +406,55 @@ export async function recoverKeysWithFace(
   // per-branch, under the key it was written with (see readAttemptState).
   const quantized = quantizeDescriptor(newDescriptor);
   const faceKey = await deriveFaceKey(quantized, blob.pub);
+
+  // ── Custody-split blob (pinVersion === 3) ──────────────────────────────────
+  if (blob.pinVersion === 3) {
+    if (!pin || !recoveryShare || recoveryShare.length !== 32 || !blob.pinSalt || !blob.encryptedCanonical) return null;
+
+    const saltBytes = Uint8Array.from(atob(blob.pinSalt), c => c.charCodeAt(0));
+    const pinBytes = await derivePinRawBits(pin, saltBytes);
+    const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+
+    // Fast PIN check — saves the user a wrong-share round trip when it is the
+    // PIN that's wrong. (An attacker can run this offline too; with v3 a
+    // confirmed PIN opens nothing, which is why the verifier is still safe.)
+    if (blob.pinVerifier) {
+      const pv = await decryptWithPinKey(blob.pinVerifier, pinKey);
+      if (pv !== 'PINOK') return null;
+    }
+
+    // Canonical needs PIN AND share — this line is the whole point of v3:
+    // the step v2 let a PIN-cracker take alone now requires the factor the
+    // relay only releases to a live matching face.
+    const canonicalJson = await decryptWithPinKey(
+      blob.encryptedCanonical,
+      await xorKey(pinBytes, recoveryShare),
+    );
+    if (!canonicalJson) return null;
+
+    let storedCanonical: number[];
+    try { storedCanonical = JSON.parse(canonicalJson) as number[]; } catch { return null; }
+
+    // Biometric gate on RAW descriptors (see the v2 branch for why raw), logged
+    // via matchOrLog. Client-side policy here; the ENFORCED face check already
+    // happened at the relay before it released the share.
+    if (!matchOrLog(storedCanonical, newDescriptor)) return null;
+
+    const storedQuantized = quantizeDescriptor(storedCanonical);
+    const faceBytes = await deriveFaceRawBits(storedQuantized, blob.pub);
+    const outerKey = await deriveTripleKey(faceBytes, pinBytes, recoveryShare);
+    const decrypted = await decryptWithPinKey(blob.encryptedKeys, outerKey);
+    if (!decrypted) return null;
+
+    let keys: KeyPair;
+    try {
+      keys = JSON.parse(decrypted) as KeyPair;
+      if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
+    } catch { return null; }
+
+    const resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
+    return { keys, faceKey: resolvedFaceKey, attemptState: await readAttemptState(blob, resolvedFaceKey) };
+  }
 
   // ── Combined-key blob (pinVersion === 2) ───────────────────────────────────
   if (blob.pinVersion === 2) {

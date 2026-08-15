@@ -190,6 +190,50 @@ check(
   'unknown token id yields no mint proof',
 );
 
+// ── v3 custody endpoints (2026-08-15): targeted key-blob path + share gates ──
+// The keyblobs gossip topic is gone; these HTTP endpoints replaced it. The
+// probe leaves one throwaway blob per run (dev-mode data, wiped on reset).
+{
+  const { storeKeyBlobOnRelays, fetchKeyBlobFromRelays } = await import('../src/network/recovery-share.js');
+  const bases = RELAYS.map((r) => r.http);
+  const blobUser = `g3smoke${Date.now().toString(36)}`;
+  const fakeBlob = {
+    pub: keys.pub, username: blobUser, encryptedKeys: 'ff'.repeat(24),
+    faceMapHash: 'a'.repeat(64), createdAt: Date.now(), updatedAt: Date.now(), pinVersion: 3,
+  };
+  const stored = await storeKeyBlobOnRelays(bases, fakeBlob, 'testnet');
+  check(stored === RELAYS.length, `POST /keyblob accepted by ${stored}/${RELAYS.length} relays`);
+  const fetched = await fetchKeyBlobFromRelays(bases, { username: blobUser }, 'testnet');
+  check(!!fetched && fetched.pub === keys.pub && fetched.encryptedKeys === fakeBlob.encryptedKeys,
+    'GET /keyblob round-trips the stored blob');
+  check((await fetchKeyBlobFromRelays(bases, { username: `nosuch${Date.now().toString(36)}` }, 'testnet')) === null,
+    'GET /keyblob for an unknown username yields null');
+
+  for (const r of RELAYS) {
+    // Share store without an attested identity must be refused (this throwaway
+    // account never went through face attestation on the relays).
+    const ts = Date.now();
+    const payload = `recovery-share:${keys.pub}:testnet:${'ab'.repeat(32)}:${ts}`;
+    const res = await fetch(`${r.http}/recovery-share`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
+      body: JSON.stringify({ accountId: keys.pub, share: 'ab'.repeat(32), ts, sig: sign(payload, keys.priv) }),
+    });
+    check(res.status === 409, `${r.name} refuses a share for an un-attested account (409, got ${res.status})`);
+    // A forged store signature must be refused outright.
+    const badSig = await fetch(`${r.http}/recovery-share`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
+      body: JSON.stringify({ accountId: keys.pub, share: 'ab'.repeat(32), ts: ts + 1, sig: 'cd'.repeat(32) }),
+    });
+    check(badSig.status === 403, `${r.name} refuses a forged share-store signature (403, got ${badSig.status})`);
+    // Release without a valid challenge session must be refused.
+    const rel = await fetch(`${r.http}/recovery-share/release`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' },
+      body: JSON.stringify({ accountId: keys.pub, challengeId: 'bogus', descriptor: new Array(128).fill(0.1), ephPub: '04' + 'ab'.repeat(64) }),
+    });
+    check(rel.status === 400, `${r.name} refuses a release without a valid challenge (400, got ${rel.status})`);
+  }
+}
+
 await node.stop();
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

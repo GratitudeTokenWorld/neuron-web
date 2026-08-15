@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **238 tests / 55 files passing**, `npm run build` clean.
+Current baseline: **244 tests / 55 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -65,7 +65,7 @@ Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
   chain is held at all.
 
 TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
-`npx tsx scripts/g1-resolve-smoke.mts` (21 checks) after every relay deploy.
+`npx tsx scripts/g1-resolve-smoke.mts` (30 checks) after every relay deploy.
 
 **Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
 `src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`
@@ -186,18 +186,32 @@ Changes here need adversarial tests, not just happy-path ones.
   realistic 0.25–0.45 "same person, different session" band is tested; the older
   face tests only ever compare a descriptor to itself or to an obvious stranger.
   Note the live scan does **not** feed key derivation for `pinVersion` ≥ 1 (the
-  canonical comes out of the blob under the PIN), so it is purely a gate — and
-  **nothing else may key off a live scan either**, because a fresh camera frame
-  cannot reproduce a 128-D bin vector. `pinAttemptState` did exactly that: it is
-  written under the *enrollment* face key but was read back under the live-scan
-  one, so the counter never decrypted once and every recovery silently reported
-  zero failed attempts. Fixed 2026-08-15 by reading it per-branch under the key
-  it was written with. Read the module header of `face-store.ts` before touching
-  that field: it can only be read *after* a successful PIN, so it carries backoff
-  state between a user's own devices and **cannot gate PIN guessing** — the blob
-  is public, so an attacker has the same pre-PIN inputs the user does and can
-  brute-force `pinVerifier` offline regardless. The cost to them is the KDF
-  (600k PBKDF2-SHA-512); enforced rate limiting would have to live on the relay.
+  canonical comes out of the blob), so it is purely a gate — and **nothing else
+  may key off a live scan either**, because a fresh camera frame cannot
+  reproduce a 128-D bin vector. (`pinAttemptState` did exactly that and its
+  counter never decrypted once; fixed 2026-08-15 — read per-branch under the
+  key each blob version was written with.)
+- **Key custody (pinVersion=3, 2026-08-15) — the blob alone must never be
+  enough.** v2 sealed `encryptedCanonical` under the PIN key alone, so the PIN
+  unlocked the face descriptor and the descriptor was the other half of the
+  "combined" key: anyone holding the public blob was one 4-digit offline
+  brute-force (~50 min of PBKDF2) away from the account keys AND the biometric.
+  Proven by running the attack (`face-match.test.ts` keeps it as the v2 control).
+  The general lesson: **N factors sealed inside one public object are worth
+  exactly the weakest factor** — a second encryption layer in the same blob
+  changes nothing. v3 splits custody instead: keys under
+  `XOR(faceBytes, pinBytes, shareBytes)`, canonical under `XOR(pin, share)`,
+  where the 32-byte **recovery share** lives ONLY on the relays
+  (`.relay-recovery-shares.json`, nid-bound), released by
+  `POST /recovery-share/release` to a live face the relay itself matches, under
+  server-side exponential backoff — the one rate limit a client wipe cannot
+  reset. Devices cache the share after proving themselves (pin-crypto IDB), so
+  relays are needed for *fresh-device recovery only*, not daily use. Rogue-relay
+  blast radius = the old v2 bar (share+blob still needs the PIN). The keyblobs
+  gossip topic is REMOVED (it broadcast every blob to every node — O(N) and a
+  harvesting surface); blobs move via `POST/GET /keyblob` only. Never put the
+  biometric in the public account record under any single factor, and never
+  create new v2 blobs.
 - **Neither descriptor spread nor luma separates good lighting from bad — the
   cross-session distance is the only number that decides recoverability.**
   Measured 2026-08-15, same face and camera: a dim room lit by a phone flashlight

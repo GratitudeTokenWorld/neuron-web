@@ -38,6 +38,14 @@ export default defineConfig({
       '/resolve': {
         target: 'http://localhost:9092',
       },
+      // v3 custody: recovery-share store/release + targeted key-blob store/fetch
+      // against the same-origin dev relay (same pattern as /resolve).
+      '/recovery-share': {
+        target: 'http://localhost:9092',
+      },
+      '/keyblob': {
+        target: 'http://localhost:9092',
+      },
     },
   },
   build: {

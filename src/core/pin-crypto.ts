@@ -16,6 +16,7 @@ import { openDB } from 'idb';
 
 const DB_NAME = 'neuronchain-security';
 const STORE_NAME = 'pinAttempts';
+const SHARE_STORE = 'recoveryShares';
 const KDF_ITERATIONS = 600_000;
 
 // Backoff schedule: attempts > 3 get exponential delay (seconds)
@@ -49,13 +50,55 @@ export function lockoutPayload(n: LockoutNotice): string {
 // ── Database ───────────────────────────────────────────────────────────────────
 
 async function getDB() {
-  return openDB(DB_NAME, 1, {
+  return openDB(DB_NAME, 2, {
     upgrade(db) {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'accountPub' });
       }
+      // v2: device-local cache of the account's recovery share (pinVersion=3).
+      if (!db.objectStoreNames.contains(SHARE_STORE)) {
+        db.createObjectStore(SHARE_STORE, { keyPath: 'accountPub' });
+      }
     },
   });
+}
+
+// ── Recovery-share device cache ───────────────────────────────────────────────
+//
+// The share is minted at creation and held by the relays behind a live-face
+// release gate; this cache is what keeps a device that ALREADY proved itself
+// (created the account, or completed one full recovery) working offline —
+// PIN change and face change need the share, and demanding a relay round trip
+// for those on the owner's own device would make the relay a required party
+// for daily operation rather than for recovery only.
+//
+// Threat note, considered and accepted: the cache is plaintext IDB, so a
+// stolen unlocked device holds blob + share and the PIN is the remaining
+// factor — exactly the pre-v3 bar, but now only for an attacker with physical
+// device access instead of anyone on the network. Sealing the cache under the
+// PIN would buy nothing (the same attacker brute-forces it offline) and would
+// break the PIN-change flow (which needs the share to re-seal the blob under
+// the NEW pin).
+
+export async function cacheRecoveryShare(accountPub: string, shareHex: string): Promise<void> {
+  const db = await getDB();
+  await db.put(SHARE_STORE, { accountPub, shareHex, cachedAt: Date.now() });
+}
+
+export async function getCachedRecoveryShare(accountPub: string): Promise<Uint8Array | null> {
+  try {
+    const db = await getDB();
+    const row = await db.get(SHARE_STORE, accountPub) as { shareHex?: string } | undefined;
+    if (!row?.shareHex || !/^[0-9a-f]{64}$/i.test(row.shareHex)) return null;
+    return Uint8Array.from(row.shareHex.match(/.{2}/g)!.map(b => parseInt(b, 16)));
+  } catch { return null; }
+}
+
+export async function deleteCachedRecoveryShare(accountPub: string): Promise<void> {
+  try {
+    const db = await getDB();
+    await db.delete(SHARE_STORE, accountPub);
+  } catch { /* cache only */ }
 }
 
 // ── Backoff schedule ──────────────────────────────────────────────────────────

@@ -1114,6 +1114,8 @@ export class NeuronNode extends EventEmitter {
 
   /** Relay HTTP bases to try for /resolve: known relays + baked bootstraps +
    *  the same-origin dev relay ('' → relative path via the Vite/nginx proxy). */
+  relayHttpBases(): string[] { return this.relayResolveBases(); }
+
   private relayResolveBases(): string[] {
     const addrs = new Set<string>();
     for (const r of this.net.getKnownRelays()) if (r.addr) addrs.add(r.addr);

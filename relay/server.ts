@@ -73,9 +73,19 @@ const ATTESTER_KEY_FILE = process.env.ATTESTER_KEY_FILE || inData('.relay-attest
 // (pure relay). NOTE: JSON file is fine for the first super-node / testing; swap
 // for LevelDB/SQLite when chains grow (see docs/SUPERNODE.md).
 const ENGINE_BLOCKS_FILE = process.env.ENGINE_BLOCKS_FILE || inData('.relay-engine-blocks.json');
-// Key-blob archive: lets a fully-wiped device recover without any peer online
-// (the blob is face+PIN-encrypted, so storing it is safe — both factors required).
+// Key-blob archive: lets a fully-wiped device recover without any peer online.
+// v3 blobs are safe to store and serve: the keys inside need face+PIN+the
+// recovery share, and the share never appears in the blob. Fetch is HTTP-only
+// and per-IP limited (GET /keyblob) — the global keyblobs gossip topic that used
+// to hand every blob to every node is gone (it was an O(N) broadcast AND a
+// harvesting surface; see face-store.ts module header).
 const KEYBLOBS_FILE = process.env.KEYBLOBS_FILE || inData('.relay-keyblobs.json');
+// Recovery shares (pinVersion=3): the third key factor, one 32-byte secret per
+// account, bound to the human's nid at store time. THE SECURITY-CRITICAL FILE
+// on this box after the identity keys — it is what stands between a leaked PIN
+// and an account, so it is written 0o600 and must never be logged or served
+// except through the face-gated release endpoint below.
+const RECOVERY_SHARES_FILE = process.env.RECOVERY_SHARES_FILE || inData('.relay-recovery-shares.json');
 // Account-record archive (G1): the relay is the directory tier now that clients
 // no longer subscribe to the global `accounts` topic — they resolve a username/
 // pub on demand via HTTP `/resolve` and cache the result. Records here are
@@ -330,6 +340,103 @@ async function saveKeyBlobs() {
 }
 setInterval(() => { saveKeyBlobs().catch(() => {}); }, 5_000);
 
+// ── Recovery shares (pinVersion=3 custody split) ──────────────────────────────
+// `${network}:${accountId}` → { accountId, nid, network, shareHex, ts,
+//                               fails, lockedUntil }
+//
+// The share is the third key factor (see src/core/face-store.ts): without it a
+// blob + a cracked PIN opens nothing. This store's one job is to release it
+// ONLY to a live face whose nid matches the one bound at store time, under an
+// exponential backoff that survives everything a client can reset — which is
+// exactly what the browser-side lockout could never guarantee (clearing site
+// data zeroed it, and a recovery on a wiped device cannot even sign its
+// LockoutNotice yet). Backoff state lives inside the record so it persists
+// with the same atomic write.
+const recoveryShareStore = new Map();
+let recoverySharesDirty = false;
+
+async function loadRecoveryShares() {
+  try {
+    for (const r of JSON.parse(await fs.readFile(RECOVERY_SHARES_FILE, 'utf8'))) {
+      recoveryShareStore.set(`${r.network}:${r.accountId}`, r);
+    }
+    console.log(`[Recovery] Loaded ${recoveryShareStore.size} recovery share(s)`);
+  } catch { /* none yet */ }
+}
+
+async function saveRecoveryShares() {
+  if (!recoverySharesDirty) return;
+  recoverySharesDirty = false;
+  // 0o600 like the identity keys: this file turns a leaked PIN into an account.
+  await atomicWrite(RECOVERY_SHARES_FILE, JSON.stringify([...recoveryShareStore.values()]), 0o600);
+}
+setInterval(() => { saveRecoveryShares().catch(() => {}); }, 5_000);
+
+/**
+ * Same schedule as the client's pin-crypto backoff (3 free, then 30s·4^(n-3),
+ * capped at 24h) — but enforced HERE, where "try again later" cannot be undone
+ * by clearing IndexedDB or replaying from a fresh IP.
+ */
+function releaseBackoffMs(fails) {
+  if (fails <= 3) return 0;
+  return Math.min(86_400_000, Math.round(30_000 * Math.pow(4, fails - 4)));
+}
+
+/** The accountId whose nid this relay bound at attestation time, if any. */
+function nidForAccount(accountId) {
+  const pending = pendingFaceUses.get(accountId);
+  if (pending?.nid) return pending.nid;
+  // Attestation consumed (open block landed) → the persistent username registry
+  // still maps the human: entries are { accountId, nid }.
+  for (const claim of usernameRegistry.values()) {
+    if (claim && claim.accountId === accountId && claim.nid) return claim.nid;
+  }
+  return null;
+}
+
+/**
+ * ECDH-wrap the share to the client's ephemeral P-256 key so the secret never
+ * crosses the wire in the clear — the dev relays speak plain HTTP, and a share
+ * sniffed once is a factor lost forever. Fresh relay ephemeral per response;
+ * AES key = SHA-256(ECDH x-coordinate).
+ */
+async function wrapShareForClient(shareHex, clientEphPubHex) {
+  const subtle = globalThis.crypto.subtle;
+  const clientPub = await subtle.importKey(
+    'raw', hexToBytes(clientEphPubHex), { name: 'ECDH', namedCurve: 'P-256' }, false, [],
+  );
+  const eph = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const bits = await subtle.deriveBits({ name: 'ECDH', public: clientPub }, eph.privateKey, 256);
+  const aesRaw = await subtle.digest('SHA-256', bits);
+  const aes = await subtle.importKey('raw', aesRaw, { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, aes, hexToBytes(shareHex));
+  const ephRaw = new Uint8Array(await subtle.exportKey('raw', eph.publicKey));
+  return { ephPub: bytesToHex(ephRaw), iv: bytesToHex(iv), ct: bytesToHex(new Uint8Array(ct)) };
+}
+
+// Per-IP caps for the recovery endpoints, separate from the enrollment counter
+// so a recovery cannot burn enrollment quota (and vice versa). In-memory like
+// ipVerifyLog, local IPs exempt. Release is the tighter one: it is the endpoint
+// an attacker must talk to.
+const ipReleaseLog = new Map();   // ip → { count, windowStart }
+const ipBlobLog = new Map();      // ip → { count, windowStart }
+const RELEASE_IP_MAX_PER_DAY = 30;
+const BLOB_IP_MAX_PER_DAY = 60;
+
+function checkAndRecordIp(log, ip, max) {
+  if (isLocalIp(ip)) return true;
+  const now = Date.now();
+  const entry = log.get(ip);
+  if (!entry || now - entry.windowStart > IP_WINDOW_MS) {
+    log.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= max) return false;
+  entry.count++;
+  return true;
+}
+
 // ── Account-record archive (G1 directory tier) ───────────────────────────────
 // `${network}:${pub}` → account record (username, pub, createdAt, pq keys, …).
 // Only ENGINE-VERIFIED records are stored: the record self-signs
@@ -425,6 +532,9 @@ function performNetworkWipe(newGeneration, source) {
   engineBlockStore.clear(); engineStoreDirty = true;
   engineHeightIndex.clear(); conflictAnnounced.clear(); // conflict index follows the archive
   keyBlobStore.clear(); keyBlobDirty = true;
+  // Shares go with the accounts they unlock: the wipe just destroyed every
+  // chain and blob, so an orphaned third factor is pure attack surface.
+  recoveryShareStore.clear(); recoverySharesDirty = true;
   usernameRegistry.clear(); usernameDirty = true;       // free the names
   accountStore.clear(); accountsDirty = true;           // wipe the directory too
   for (const e of faceDescriptorDB) e.count = 0;
@@ -436,7 +546,7 @@ function performNetworkWipe(newGeneration, source) {
   console.log(`[Archive] WIPED by ${source} → generation ${currentGeneration}`);
 }
 
-/** Archive a key-blob seen on the keyblobs topic (keep the newest per account). */
+/** Archive a key-blob from POST /keyblob (keep the newest per account). */
 function archiveKeyBlob(blob, network) {
   if (!ARCHIVE_ENABLED || !blob || !blob.pub || !blob.username || !blob.encryptedKeys) return;
   const existing = keyBlobStore.get(blob.pub);
@@ -622,6 +732,9 @@ async function main() {
   await loadUsernames();
   await loadOperators();
   await loadGeneration();
+  // Not gated on ARCHIVE_ENABLED: shares are identity infrastructure (the third
+  // key factor), not archival convenience — a pure relay must still serve them.
+  await loadRecoveryShares();
   if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); await loadAccounts(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
@@ -630,10 +743,11 @@ async function main() {
   // ── HTTP server (started BEFORE libp2p so face-verify works even if ports conflict) ──
 
   const httpServer = createServer(async (req, res) => {
-    // CORS preflight for face-verify endpoints
-    if (req.url?.startsWith('/face-verify')) {
+    // CORS preflight for the JSON-POST endpoints (face-verify, recovery-share,
+    // keyblob). GET endpoints stay preflight-free by using query params only.
+    if (req.url?.startsWith('/face-verify') || req.url?.startsWith('/recovery-share') || req.url?.startsWith('/keyblob')) {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       // Must include x-network: the client sends it on /face-verify requests, so a
       // cross-origin attestation (to a SECOND relay) preflights against this list.
       // Omitting it silently blocks cross-relay face-verify → only 1 attester (B4).
@@ -841,6 +955,174 @@ async function main() {
           res.writeHead(204);
           res.end();
         });
+
+      } else if (req.method === 'POST' && req.url === '/recovery-share') {
+        // Store the account's recovery share (pinVersion=3). Self-authenticating:
+        // signed by the accountId's engine key over the exact payload, so only
+        // the key owner can (re)bind a share — an unsigned overwrite would be an
+        // account-loss DoS. Newest signed ts wins; a replayed older store is
+        // rejected, so rotation cannot be undone from a capture.
+        let body;
+        try { body = await readJsonBody(req); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message })); return;
+        }
+        const { accountId, share, ts, sig } = body;
+        const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        if (typeof accountId !== 'string' || !/^0[23][0-9a-f]{64}$/i.test(accountId)
+          || typeof share !== 'string' || !/^[0-9a-f]{64}$/i.test(share)
+          || typeof ts !== 'number' || typeof sig !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'accountId, share (32-byte hex), ts, sig required' })); return;
+        }
+        let sigOk = false;
+        try { sigOk = engineVerify(sig, `recovery-share:${accountId}:${network}:${share}:${ts}`, accountId); } catch { /* bad sig */ }
+        if (!sigOk) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid signature' })); return;
+        }
+        const key = `${network}:${accountId}`;
+        const existing = recoveryShareStore.get(key);
+        if (existing && existing.ts >= ts) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'stale ts (replay?)' })); return;
+        }
+        // Bind the human: the nid this relay's own attestation flow assigned to
+        // the live face that created this account. Without a nid there is no
+        // identity to gate the release against, so the store is refused —
+        // creation stores the share right after attestation, when the binding
+        // is guaranteed fresh (pendingFaceUses), with the persistent username
+        // registry as the fallback once the open block has consumed it.
+        const nid = existing?.nid ?? nidForAccount(accountId);
+        if (!nid) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'no attested identity for this accountId on this relay' })); return;
+        }
+        recoveryShareStore.set(key, {
+          // Lowercased: @noble's hexToBytes (used by the release wrap) throws on
+          // uppercase, and a stored share that cannot be released is account loss.
+          accountId, nid, network, shareHex: share.toLowerCase(), ts,
+          fails: existing?.fails ?? 0, lockedUntil: existing?.lockedUntil ?? 0,
+        });
+        recoverySharesDirty = true;
+        console.log(`[Recovery] share stored acct=${accountId.slice(0, 12)}… nid=${String(nid).slice(0, 8)}…`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+
+      } else if (req.method === 'POST' && req.url === '/recovery-share/release') {
+        // THE gate. Releases the share only to a live face whose nid matches the
+        // one bound at store time — this is where recovery rate limiting became
+        // real: the backoff lives here, on the party the attacker must talk to,
+        // not in the attacker's own browser storage.
+        const ip = getClientIp(req);
+        let body;
+        try { body = await readJsonBody(req); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message })); return;
+        }
+        const { accountId, challengeId, descriptor, ephPub } = body;
+        const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        if (typeof accountId !== 'string' || typeof ephPub !== 'string' || !/^04[0-9a-f]{128}$/i.test(ephPub)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'accountId and ephPub (uncompressed P-256 hex) required' })); return;
+        }
+        // Session: same single-use challenge store as attestation — no
+        // challenge, no attempt; one challenge, one attempt. (Not IP-bound,
+        // matching /face-verify/verify; the per-IP cap below and the per-account
+        // backoff are the enforced limits.)
+        const session = challengeSessions.get(String(challengeId || ''));
+        if (!session || session.used || Date.now() - session.createdAt > CHALLENGE_TTL_MS) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid, used or expired challengeId' })); return;
+        }
+        session.used = true;
+        if (!checkAndRecordIp(ipReleaseLog, ip, RELEASE_IP_MAX_PER_DAY)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Rate limit: max ${RELEASE_IP_MAX_PER_DAY} release attempts per IP per 24h` })); return;
+        }
+        const record = recoveryShareStore.get(`${network}:${accountId}`);
+        if (!record) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'no share for this account on this relay' })); return;
+        }
+        // Server-side exponential backoff — the point of the whole endpoint.
+        if (record.lockedUntil > Date.now()) {
+          const retryAfterS = Math.ceil((record.lockedUntil - Date.now()) / 1000);
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfterS) });
+          res.end(JSON.stringify({ error: `locked - try again in ${retryAfterS}s`, retryAfterS })); return;
+        }
+        const fail = async (msg) => {
+          record.fails = (record.fails || 0) + 1;
+          record.lockedUntil = Date.now() + releaseBackoffMs(record.fails);
+          recoverySharesDirty = true;
+          console.log(`[Recovery] release DENIED acct=${accountId.slice(0, 12)}… ip=${ip} fails=${record.fails} (${msg})`);
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: msg }));
+        };
+        if (!validateDescriptor(descriptor)) { await fail('descriptor must be 128 finite numbers in (-2, 2)'); return; }
+        // Live-face match, read-only (no count/centroid updates — this is not an
+        // enrollment). Must land on the SAME human the share was bound to.
+        const matched = findMatchingFace(descriptor, network);
+        if (!matched || !matched.nid || matched.nid !== record.nid) { await fail('face does not match this account'); return; }
+        record.fails = 0;
+        record.lockedUntil = 0;
+        recoverySharesDirty = true;
+        // toLowerCase: @noble hexToBytes rejects uppercase hex.
+        const wrapped = await wrapShareForClient(record.shareHex, ephPub.toLowerCase());
+        console.log(`[Recovery] share released acct=${accountId.slice(0, 12)}… ip=${ip}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(wrapped));
+
+      } else if (req.method === 'POST' && req.url === '/keyblob') {
+        // Targeted replacement for the global keyblobs gossip topic: the owner
+        // POSTs the blob to the relays it knows; nobody else ever receives it.
+        const ip = getClientIp(req);
+        if (!checkAndRecordIp(ipBlobLog, ip, BLOB_IP_MAX_PER_DAY)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Rate limit: max ${BLOB_IP_MAX_PER_DAY} blob writes per IP per 24h` })); return;
+        }
+        let body;
+        try { body = await readJsonBody(req); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message })); return;
+        }
+        const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        const blob = body?.blob;
+        if (!blob || typeof blob.pub !== 'string' || typeof blob.encryptedKeys !== 'string' || typeof blob.username !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'blob{pub, encryptedKeys, username} required' })); return;
+        }
+        archiveKeyBlob(blob, network);   // newest-ts-wins lives in there
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+
+      } else if (req.method === 'GET' && req.url?.startsWith('/keyblob?')) {
+        // Recovery blob fetch (query params only — no preflight). Per-IP limited:
+        // a legitimate user fetches a handful of blobs per device lifetime, so a
+        // crawler stands out immediately. This limit is FRICTION, not the
+        // security boundary — a v3 blob without PIN and share opens nothing.
+        const ip = getClientIp(req);
+        if (!checkAndRecordIp(ipBlobLog, ip, BLOB_IP_MAX_PER_DAY)) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: `Rate limit: max ${BLOB_IP_MAX_PER_DAY} blob fetches per IP per 24h` })); return;
+        }
+        const url = new URL(req.url, 'http://localhost');
+        const network = url.searchParams.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const username = (url.searchParams.get('username') || '').trim().toLowerCase();
+        const pub = url.searchParams.get('pub') || '';
+        let best = null;
+        for (const b of keyBlobStore.values()) {
+          if (b.network !== network) continue;
+          if (pub ? b.pub !== pub : b.username !== username) continue;
+          if (!best || blobTs(b) > blobTs(best)) best = b;
+        }
+        if (!best) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'no blob' })); return;
+        }
+        const { network: _n, ...blobOut } = best;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(blobOut));
 
       } else if (req.method === 'POST' && req.url === '/face-verify/challenge') {
         const ip = getClientIp(req);
@@ -1196,8 +1478,8 @@ async function main() {
     pubsub.subscribe(`${pfx}/storage/receipts`);
     pubsub.subscribe(`${pfx}/storage/delete-requests`);
     pubsub.subscribe(`${pfx}/lockouts`);
-    pubsub.subscribe(`${pfx}/keyblobs`);
-    pubsub.subscribe(`${pfx}/blob-requests`);
+    // keyblobs / blob-requests topics: gone — blobs move over targeted HTTP
+    // (POST/GET /keyblob) so no node ever receives a stranger's blob.
     pubsub.subscribe(`${pfx}/peer-addrs`);
     pubsub.subscribe(`${pfx}/relays`);
     pubsub.subscribe(`${pfx}/snapshots`);
@@ -1262,20 +1544,6 @@ async function main() {
     dlog(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
   }
 
-  // Serve a recovery blob-request from the key-blob archive (newest per username).
-  function serveKeyBlobFromArchive(username, network) {
-    if (!ARCHIVE_ENABLED) return;
-    let best = null;
-    for (const b of keyBlobStore.values()) {
-      if (b.username === username && b.network === network && (!best || blobTs(b) > blobTs(best))) best = b;
-    }
-    if (!best) return;
-    const { network: _n, ...blob } = best;
-    pubsub.publish(`neuronchain/${PROTOCOL_VERSION}/${network}/keyblobs`,
-      new TextEncoder().encode(JSON.stringify(blob))).catch(() => {});
-    dlog(`[Archive] Served key-blob user=${username}`);
-  }
-
   pubsub.addEventListener('message', (evt) => {
     const msg = evt.detail;
     const topic = msg.topic;
@@ -1291,19 +1559,9 @@ async function main() {
       try { archiveAccountRecord(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
       return;
     }
-    // Archive key-blobs so recovery works with no peer online (face+PIN-encrypted).
-    if (topic.endsWith('/keyblobs')) {
-      try { archiveKeyBlob(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
-      return;
-    }
-    // Serve a recovery blob-request from the archive.
-    if (topic.endsWith('/blob-requests')) {
-      try {
-        const d = JSON.parse(new TextDecoder().decode(msg.data));
-        if (d.username) serveKeyBlobFromArchive(String(d.username), networkFromTopic(topic));
-      } catch { /* malformed */ }
-      return;
-    }
+    // NOTE key-blobs no longer ride gossip in either direction — the global
+    // topic was an O(N) broadcast that handed every account's blob to every
+    // node (a harvesting surface). Owners POST /keyblob; recovery GETs it.
     // Serve delta requests from the archive (durable shard holder).
     if (topic.includes('/engine-delta-req/')) {
       try {

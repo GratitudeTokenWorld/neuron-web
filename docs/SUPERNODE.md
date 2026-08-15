@@ -51,7 +51,19 @@ tier answer queries without becoming an authority.
 | `GET /token?id=&network=` | an NFT's mint proof (**G2**): the MINTER's open + head + `nft-mint` blocks with audit paths | `verifyMintProof` — token id match, mint inclusion on a verified-human chain |
 | `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
 | `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
+| `POST /keyblob` \| `GET /keyblob?username=\|pub=&network=` | targeted key-blob store/fetch (replaced the global `keyblobs` gossip topic 2026-08-15 — an O(N) broadcast and harvesting surface) | blob opens only with face+PIN+share (v3); `linkedAnchor` re-checked against the on-chain record at recovery. Per-IP limited |
+| `POST /recovery-share` | store an account's v3 recovery share, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{share}:{ts}` by the account's engine key; newest signed `ts` wins |
+| `POST /recovery-share/release` | **the recovery gate**: release the share to a live face matching the account's `nid` | server-side per-account exponential backoff (3 free, then 30s·4ⁿ up to 24h) + per-IP cap + single-use challenge session; response ECDH-wrapped to the client's ephemeral key |
 | `POST /log-reload` | dev telemetry sink | — |
+
+**`/recovery-share/release` is the exception to "a relay can serve or withhold,
+never forge".** The share is not client-verifiable content — it is a secret the
+relay custodies, and the face match that gates it runs ON the relay (against its
+own face DB, read-only). That makes this the one endpoint where the relay is an
+*authority*, which is deliberate: the whole point is rate limiting that an
+attacker cannot reset, and only a party the attacker must talk to can provide
+that. The blast radius of a rogue relay stays bounded — share + blob still
+needs the PIN (600k-iteration PBKDF2 per guess), i.e. exactly the pre-v3 bar.
 
 Two subtleties worth knowing before changing any of this:
 
@@ -83,7 +95,8 @@ the node's identity and breaks the baked bootstrap address).
 | `.relay-signing-key.json` | relay signing key | re-announce needed |
 | `.relay-face-db.json` | enrolled face descriptors + per-face account counts | face Sybil limit resets |
 | `.relay-engine-blocks.json` | archived engine blocks (the archive) | re-fills from gossip, but recovery durability is degraded until it does |
-| `.relay-keyblobs.json` | archived face+PIN-encrypted key-blobs (for peer-independent recovery) | recovery needs a live peer holding the blob until it re-fills |
+| `.relay-keyblobs.json` | archived encrypted key-blobs (for peer-independent recovery; arrive via `POST /keyblob`) | recovery impossible until the owner's next blob update re-stores it (no gossip re-fill any more) — the OTHER relay's copy is the redundancy |
+| `.relay-recovery-shares.json` | **v3 recovery shares** — the third key factor per account, nid-bound, with server-side backoff state. Written `0600`; **never** logged or served except via the face-gated release | affected accounts can never complete a fresh-device recovery again (devices with the share cached still work). The other relay's copy is the redundancy — check it before wiping this file |
 | `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
 | `.relay-accounts.json` | account-record archive (G1 directory tier): engine-verified records served via `/resolve` | re-fills from owners' 20 s publish ticks; until then clients can't resolve usernames this relay alone knew |
 | `.relay-operators.json` | the first 3 accountIds attested — the only accounts allowed to wipe this relay | anyone could re-claim an operator slot; **kept across wipes** |
@@ -210,9 +223,13 @@ The peer-id and attester-key files are the ones you cannot regenerate.
 ## Data integrity & permissions
 
 The relay is a **cache, not the source of truth** — engine blocks are
-account-signed + accumulator-committed, key-blobs are face+PIN-encrypted, and any
-loss re-derives from clients + gossip + the other super-node. So tampering with a
-store file is mostly *detectable denial*, not theft. On top of that, the relay
+account-signed + accumulator-committed, key-blobs open only with face+PIN+share
+(v3), and any loss re-derives from clients + gossip + the other super-node. So
+tampering with a store file is mostly *detectable denial*, not theft. The one
+exception is `.relay-recovery-shares.json`: it is custody, not cache — a secret
+per account, replicated only on the attester relays, and reading it is the
+"rogue relay" case in the threat model (still PIN-gated, but treat the file
+like the identity keys). On top of that, the relay
 hardens its own persistence (Tier 1):
 
 - **Atomic writes.** Every store file is written via temp → `fsync` → `.bak`
@@ -372,7 +389,10 @@ Net effect: a reset landing on any one relay propagates to all of them within
   pm2 stop neuron-relay
   cd .relay-data
   rm -f .relay-engine-blocks.json .relay-keyblobs.json .relay-usernames.json \
-        .relay-accounts.json .relay-operators.json          # operators re-elect
+        .relay-accounts.json .relay-operators.json \
+        .relay-recovery-shares.json                         # operators re-elect
+  # ^ shares go with the accounts they unlock: a wipe destroys the chains, so
+  #   keeping orphaned third factors around would only be attack surface.
   node -e 'const f=require("fs");
     f.writeFileSync(".relay-generation.json", String(<NEW_GEN>));
     const db=JSON.parse(f.readFileSync(".relay-face-db.json","utf8"));
@@ -456,6 +476,9 @@ pm2 stop neuron-relay   # on akashicrecords.dev
 scp <source-relay>:<repo>/.relay-data/.relay-engine-blocks.json  .relay-data/
 scp <source-relay>:<repo>/.relay-data/.relay-keyblobs.json       .relay-data/
 scp <source-relay>:<repo>/.relay-data/.relay-usernames.json      .relay-data/
+# recovery shares (0600, secret!) — without them fresh-device recovery is dead
+# for every account whose share only this box held:
+scp <source-relay>:<repo>/.relay-data/.relay-recovery-shares.json .relay-data/
 pm2 start neuron-relay  # archives merge on load
 ```
 (If the network is still early/empty, skip this — there's nothing to backfill.)

@@ -15,6 +15,7 @@
 import { createLibp2p } from 'libp2p';
 import { applyGossipsubCompat } from './gossipsub-compat.js';
 import { relayHttpBase } from './account-resolver.js';
+import { storeKeyBlobOnRelays, fetchKeyBlobFromRelays } from './recovery-share.js';
 import { webRTC } from '@libp2p/webrtc';
 import { webSockets } from '@libp2p/websockets';
 import { WebSockets as WsMatcher, WebSocketsSecure as WssMatcher } from '@multiformats/multiaddr-matcher';
@@ -291,8 +292,14 @@ function topicStorageCacheRequests(network: string): string { return `neuronchai
 function topicStorageDeleteRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/delete-requests`; }
 function topicStorageReplaceRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/replace-requests`; }
 function topicLockouts(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/lockouts`; }
-function topicKeyBlobs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/keyblobs`; }
-function topicBlobRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/blob-requests`; }
+// topicKeyBlobs / topicBlobRequests: REMOVED (2026-08-15). The keyblobs topic
+// broadcast every account's encrypted-key blob to every node — an O(N) scale
+// violation with the same shape as G1, and worse: a passive harvesting surface
+// for the one object whose confidentiality the identity model rests on (see
+// face-store.ts). Blobs now move over targeted HTTP only: owners POST /keyblob
+// to the relays; recovery GETs it (recovery-share.ts). Do not resurrect these
+// topics for convenience — that is exactly how the accounts topic came back
+// from the dead twice.
 function topicPeerAddrs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/peer-addrs`; }
 function topicRelays(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/relays`; }
 function topicSnapshots(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/snapshots`; }
@@ -760,8 +767,8 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicStorageDeleteRequests(this.network));
     pubsub.subscribe(topicStorageReplaceRequests(this.network));
     pubsub.subscribe(topicLockouts(this.network));
-    pubsub.subscribe(topicKeyBlobs(this.network));
-    pubsub.subscribe(topicBlobRequests(this.network));
+    // keyblobs / blob-requests topics deliberately absent — see the note at the
+    // (removed) topic definitions. Blobs are targeted HTTP now.
     pubsub.subscribe(topicPeerAddrs(this.network));
     pubsub.subscribe(topicRelays(this.network));
     pubsub.subscribe(topicSnapshots(this.network));
@@ -1193,51 +1200,7 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
-    if (topic === topicKeyBlobs(this.network)) {
-      const blob = decode<Record<string, unknown>>(data);
-      if (blob.pub && blob.encryptedKeys && blob.username) {
-        // Verify linkedAnchor against on-chain account to reject tampered blobs.
-        // Anchor = SHA-256(encryptedKeys + ":" + faceMapHash + ":" + pub).
-        // Skip if account not yet synced locally (can't verify yet - accept optimistically).
-        if (blob.linkedAnchor && blob.faceMapHash) {
-          const onChain = await this.db.get('accounts', blob.pub as string).catch(() => null);
-          if (onChain) {
-            const onChainAnchor = (onChain as Record<string, unknown>).linkedAnchor;
-            if (onChainAnchor && typeof onChainAnchor === 'string') {
-              const input = `${blob.encryptedKeys}:${blob.faceMapHash}:${blob.pub}`;
-              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-              const computed = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-              if (computed !== onChainAnchor) return; // anchor mismatch - discard
-            }
-          }
-        }
-
-        // Only overwrite if the incoming blob is newer - prevents a stale gossip
-        // from another node from silently reverting a locally-updated blob.
-        const existing = await this.db.get('keyblobs', blob.pub as string).catch(() => null);
-        const incomingTs = typeof blob.updatedAt === 'number' ? blob.updatedAt : 0;
-        const existingTs = existing && typeof (existing as Record<string, unknown>).updatedAt === 'number'
-          ? (existing as Record<string, unknown>).updatedAt as number : 0;
-        if (incomingTs >= existingTs) {
-          await this.db.put('keyblobs', blob as NeuronDB['keyblobs']).catch(() => {});
-        }
-        this.emit('blob:received', blob);
-      }
-      return;
-    }
-
-    if (topic === topicBlobRequests(this.network)) {
-      const req = decode<{ username: string }>(data);
-      if (req.username) {
-        // Respond if we have this blob locally
-        const all = await this.db.getAll('keyblobs').catch(() => [] as NeuronDB['keyblobs'][]);
-        const found = all.find(b => (b as Record<string, unknown>).username === req.username);
-        if (found) {
-          this.publish(topicKeyBlobs(this.network), found);
-        }
-      }
-      return;
-    }
+    // (keyblobs / blob-requests topic handlers removed — blobs are HTTP-only.)
 
     if (topic === topicPeerAddrs(this.network)) {
       const msg = decode<{ peerId?: string; addrs?: string[]; smokeAddr?: string }>(data);
@@ -1411,13 +1374,30 @@ export class Libp2pNetwork extends EventEmitter {
     this.db.put('contracts', { ...contract, id } as NeuronDB['contracts']).catch(() => {});
   }
 
+  /**
+   * Relay HTTP bases for the targeted blob path: known relays + the baked
+   * bootstraps (they are the archives) + '' (same-origin dev relay via the
+   * Vite/nginx proxy). Same recipe as node.relayResolveBases — duplicated here
+   * because the network layer owns the blob calls and cannot reach the node.
+   */
+  private relayBases(): string[] {
+    const addrs = new Set<string>();
+    for (const r of this.getKnownRelays()) if (r.addr) addrs.add(r.addr);
+    for (const a of bakedBootstrapAddrs()) addrs.add(a);
+    const bases = new Set<string>(['']);
+    for (const a of addrs) bases.add(relayHttpBase(a));
+    return [...bases];
+  }
+
   saveKeyBlob(pub: string, blob: Record<string, unknown>): Promise<void> {
     const entry = { ...blob, pub };
     const stored = this.db.put('keyblobs', entry as NeuronDB['keyblobs']).then(() => {}).catch(() => {});
-    // Gossip the updated blob so other nodes can serve it during recovery.
-    // With the combined-key scheme the blob no longer grants standalone access to private keys
-    // (face + PIN are both required), so network-wide availability is safe.
-    if (this.running) this.publish(topicKeyBlobs(this.network), entry);
+    // Targeted POST to the relay archives — NOT gossip. The old keyblobs topic
+    // handed every blob to every node: an O(N) broadcast and, worse, a passive
+    // harvesting surface. Only the relays need the blob (wiped-device recovery),
+    // so only the relays receive it. Best-effort: the next update retries any
+    // relay that missed this one.
+    void storeKeyBlobOnRelays(this.relayBases(), entry, this.network).catch(() => {});
     return stored;
   }
 
@@ -1443,26 +1423,15 @@ export class Libp2pNetwork extends EventEmitter {
       }
     } catch { /* fall through */ }
 
-    // Slow path: ask peers over GossipSub and wait for a response
-    if (!this.running) return null;
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.off('blob:received', handler);
-        resolve(null);
-      }, timeoutMs);
-
-      const handler = (...args: unknown[]) => {
-        const blob = args[0] as Record<string, unknown>;
-        if (blob && blob.username === username) {
-          clearTimeout(timer);
-          this.off('blob:received', handler);
-          resolve(blob);
-        }
-      };
-
-      this.on('blob:received', handler);
-      this.publish(topicBlobRequests(this.network), { username });
-    });
+    // Slow path: targeted GET from the relay archives (replaces the old
+    // gossip broadcast request — nobody else's blob ever transits this client).
+    const blob = await fetchKeyBlobFromRelays(this.relayBases(), { username }, this.network, timeoutMs);
+    if (blob?.pub) {
+      // Cache locally so the recovery flow's later loadKeyBlob(pub) calls and a
+      // re-entry into this function stay offline-fast.
+      await this.db.put('keyblobs', blob as NeuronDB['keyblobs']).catch(() => {});
+    }
+    return blob;
   }
 
   /**

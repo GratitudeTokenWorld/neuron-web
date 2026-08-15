@@ -7,7 +7,8 @@ import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reloa
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
 import { bakedBootstrapAddrs, peerIdFromMultiaddr } from './network/libp2p-network';
 import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
-import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
+import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey, deriveTripleKey, generateRecoveryShare } from './core/face-store';
+import { storeRecoveryShare, releaseRecoveryShare } from './network/recovery-share';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
 import { sign as engineSignRecord } from './engine/core/keys';
@@ -21,7 +22,13 @@ import {
   derivePinRawBits, encryptWithPinKey, decryptWithPinKey,
   checkPinLockout, recordPinFailure, recordPinSuccess,
   getBackoffMs, generatePinSalt, LockoutNotice, lockoutPayload,
+  cacheRecoveryShare, getCachedRecoveryShare,
 } from './core/pin-crypto';
+
+/** Hex of a recovery share for the device cache — shares are handled as bytes everywhere else. */
+function shareToHex(share: Uint8Array): string {
+  return Array.from(share).map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 // ──── Single-tab lock ────
 if (!acquireTabLock()) {
@@ -2155,20 +2162,42 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       restoreCreateBtn(); return;
     }
 
-    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Encrypting keys with face + PIN...</span>';
-    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin, accountId);
+    // v3 custody split: mint the third key factor and hand it to the attester
+    // relays BEFORE sealing the blob — if the share can't be stored on the
+    // required quorum, the account must not be created at all, because a v3
+    // blob without a releasable share is unrecoverable by construction. The
+    // attesters were just reached for the attestations, so the same bases and
+    // the same quorum requirement apply.
+    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Storing recovery share with attesters...</span>';
+    const recoveryShare = generateRecoveryShare();
+    const shareBases = [...new Set(pendingChallenges.map(c => c.faceVerifyBase))];
+    const sharesStored = await storeRecoveryShare(shareBases, accountId, node.ledger.network, recoveryShare, engineKeys.priv);
+    if (sharesStored < REQUIRED_ATTESTERS) {
+      addLog(`Recovery: share stored on ${sharesStored}/${REQUIRED_ATTESTERS} relays — aborting creation`, 'error');
+      toast('Could not store recovery share on enough relays', 'error');
+      statusEl.innerHTML = `<span style="color:var(--danger)">The recovery share reached only ${sharesStored}/${REQUIRED_ATTESTERS} relays. Without it a wiped device could never recover this account, so creation was aborted. Check relay connectivity and try again.</span>`;
+      restoreCreateBtn(); return;
+    }
 
-    // Encrypt face descriptor with PIN key for local privacy
+    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Encrypting keys with face + PIN + share...</span>';
+    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin, accountId, recoveryShare);
+    // This device has proved itself (it IS the enrollment) — cache the share so
+    // PIN/face changes here never need a relay round trip.
+    await cacheRecoveryShare(accountId, shareToHex(recoveryShare));
+
     const pinSalt = keyBlob.pinSalt!;
     const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
     const pinRawBits = await derivePinRawBits(pin, saltBytes);
     const pinKey = await crypto.subtle.importKey('raw', pinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-    const encryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
 
-    // Register account — identity is the engine accountId (username is the alias mapped to it)
+    // Register account — identity is the engine accountId (username is the alias
+    // mapped to it). NOTE deliberately NO encryptedFaceDescriptor here: v2 put
+    // the biometric PIN-encrypted into the PUBLIC account record (resolvable by
+    // anyone via /resolve, with pinSalt and pinVerifier sitting beside it as an
+    // offline brute-force oracle) — a 4-digit wall around a face. The canonical
+    // now lives ONLY in the blob's encryptedCanonical, sealed under PIN+share.
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Creating account on-chain...</span>';
     const account = buildAccount(username, accountId, faceMap.hash, {
-      encryptedFaceDescriptor,
       pinSalt,
       pinVerifier: keyBlob.pinVerifier,
       linkedAnchor: keyBlob.linkedAnchor,
@@ -2192,7 +2221,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     node.net.saveAccount(accountId, {
       username, pub: accountId, balance: 1000000, nonce: 0,
       createdAt: account.createdAt, faceMapHash: faceMap.hash,
-      encryptedFaceDescriptor, pinSalt, pinVerifier: keyBlob.pinVerifier,
+      pinSalt, pinVerifier: keyBlob.pinVerifier,
       linkedAnchor: keyBlob.linkedAnchor, pqPub: keys.pqPub, pqKemPub: keys.pqKemPub,
       _sig: accSig,
     });
@@ -2359,9 +2388,36 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     }
     const faceMap = capturedR.faceMap;
 
+    // v3: obtain the recovery share — the factor that is deliberately NOT in
+    // the blob. Cached on a device that already proved itself; otherwise
+    // released by a relay after IT matches the live face against the enrolled
+    // identity, under server-side backoff. The release uses the descriptor the
+    // liveness sequence just produced, so the relay sees the same face the
+    // local gate is about to check.
+    let recoveryShare: Uint8Array | undefined;
+    if (blob.pinVersion === 3) {
+      recoveryShare = (await getCachedRecoveryShare(blob.pub)) ?? undefined;
+      if (!recoveryShare) {
+        statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Requesting recovery share from relays...</span>';
+        const released = await releaseRecoveryShare(
+          node.relayHttpBases(), blob.pub, node.ledger.network, faceMap.canonical,
+        );
+        if (!released.ok) {
+          const lockMsg = released.retryAfterS
+            ? ` The relay has locked further attempts for ${released.retryAfterS}s (server-side backoff).`
+            : '';
+          addLog(`Recovery: share release refused — ${released.reason}`, 'error');
+          toast('Relays refused to release the recovery share', 'error');
+          statusEl.innerHTML = `<span style="color:var(--danger)">No relay released the recovery share: ${escHtml(released.reason)}.${lockMsg}</span>`;
+          finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
+        }
+        recoveryShare = released.share;
+      }
+    }
+
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Decrypting keys with face + PIN...</span>';
 
-    const recoveryResult = await recoverKeysWithFace(blob, faceMap.canonical, pin);
+    const recoveryResult = await recoverKeysWithFace(blob, faceMap.canonical, pin, recoveryShare);
 
     if (!recoveryResult) {
       const msg = (blob.pinVersion && blob.pinVersion >= 1)
@@ -2388,6 +2444,10 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const { keys, faceKey } = recoveryResult;
     // On-chain identity = engine pubkey derived from the recovered (face-unlocked) keys.
     const accountId = engineAccountId(keys.priv);
+
+    // This device just completed a full face+PIN+share recovery — it has proved
+    // itself. Cache the share so PIN/face changes here work offline.
+    if (recoveryShare) await cacheRecoveryShare(blob.pub, shareToHex(recoveryShare));
 
     // Reset attempt counter on successful recovery
     await recordPinSuccess(blob.pub);
@@ -2428,13 +2488,27 @@ $('#btnRecoverFace').addEventListener('click', async () => {
         const newPin = await promptSetPin();
         if (newPin) {
           try {
-            const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin, accountId);
+            // Try the full v3 upgrade: mint a share and store it on the relays
+            // (signed — we hold the keys). If the quorum can't take it (relay
+            // predates v3, or this account has no nid there), fall back to v2
+            // rather than failing the upgrade — v2 is still face+PIN, and the
+            // next face update retries the v3 upgrade.
+            let upgradeShare: Uint8Array | undefined = generateRecoveryShare();
+            const stored = await storeRecoveryShare(
+              node.relayHttpBases(), accountId, node.ledger.network, upgradeShare, engineKeysFromAppPrivate(keys.priv).priv,
+            );
+            if (stored < REQUIRED_ATTESTERS) {
+              addLog(`Recovery: v3 upgrade unavailable (share stored ${stored}/${REQUIRED_ATTESTERS}) — using face+PIN (v2)`, 'info');
+              upgradeShare = undefined;
+            }
+            const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin, accountId, upgradeShare);
+            if (upgradeShare) await cacheRecoveryShare(accountId, shareToHex(upgradeShare));
             await node.net.saveKeyBlob(accountId, newBlob as unknown as Record<string, unknown>);
             const saltBytes = Uint8Array.from(atob(newBlob.pinSalt!), c => c.charCodeAt(0));
             const newRawBits = await derivePinRawBits(newPin, saltBytes);
             const newPinKey = await crypto.subtle.importKey('raw', newRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
             cachePinKey(accountId, newPinKey, newRawBits);
-            toast('PIN added - account upgraded to face + PIN security', 'success');
+            toast(upgradeShare ? 'PIN added - account upgraded to face + PIN + network share' : 'PIN added - account upgraded to face + PIN security', 'success');
           } catch {
             toast('PIN setup failed - account still accessible via face', 'error');
           }
@@ -2590,8 +2664,45 @@ $('#btnUpdatePin').addEventListener('click', async () => {
 
     let newEncryptedKeys: string;
     let newPinVersion: number;
+    let newEncryptedCanonicalV3: string | undefined;
 
-    if (blob.pinVersion === 2) {
+    if (blob.pinVersion === 3) {
+      // Custody-split blob: everything the old PIN sealed was sealed together
+      // with the SHARE, so re-sealing needs it too. This device cached it at
+      // creation or at its last successful recovery — if the cache is gone
+      // (cleared site data), a full recovery is the flow that re-proves the
+      // face to a relay and re-earns the share; a PIN change must not become
+      // a share-release side channel.
+      const share = await getCachedRecoveryShare(pub);
+      const oldPinRawBits = getCachedPinRawBits(pub);
+      if (!share || !oldPinRawBits) {
+        toast('Recovery share not cached on this device - run Recover Account once, then retry', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">This device does not hold the recovery share. Run <strong>Recover Account</strong> (face + PIN) once on this device, then change the PIN.</span>';
+        return;
+      }
+      if (!blob.encryptedCanonical) {
+        toast('Security data missing - use Update Face first to repair it, then change your PIN', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Security data missing. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+        return;
+      }
+      const canonicalJson = await decryptWithPinKey(
+        blob.encryptedCanonical, await deriveCombinedKey(oldPinRawBits, share),
+      );
+      if (!canonicalJson) {
+        toast('Security data is out of sync - please use Update Face first to repair it, then change your PIN', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Security data out of sync. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+        return;
+      }
+      const storedQuantized = quantizeDescriptor(JSON.parse(canonicalJson) as number[]);
+      const faceBytes = await deriveFaceRawBits(storedQuantized, pub);
+      newEncryptedKeys = await encryptWithPinKey(
+        JSON.stringify(acc.keys), await deriveTripleKey(faceBytes, newPinRawBits, share),
+      );
+      newEncryptedCanonicalV3 = await encryptWithPinKey(
+        canonicalJson, await deriveCombinedKey(newPinRawBits, share),
+      );
+      newPinVersion = 3;
+    } else if (blob.pinVersion === 2) {
       // Combined-key blob: recover face bytes from stored canonical, form new combined key
       if (!blob.encryptedCanonical) {
         toast('Security data missing - use Update Face first to repair it, then change your PIN', 'error');
@@ -2631,9 +2742,12 @@ $('#btnUpdatePin').addEventListener('click', async () => {
       if (oldDesc) newEncryptedFaceDescriptor = await encryptWithPinKey(oldDesc, newPinKey);
     }
 
-    // Re-encrypt encryptedCanonical with new PIN key
-    let newEncryptedCanonical: string | undefined;
-    if (blob.encryptedCanonical) {
+    // Re-encrypt encryptedCanonical with new PIN key (v1/v2 only — the v3
+    // branch already re-sealed it under XOR(newPin, share); decrypting with the
+    // bare old pinKey would fail for v3 and silently keep a canonical sealed
+    // under the OLD pin, bricking the next recovery).
+    let newEncryptedCanonical: string | undefined = newEncryptedCanonicalV3;
+    if (blob.pinVersion !== 3 && blob.encryptedCanonical) {
       const oldCanonical = await decryptWithPinKey(blob.encryptedCanonical, oldPinKey);
       if (oldCanonical) newEncryptedCanonical = await encryptWithPinKey(oldCanonical, newPinKey);
     }
@@ -2758,9 +2872,13 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     // Use the in-memory keys directly - identity was already proved by requirePin + liveness.
     const keysJson: string = JSON.stringify(acc.keys);
 
-    // Build new encryptedKeys using combined key (pinVersion=2) or face-only (no PIN)
+    // Build new encryptedKeys. A v3 blob stays v3 (face+PIN+share); a v2 blob
+    // is UPGRADED to v3 here when the share is cached — the face rebind already
+    // re-seals everything, so it is the natural (and only safe) upgrade point.
+    // Without a cached share a v2 blob stays v2 rather than failing the rebind.
     let newEncryptedKeys: string;
     let newPinVersion: number;
+    let newEncryptedCanonical: string | undefined;
     if (pinKey) {
       const pinRawBits = getCachedPinRawBits(pub);
       if (!pinRawBits) {
@@ -2769,19 +2887,31 @@ $('#btnUpdateFace').addEventListener('click', async () => {
         statusEl.innerHTML = '';
         return;
       }
+      const share = await getCachedRecoveryShare(pub);
+      if (blob.pinVersion === 3 && !share) {
+        // Never silently downgrade a custody-split blob to PIN-strength.
+        hideCameraModal();
+        toast('Recovery share not cached on this device - run Recover Account once, then retry', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">This device does not hold the recovery share. Run <strong>Recover Account</strong> (face + PIN) once on this device, then update the face.</span>';
+        return;
+      }
       const newFaceBytes = await deriveFaceRawBits(newQuantized, pub);
-      const newSharedKey = await deriveCombinedKey(newFaceBytes, pinRawBits);
-      newEncryptedKeys = await encryptWithPinKey(keysJson, newSharedKey);
-      newPinVersion = 2;
+      if (share) {
+        newEncryptedKeys = await encryptWithPinKey(keysJson, await deriveTripleKey(newFaceBytes, pinRawBits, share));
+        newEncryptedCanonical = await encryptWithPinKey(
+          JSON.stringify(faceMap.canonical), await deriveCombinedKey(pinRawBits, share),
+        );
+        newPinVersion = 3;
+      } else {
+        const newSharedKey = await deriveCombinedKey(newFaceBytes, pinRawBits);
+        newEncryptedKeys = await encryptWithPinKey(keysJson, newSharedKey);
+        newEncryptedCanonical = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
+        newPinVersion = 2;
+      }
     } else {
       newEncryptedKeys = await encryptWithFaceKey(keysJson, newFaceKey);
       newPinVersion = 0;
     }
-
-    // Update encryptedCanonical with new canonical descriptor (still encrypted with PIN key for deterministic recovery)
-    const newEncryptedCanonical = pinKey
-      ? await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey)
-      : undefined;
 
     // Compute new faceMapHash
     const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(newQuantized)));
@@ -2813,13 +2943,18 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     // Sync the account record (linkedAnchor + faceMapHash, re-signed) so face
     // recovery's integrity check stays consistent. (On-chain account-update block
     // is deferred with multi-node sync — see syncAccountRecord.)
+    // v3: no biometric in the public record — the canonical lives only in the
+    // blob, sealed under PIN+share (see account creation for the full rationale).
     await syncAccountRecord(acc, {
       linkedAnchor: newLinkedAnchor, faceMapHash: newFaceMapHash,
-      encryptedFaceDescriptor: newEncryptedCanonical,
+      ...(newPinVersion === 3 ? {} : { encryptedFaceDescriptor: newEncryptedCanonical }),
     });
 
     // Update local account
-    Object.assign(acc, { faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedCanonical });
+    Object.assign(acc, {
+      faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor,
+      ...(newPinVersion === 3 ? { encryptedFaceDescriptor: undefined } : { encryptedFaceDescriptor: newEncryptedCanonical }),
+    });
     saveWallet();
     statusEl.innerHTML = '<span style="color:var(--success)">Face updated successfully.</span>';
     toast('Face updated', 'success');

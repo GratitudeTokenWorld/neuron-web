@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 238 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 244 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
@@ -542,11 +542,19 @@ linear face matching; ledger Sybil check is hash-only & effectively dead
 untenable at 10B.
 
 **Target design**
-- **Keep the sound crypto unchanged.** Account model (`pub` + PQ keys +
-  `linkedAnchor`) and the face+PIN combined-key recovery with attempt-state
-  ([account.ts:3-24](src/core/account.ts#L3),
-  [face-store.ts createEncryptedKeyBlob/recoverKeysWithFace]) are excellent —
-  preserve as-is.
+- **Key custody is the v3 split (2026-08-15), not the old combined key.** The
+  v2 "face+PIN combined key" this section once called sound was NOT: the blob
+  sealed the face descriptor under the PIN alone, so the public blob + a
+  ~50-minute offline brute-force of 4 digits yielded the account keys and the
+  biometric (proven by running the attack; kept as the v2-control test in
+  `src/core/face-match.test.ts`). v3 seals keys under
+  `XOR(faceBytes, pinBytes, shareBytes)` with the 32-byte share held ONLY by
+  the attester relays, nid-bound, released to a live relay-matched face under
+  server-side exponential backoff (`/recovery-share/release` —
+  docs/SUPERNODE.md). Design rule that must survive any future rework: **no
+  combination of factors stored inside one public object can exceed the
+  strength of its weakest factor** — at least one factor must live with a
+  party that can refuse to release it.
 - **Generalize `RelayCredential` → typed attestations.** It already signs only a
   `claimHash` ([dag-block.ts:61-68], verified at
   [dag-ledger.ts:477-494](src/core/dag-ledger.ts#L477)). Extend to
@@ -828,14 +836,32 @@ silently overloading validators.
 - Generalizable signed-credential quorum ([dag-block.ts](src/core/dag-block.ts), [dag-ledger.ts:477-494](src/core/dag-ledger.ts#L477))
 - Storage-reward economics + spot-check/receipt repair ([storage-manager.ts](src/network/storage-manager.ts))
 
-## Scale-invariant gaps G1 + G2 — both CLOSED
+## Scale-invariant gaps G1 + G2 — both CLOSED (and G3, found + closed later)
 
 > **Status (2026-08-10): BOTH gaps are fully implemented, deployed and
 > manually re-tested green** (TESTPLAN T1–T7 on the two-relay dev network,
 > including the NFT round trip through the proof path).
 > Payments **and NFTs** now claim via proof packets — no counterparty chain is
-> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (21 checks
+> held at all. Automated live probe: `scripts/g1-resolve-smoke.mts` (30 checks
 > — run it after every relay deploy).
+
+**G3 — the global `keyblobs` topic (found and closed 2026-08-15, with the v3
+custody rework).** Same shape as G1 and missed by the G1 sweep because it hid
+behind a security rationale ("gossiped for peer-independent recovery"): every
+client subscribed to every account's encrypted-key blob — O(total users) per
+node, re-broadcast on every create/recovery/PIN-change/face-change — and, once
+the v2 crypto flaw made blobs PIN-strength, it doubled as a passive harvesting
+surface for the most sensitive object in the system. Closed exactly like G1:
+the topic is gone in both directions (`libp2p-network.ts`, `relay/server.ts`);
+owners `POST /keyblob` to the relays they know, recovery `GET`s it on demand,
+per-IP limited. Peer-held blob redundancy was not lost — it never really
+existed (browsers evict IDB; the relay archive was already the tested recovery
+path in T5). The recurring lesson, third time now: **"everyone should hold
+this so nobody depends on anyone" always decays into "everyone holds
+everything" — redundancy must be a bounded assignment (k named holders), never
+a broadcast.** Phase 3's leased replication is the general mechanism; when it
+lands, key blobs should become ordinary leased content with a replication
+target instead of a relay-only special case.
 
 **G1 — The global `accounts` topic is `O(N)`. CLOSED** (shipped 2026-08-09,
 manually verified 2026-08-10). What shipped:

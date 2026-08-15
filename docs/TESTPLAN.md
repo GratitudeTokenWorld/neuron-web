@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 238-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 244-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
@@ -190,12 +190,33 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
 
 ## T5 — Recovery after wipe (redundant durability)
 
+> **Changed by the v3 custody split (2026-08-15) — the whole flow needs a
+> re-run.** Accounts are now sealed under face+PIN+**recovery share**; the share
+> lives only on the relays and is released by `POST /recovery-share/release`
+> after the RELAY matches the live face, under server-side exponential backoff.
+> The old keyblobs gossip is gone: the blob arrives via `GET /keyblob`. Watch
+> the relay log during recovery — expect `[Recovery] share released acct=…`
+> (and `[Recovery] release DENIED … fails=N` on a wrong face).
+
 1. Browser B: note bob's balance. Wipe site data completely (DevTools → Application
    → Clear storage), or use a third profile.
 2. Recover bob: username + face + PIN. **Pass:** account restores with full balance
-   and history — key-blob served from a relay archive (`c9ac182`), chain from the
-   delta archive. Do this once with relay #1 stopped (`pm2 stop neuron-relay`) to
-   prove relay #2 alone suffices; restart afterwards.
+   and history — key-blob via `GET /keyblob`, share released after the relay-side
+   face match, chain from the delta archive. Do this once with relay #1 stopped
+   (`pm2 stop neuron-relay`) to prove relay #2 alone suffices (every relay holds
+   the full share, not a fragment); restart afterwards.
+   **New negative checks, run deliberately:**
+   - Wrong-face release: have a second person attempt bob's recovery with the
+     right username + PIN. **Pass:** "No relay released the recovery share:
+     face does not match this account", relay logs `release DENIED`, and after
+     3+ attempts the relay answers with a lockout (`locked - try again in Ns`) —
+     wiping the browser must NOT reset that timer (it lives on the relay).
+   - PIN-only offline attack is dead by construction (pinned by the v2-control
+     test in `src/core/face-match.test.ts`) — nothing to test manually.
+3. **PIN change / face change on a fresh device** (v3): both require the cached
+   share, so straight after a wipe they must refuse with "run Recover Account
+   once" — and work again after one successful recovery. **Pass:** both
+   behaviours observed.
 3. **Recover under DIFFERENT lighting from the one you enrolled in** — this is the
    case that used to fail, so it is now part of the pass condition, not a bonus.
    Enroll a fresh account in a dim room (lamp off, curtains drawn), then recover it
@@ -261,12 +282,12 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 
 | # | Test | Result | Notes |
 |---|------|--------|-------|
-| T1 | 2-attester account creation | ☑ | Re-run 2026-08-10 on the seven-box tracker |
+| T1 | 2-attester account creation | ☐ | **Re-run needed (v3, 2026-08-15):** creation now also stores the recovery share on both attesters (aborts without the quorum) — expect `[Recovery] share stored acct=…` on both relay logs. Last green 2026-08-10 (pre-v3) |
 | T2 | Cross-relay account sync | ☑ | Through G1 `/resolve` (on-demand, not spontaneous) |
 | T3 | Transfers + offline claim | ☑ | Through G2 `/head-proof` packets; offline **and** wiped-recipient variants |
 | T4 | NFT mint/transfer/burn | ☑ | Re-verified 2026-08-10 incl. the A→B→A round trip: ownership sticks across refreshes and the claim lands without one. Discovery via inbox signal + `/pending-sends`; claims verify transfer packet + `/token` mint proof |
-| T5 | Recovery after wipe (1 relay down) | ☑ | Key-blob + chain from the archive; claim gated on own-chain sync |
-| T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix) |
+| T5 | Recovery after wipe (1 relay down) | ☐ | **Re-run needed (v3, 2026-08-15):** flow now includes the face-gated share release + relay-side backoff (see the new negative checks). Last green 2026-08-10 (pre-v3) |
+| T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix). Pre-v3 run, but the biometric gate it measured is unchanged by v3 |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
 
@@ -274,7 +295,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 covers everything about the archive API that does *not* need a face:
 
 ```sh
-npx tsx scripts/g1-resolve-smoke.mts    # 21 checks; expect ALL CHECKS PASSED
+npx tsx scripts/g1-resolve-smoke.mts    # 30 checks; expect ALL CHECKS PASSED
 ```
 
 It publishes a signed account record and a real signed sender chain to relay-1

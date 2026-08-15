@@ -10,8 +10,13 @@ import {
   compareFaces, quantizeDescriptor, descriptorSpread,
   MATCH_THRESHOLD, ENROLL_SPREAD_LIMIT, ENROLL_SPREAD_WARN,
 } from './face-verify.js';
-import { createEncryptedKeyBlob, recoverKeysWithFace, updateAttemptStateInBlob } from './face-store.js';
+import {
+  createEncryptedKeyBlob, recoverKeysWithFace, updateAttemptStateInBlob,
+  generateRecoveryShare, deriveCombinedKey,
+} from './face-store.js';
 import { generateAccountKeys } from './account.js';
+import { derivePinRawBits, decryptWithPinKey } from './pin-crypto.js';
+import { deriveFaceRawBits } from './face-verify.js';
 
 /**
  * The gap these tests close: every existing face test compares a descriptor
@@ -117,6 +122,89 @@ describe('recoverKeysWithFace — cross-session face, not a byte-identical one',
     // The face is the only factor left once a PIN leaks, so this is the check
     // that must not be relaxed alongside the one above.
     expect(await recoverKeysWithFace(blob, descriptor(6), '1234')).toBeNull();
+  });
+});
+
+describe('pinVersion=3 — the custody split', () => {
+  /**
+   * REGRESSION, run as the literal attack: v2 sealed encryptedCanonical under
+   * the PIN key alone, so blob + guessed PIN walked the whole chain — canonical
+   * → faceBytes → XOR → private key — making the 4-digit PIN the account's only
+   * protection and leaking the biometric. (The first test proves the chain still
+   * works on a v2 blob, so the second proving it dead on v3 is meaningful.)
+   */
+  async function pinOnlyAttack(blob: Awaited<ReturnType<typeof createEncryptedKeyBlob>>, pin: string): Promise<{ priv: string } | null> {
+    // The attacker's inputs: the public blob and the PIN. No face, no share.
+    const salt = Uint8Array.from(atob(blob.pinSalt!), c => c.charCodeAt(0));
+    const pinBytes = await derivePinRawBits(pin, salt);
+    const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const canonicalJson = await decryptWithPinKey(blob.encryptedCanonical!, pinKey);
+    if (!canonicalJson) return null;                       // v3 stops it HERE
+    const face = JSON.parse(canonicalJson) as number[];
+    const faceBytes = await deriveFaceRawBits(quantizeDescriptor(face), blob.pub);
+    const shared = await deriveCombinedKey(faceBytes, pinBytes);
+    const plain = await decryptWithPinKey(blob.encryptedKeys, shared);
+    return plain ? JSON.parse(plain) as { priv: string } : null;
+  }
+
+  it('v2 control: blob + PIN alone recovers the private key (the flaw)', async () => {
+    const keys = await generateAccountKeys();
+    const blob = await createEncryptedKeyBlob(keys, 'v2victim', descriptor(20), 'hash', '4821');
+    expect(blob.pinVersion).toBe(2);
+    const stolen = await pinOnlyAttack(blob, '4821');
+    expect(stolen?.priv).toBe(keys.priv);
+  });
+
+  it('v3: the same attack with the same correct PIN recovers nothing', async () => {
+    const keys = await generateAccountKeys();
+    const share = generateRecoveryShare();
+    const blob = await createEncryptedKeyBlob(keys, 'v3victim', descriptor(21), 'hash', '4821', keys.pub, share);
+    expect(blob.pinVersion).toBe(3);
+    // The chain dies at encryptedCanonical: it needs PIN AND share, and the
+    // share is not in the blob. Nothing downstream is reachable.
+    expect(await pinOnlyAttack(blob, '4821')).toBeNull();
+    // And the recovery API agrees: correct face + correct PIN, no share → null.
+    expect(await recoverKeysWithFace(blob, descriptor(21), '4821')).toBeNull();
+  });
+
+  it('v3: a rogue relay (share, no PIN) recovers nothing', async () => {
+    const keys = await generateAccountKeys();
+    const share = generateRecoveryShare();
+    const blob = await createEncryptedKeyBlob(keys, 'v3b', descriptor(22), 'hash', '4821', keys.pub, share);
+    expect(await recoverKeysWithFace(blob, descriptor(22), undefined, share)).toBeNull();
+    expect(await recoverKeysWithFace(blob, descriptor(22), '9999', share)).toBeNull();
+  });
+
+  it('v3: wrong share fails even with correct face and PIN', async () => {
+    const keys = await generateAccountKeys();
+    const blob = await createEncryptedKeyBlob(keys, 'v3c', descriptor(23), 'hash', '4821', keys.pub, generateRecoveryShare());
+    expect(await recoverKeysWithFace(blob, descriptor(23), '4821', generateRecoveryShare())).toBeNull();
+  });
+
+  it('v3: all three factors recover, including across a lighting change', async () => {
+    const keys = await generateAccountKeys();
+    const enrolled = descriptor(24);
+    const share = generateRecoveryShare();
+    const blob = await createEncryptedKeyBlob(keys, 'v3d', enrolled, 'hash', '4821', keys.pub, share);
+    // Same-session scan and a cross-lighting rescan (the T5.3 band) both work.
+    for (const live of [enrolled, rescan(enrolled, 41, 0.36)]) {
+      const r = await recoverKeysWithFace(blob, live, '4821', share);
+      expect(r).not.toBeNull();
+      expect(r!.keys.priv).toBe(keys.priv);
+    }
+    // Wrong person with the right PIN and the right share is still refused.
+    expect(await recoverKeysWithFace(blob, descriptor(25), '4821', share)).toBeNull();
+  });
+
+  it('v3: attempt counter round-trips like v2 (same enrollment-key rule)', async () => {
+    const keys = await generateAccountKeys();
+    const enrolled = descriptor(26);
+    const share = generateRecoveryShare();
+    const blob = await createEncryptedKeyBlob(keys, 'v3e', enrolled, 'hash', '4821', keys.pub, share);
+    const first = await recoverKeysWithFace(blob, enrolled, '4821', share);
+    const carried = await updateAttemptStateInBlob(blob, first!.faceKey, { failedAttempts: 2, lockedUntil: 1_900_000_000_000 });
+    const second = await recoverKeysWithFace(carried, rescan(enrolled, 43, 0.3), '4821', share);
+    expect(second!.attemptState).toEqual({ failedAttempts: 2, lockedUntil: 1_900_000_000_000 });
   });
 });
 
