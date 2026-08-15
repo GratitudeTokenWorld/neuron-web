@@ -833,8 +833,8 @@
     /* Mirrors about the FRAME's centre line, so this origin must stay a view-box
        point — do not "fix" it to fill-box/center by analogy with .cg-depth-oval:
        the chevrons sit at x 28-61, so their own box centre would flip them in
-       place instead of moving them to the other side. Safe under the art group's
-       vertical translate because scaleX ignores the y origin entirely. */
+       place instead of moving them to the other side. Unaffected by
+       fitCaptureGuide()'s min-y shift because scaleX ignores the y origin. */
     .capture-guide[data-dir="right"] .cg-turn { transform: scaleX(-1); transform-origin: 100px 75px; }
     @keyframes cg-sweep { 0%, 70%, 100% { opacity: 0; } 25% { opacity: 1; } }
 
@@ -865,12 +865,12 @@
     .cg-depth-oval {
       stroke: #fff;
       stroke-opacity: 0.95;
-      /* fill-box, NOT an absolute view-box point: the art group is translated
-         vertically to centre itself in a portrait viewBox (fitCaptureGuide), and
-         a hard-coded `100px 74px` origin would then sit above the ring's real
-         centre, so the depth readout would drift as it scaled. The ellipse's own
-         fill-box centre IS (100,74), so this is identical on a 4:3 feed and
-         correct on every other one. */
+      /* fill-box, NOT an absolute view-box point. fitCaptureGuide() moves the
+         viewBox's min-y negative to match a portrait feed, and a view-box origin
+         is measured FROM min-y — so `100px 74px` would slide off the ring's real
+         centre by half the added height and the depth readout would drift as it
+         scaled. The ellipse's own fill-box centre is (100,74) whatever min-y is:
+         identical on a 4:3 feed, correct on every other. */
       transform-box: fill-box;
       transform-origin: center;
       transform: scale(var(--depth-scale, 0.5));
@@ -1176,17 +1176,23 @@
       <div class="camera-modal-video">
         <video id="faceVideo" autoplay muted playsinline></video>
         <div class="capture-guide" id="captureGuide" data-guide="" data-dir="left">
-          <!-- viewBox height is rewritten from the LIVE stream's aspect by
-               fitCaptureGuide() — the art is authored for 4:3 (200x150) but a
+          <!-- The viewBox is rewritten from the LIVE stream's aspect by
+               fitCaptureGuide(): the art is authored for 4:3 (200x150) but a
                phone hands back a portrait stream, and a fixed landscape viewBox
                letterboxes the guide inside a portrait box instead of covering
-               the frame the detector is actually reading. `cg-art` is translated
-               to stay centred as the box grows. Width units are deliberately
-               untouched: 200 units = frame WIDTH, the same reference
-               MIN/MAX_FACE_FRAC measures eye-span against, so the oval and the
-               framing gate can never drift apart. -->
+               the frame the detector is reading.
+
+               It grows by moving min-y NEGATIVE rather than by wrapping the art
+               in a translated <g>. Deliberate: `.capture-guide g` hides every
+               group so `data-guide` can reveal one, and a wrapper <g> is caught
+               by that rule — an ancestor set to display:none cannot be undone by
+               a descendant, so the whole guide vanishes. Shifting the viewBox
+               adds the same space and leaves the art's own coordinates alone.
+
+               Width units are untouched on purpose: 200 units = frame WIDTH, the
+               same reference MIN/MAX_FACE_FRAC measures eye-span against, so the
+               oval and the framing gate can never drift apart. -->
           <svg id="captureGuideSvg" viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-           <g id="captureGuideArt">
             <ellipse class="cg-oval" cx="100" cy="74" rx="44" ry="58"/>
             <!-- Chevrons POINT the way to turn: vertex on the outside, arms opening
                  back toward the face ("<<<" on the left). data-dir="right" mirrors
@@ -1227,7 +1233,6 @@
               <path class="cg-line" d="M70 68 q10 -8 20 0" opacity="0.45"/>
               <path class="cg-line" d="M110 68 q10 -8 20 0" opacity="0.45"/>
             </g>
-           </g>
           </svg>
         </div>
       </div>

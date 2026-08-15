@@ -917,25 +917,31 @@ const GUIDE_ART_H = 150;
  * of the height, sitting in a band across the middle while the face fills the
  * frame around it.
  *
- * The fix is to grow the viewBox vertically to the stream's true aspect and
- * re-centre the art in it. Horizontal units are left alone on purpose: 200 units
+ * The fix is to grow the viewBox vertically to the stream's true aspect, keeping
+ * the art centred in it. Horizontal units are left alone on purpose: 200 units
  * = frame width is the same reference `MIN_FACE_FRAC`/`MAX_FACE_FRAC` measure
  * against, so the oval the user frames into and the gate that judges the framing
  * stay in the same units. Changing that is how a guide starts saying "you're in
  * the circle" while the check still says "move closer".
+ *
+ * The extra height is added by moving min-y NEGATIVE, not by translating a
+ * wrapper `<g>`. A wrapper is caught by `.capture-guide g { display: none }` —
+ * the rule that lets `data-guide` reveal one cue at a time — and a descendant
+ * cannot un-hide a hidden ancestor, so wrapping the art erases the entire guide.
+ * Shifting the viewBox adds the same space and leaves the art's own coordinates
+ * (and every `transform-box: view-box` origin that depends on x) untouched.
  */
 function fitCaptureGuide(video: HTMLVideoElement): void {
   const svg = document.getElementById('captureGuideSvg');
-  const art = document.getElementById('captureGuideArt');
-  if (!svg || !art) return;
+  if (!svg) return;
   const w = video.videoWidth;
   const h = video.videoHeight;
   if (!w || !h) return;                       // metadata not in yet; caller retries
   // Never shrink below the authored canvas: a landscape-but-wider-than-4:3 feed
   // (16:9 laptop cams) would otherwise crop the oval's top and bottom off.
   const viewH = Math.max(GUIDE_ART_H, (GUIDE_ART_W * h) / w);
-  svg.setAttribute('viewBox', `0 0 ${GUIDE_ART_W} ${viewH.toFixed(2)}`);
-  art.setAttribute('transform', `translate(0 ${((viewH - GUIDE_ART_H) / 2).toFixed(2)})`);
+  const minY = (GUIDE_ART_H - viewH) / 2;     // ≤ 0; splits the growth above/below
+  svg.setAttribute('viewBox', `0 ${minY.toFixed(2)} ${GUIDE_ART_W} ${viewH.toFixed(2)}`);
 }
 
 /**
