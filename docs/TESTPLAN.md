@@ -294,11 +294,11 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 
 | # | Test | Result | Notes |
 |---|------|--------|-------|
-| T1 | 2-attester account creation | ☐ | **Re-run needed (v3, 2026-08-15):** creation now also stores the recovery share on both attesters (aborts without the quorum) — expect `[Recovery] share stored acct=…` on both relay logs. Last green 2026-08-10 (pre-v3) |
+| T1 | 2-attester account creation | ☑ | Re-verified 2026-08-15 on v3: 3 attestations (2 cloud + local dev relay) and a **2-of-3 Shamir split** stored on all three (`[Recovery] share stored` ×3, x=1/2/3) |
 | T2 | Cross-relay account sync | ☑ | Through G1 `/resolve` (on-demand, not spontaneous) |
 | T3 | Transfers + offline claim | ☑ | Through G2 `/head-proof` packets; offline **and** wiped-recipient variants |
 | T4 | NFT mint/transfer/burn | ☑ | Re-verified 2026-08-10 incl. the A→B→A round trip: ownership sticks across refreshes and the claim lands without one. Discovery via inbox signal + `/pending-sends`; claims verify transfer packet + `/token` mint proof |
-| T5 | Recovery after wipe (1 relay down) | ☐ | **Re-run needed (v3, 2026-08-15):** flow now includes the face-gated share release + relay-side backoff (see the new negative checks). Last green 2026-08-10 (pre-v3) |
+| T5 | Recovery after wipe (1 relay down) | ◐ | **Happy path green 2026-08-15 on v3:** fresh-device recovery released shares from two relays (`share released … x=2` + local x=1), combined, account restored — and it did so **without contacting the third custodian**, incidentally proving any-2-of-3. Still to run: the photo attempt, an explicit one-relay-down run, and lockout-survives-a-wipe |
 | T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix). Pre-v3 run, but the biometric gate it measured is unchanged by v3 |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
