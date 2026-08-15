@@ -548,6 +548,17 @@ built yet — see CLAUDE.md → *Where to pick up*.
   fraud proofs nor committees ever look at it. `addBlock` enforces balance
   conservation (`balance == head.balance + amount`) *and* the evidence ceiling;
   either alone is bypassable, and both are tested adversarially.
+- **Leaving releases the LEASE; it does not launder the account's history.**
+  The heartbeat interval is the whole reason 6 heartbeats prove 24 hours, and it
+  was held on the live provider profile — which `storage-deregister` deletes. So
+  `register → heartbeat → deregister → register → …` reset the clock every
+  cycle, and a provider could bank a full day's uptime in **under a minute** and
+  claim the entire reward for capacity it never held (measured before the fix:
+  6/6 counted heartbeats in 60 s, paying exactly what an honest day pays). Found
+  by Lucian, 2026-08-15. The interval clock and the first-registration time are
+  now durable per account, so deregistering costs the lease and gains nothing.
+  The general shape to watch for: **any anti-abuse clock an account can reset by
+  destroying its own record is not a clock.**
 
 ### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
 

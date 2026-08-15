@@ -158,6 +158,27 @@ export class ProviderLedger {
    */
   readonly providers = new Map<string, StorageProviderState>();
 
+  /**
+   * Per-account facts that **deregistering must not erase**.
+   *
+   * The heartbeat interval is what turns 6 heartbeats into a proof of 24 hours
+   * of uptime, and it was held on the live profile — which `storage-deregister`
+   * deletes. So `register → heartbeat → deregister → register → heartbeat → …`
+   * reset `lastHeartbeat` to 0 every cycle, and `countsAsRenewal` treats 0 as
+   * "first heartbeat, always due". A provider could bank a full day's uptime in
+   * under a minute and claim the whole reward for capacity it never held
+   * (measured: 6/6 counted heartbeats in 60 s, paying exactly what an honest
+   * 24-hour day pays). Found by Lucian, 2026-08-15.
+   *
+   * `firstRegisteredAt` is durable for the same reason: re-registering would
+   * otherwise refresh the initial lease grace, so an account could look live
+   * forever without ever proving possession.
+   *
+   * The rule: leaving the storage ledger releases the LEASE. It does not launder
+   * the account's history.
+   */
+  private readonly durable = new Map<string, { firstRegisteredAt: number; lastHeartbeat: number }>();
+
   private readonly epochs = new Map<string, Map<number, EpochRecord>>();
   /** pub → capacity changes over time, oldest first. One entry per register/deregister. */
   private readonly capacityHistory = new Map<string, { ts: number; capacityGB: number }[]>();
@@ -217,10 +238,13 @@ export class ProviderLedger {
    * minute. Returns false for one that arrives inside the interval.
    */
   countsAsRenewal(pub: string, timestamp: number): boolean {
-    const p = this.providers.get(pub);
-    if (!p) return false;
-    if (p.lastHeartbeat === 0) return true;
-    return timestamp - p.lastHeartbeat >= HEARTBEAT_INTERVAL_MS - HEARTBEAT_GRACE_MS;
+    if (!this.providers.has(pub)) return false;
+    // Read the clock from the DURABLE record, never the live profile: the
+    // profile is destroyed by a deregister, and a provider that can destroy its
+    // own interval clock has no interval. See `durable`.
+    const last = this.durable.get(pub)?.lastHeartbeat ?? 0;
+    if (last === 0) return true;
+    return timestamp - last >= HEARTBEAT_INTERVAL_MS - HEARTBEAT_GRACE_MS;
   }
 
   /**
@@ -351,13 +375,18 @@ export class ProviderLedger {
     const pub = block.accountId;
     const capacityGB = block.storage?.capacityGB ?? 0;
     const existing = this.providers.get(pub);
+    // Seed from the durable record, so a deregister/re-register cycle inherits
+    // the account's real registration age and heartbeat clock instead of a fresh
+    // one. Without this, churning resets both and the uptime proof collapses.
+    let d = this.durable.get(pub);
+    if (!d) this.durable.set(pub, (d = { firstRegisteredAt: block.timestamp, lastHeartbeat: 0 }));
     const p: StorageProviderState = {
       pub,
       deviceId: block.storage?.deviceId ?? existing?.deviceId ?? '',
-      registeredAt: existing?.registeredAt ?? block.timestamp,
+      registeredAt: d.firstRegisteredAt,
       capacityGB,
       lastActualStoredBytes: existing?.lastActualStoredBytes ?? 0,
-      lastHeartbeat: existing?.lastHeartbeat ?? 0,
+      lastHeartbeat: d.lastHeartbeat,
       heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,
       lastRewardEpoch: existing?.lastRewardEpoch ?? 0,
       totalEarned: existing?.totalEarned ?? 0,
@@ -404,6 +433,8 @@ export class ProviderLedger {
     // Only a heartbeat that satisfies the interval renews the lease or earns uptime.
     if (this.countsAsRenewal(pub, block.timestamp)) {
       p.lastHeartbeat = block.timestamp;
+      const d = this.durable.get(pub);
+      if (d) d.lastHeartbeat = block.timestamp;   // survives a deregister
       this.recordHeartbeatTime(pub, block.timestamp);
       rec.heartbeats += 1;
       if (typeof s?.storedBytes === 'number' && s.storedBytes >= 0 && block.timestamp >= rec.latestBytesAt) {
@@ -503,6 +534,7 @@ export class ProviderLedger {
   /** Drop all state (ledger reset). */
   clear(): void {
     this.providers.clear();
+    this.durable.clear();
     this.epochs.clear();
     this.capacityHistory.clear();
     this.heartbeatTimes.clear();

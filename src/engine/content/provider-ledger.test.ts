@@ -134,6 +134,62 @@ describe('heartbeat counting', () => {
   });
 });
 
+describe('deregistering does not launder the account history', () => {
+  /** register → heartbeat → deregister → register → … as fast as blocks allow. */
+  function churn(pl: ProviderLedger, from: number, cycles: number, capacityGB = 1000): void {
+    for (let i = 0; i < cycles; i++) {
+      const t = from + i * 10_000;
+      pl.apply(blk('storage-heartbeat', t, { storedBytes: capacityGB * GB_BYTES }), t);
+      pl.apply(blk('storage-deregister', t + 1_000, {}), t + 1_000);
+      pl.apply(blk('storage-register', t + 2_000, { capacityGB }), t + 2_000);
+    }
+  }
+
+  it('cannot bank a full day of uptime in a minute by churning registrations', () => {
+    // The attack (found by Lucian, 2026-08-15): the heartbeat interval clock
+    // lived on the live profile, and `storage-deregister` deletes that profile —
+    // so every re-register reset it to 0, which `countsAsRenewal` reads as
+    // "first heartbeat, always due". Measured before the fix: 6/6 counted
+    // heartbeats in 60 seconds, paying exactly what an honest 24h day pays.
+    const pl = registered(1000, DAY - REWARD_EPOCH_MS);
+    churn(pl, DAY, MAX_HEARTBEATS_PER_DAY);
+
+    // Only the FIRST heartbeat of the day counts: the rest are inside the
+    // interval, measured against a clock the attacker cannot destroy.
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
+    const terms = pl.rewardTerms(PUB, 100);
+    if (typeof terms === 'string') throw new Error(terms);
+    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 1000 * (1 / MAX_HEARTBEATS_PER_DAY)));
+    // ...which is a sixth of the full day it was trying to claim.
+    expect(terms.amount).toBeLessThan(BASE_STORAGE_RATE_MILLI * 1000);
+  });
+
+  it('still pays an honest provider that churns between real heartbeats', () => {
+    // Churning is not itself an offence — a provider may legitimately leave and
+    // rejoin. It just buys no uptime that the clock did not already allow.
+    const pl = registered(10, DAY - REWARD_EPOCH_MS);
+    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+      churn(pl, DAY + i * HEARTBEAT_INTERVAL_MS, 1, 10);
+    }
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);
+  });
+
+  it('does not refresh the lease grace by re-registering', () => {
+    // registeredAt is durable too: otherwise an account could look live forever
+    // by re-registering, without ever proving possession.
+    const pl = registered(10, DAY);
+    pl.apply(blk('storage-deregister', DAY + 1_000, {}), DAY + 1_000);
+    const backLater = DAY + MAX_OFFLINE_MS;
+    pl.apply(blk('storage-register', backLater, { capacityGB: 10 }), backLater);
+    // The original registration is what the grace runs from, so it has lapsed.
+    expect(pl.providers.get(PUB)!.registeredAt).toBe(DAY);
+    expect(pl.isLive(PUB, backLater)).toBe(false);
+    // A real heartbeat revives it — that is the only thing that should.
+    pl.apply(blk('storage-heartbeat', backLater, {}), backLater);
+    expect(pl.isLive(PUB, backLater)).toBe(true);
+  });
+});
+
 describe('reward terms', () => {
   /** A full day of heartbeats reporting `storedBytes`, on epoch `day`. */
   function fullDay(pl: ProviderLedger, day: number, storedBytes: number): void {
