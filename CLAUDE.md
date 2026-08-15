@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **229 tests / 54 files passing**, `npm run build` clean.
+Current baseline: **238 tests / 55 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -170,6 +170,50 @@ Changes here need adversarial tests, not just happy-path ones.
   Detection uses `detectAllFaces` everywhere and aborts on >1 face:
   `detectSingleFace` does **not** fail on two faces, it returns the highest-scoring
   one — which let a photo held beside a real head supply the enrolled descriptor.
+- **Face MATCHING is a separate subsystem from liveness — keep its three gates
+  in agreement.** "Is this the same human?" is decided in three places, all on
+  **RAW** descriptors at `MATCH_THRESHOLD` 0.45: `compareFaces` (recovery),
+  `findMatchingFace` in `relay/server.ts` (Sybil), and
+  `dag-ledger.countMatchingFaceAccounts`. **Never quantize before comparing.**
+  `quantizeDescriptor` (QUANT_BIN 0.1) exists only so *key derivation* from the
+  stored canonical reproduces its bins; on a unit-norm 128-D descriptor those
+  bins are a large fraction of the per-component RMS (~0.088), so quantizing
+  amplifies distance by roughly a square root (raw 0.35 → 0.55). Recovery did
+  this, which enforced ~0.21 raw — half the intended gate — and made an account
+  enrolled in dim light unrecoverable in daylight *by its own owner*, while the
+  relay simultaneously refused them a second account for being the same face.
+  Pinned by `src/core/face-match.test.ts`, which is also the only place the
+  realistic 0.25–0.45 "same person, different session" band is tested; the older
+  face tests only ever compare a descriptor to itself or to an obvious stranger.
+  Note the live scan does **not** feed key derivation for `pinVersion` ≥ 1 (the
+  canonical comes out of the blob under the PIN), so it is purely a gate — and
+  **nothing else may key off a live scan either**, because a fresh camera frame
+  cannot reproduce a 128-D bin vector. `pinAttemptState` did exactly that: it is
+  written under the *enrollment* face key but was read back under the live-scan
+  one, so the counter never decrypted once and every recovery silently reported
+  zero failed attempts. Fixed 2026-08-15 by reading it per-branch under the key
+  it was written with. Read the module header of `face-store.ts` before touching
+  that field: it can only be read *after* a successful PIN, so it carries backoff
+  state between a user's own devices and **cannot gate PIN guessing** — the blob
+  is public, so an attacker has the same pre-PIN inputs the user does and can
+  brute-force `pinVerifier` offline regardless. The cost to them is the KDF
+  (600k PBKDF2-SHA-512); enforced rate limiting would have to live on the relay.
+- **Neither descriptor spread nor luma separates good lighting from bad — the
+  cross-session distance is the only number that decides recoverability.**
+  Measured 2026-08-15, same face and camera: a dim room lit by a phone flashlight
+  gave `spread max=0.150, luma=147`; decent natural light gave `max=0.154,
+  luma=172`. The *worse* light scored the *lower* spread (steady flashlight →
+  three near-identical samples; diffuse daylight → shading shifts between them),
+  so spread measures capture **stability**, not fidelity. And luma read 147 in a
+  room lit only by a phone, which is the auto-gain effect that rules out a
+  luminance floor, measured rather than argued. `ENROLL_SPREAD_LIMIT`
+  (= `MATCH_THRESHOLD`) is therefore a backstop against captures that cannot work
+  at all — three shots of one face further apart than two different people may
+  be — **not** a lighting gate, and tightening it toward `ENROLL_SPREAD_WARN`
+  would reject the good enrollment before the bad one. `DARK_LUMA` remains
+  wording-only. The number to reason from is `matchOrLog`'s
+  `[face] recovery match distance=… margin=… PASS/FAIL`, logged on passes too —
+  a threshold cannot be judged without the distribution of real successes.
 - **Consensus.** Fraud-proof safety + ECVRF committee finality. Don't weaken the
   challenge window, slashing, or equivocation freezing.
 - **Cross-account replay order.** Persisted blocks are replayed sorted

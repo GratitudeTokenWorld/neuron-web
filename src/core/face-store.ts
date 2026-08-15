@@ -14,6 +14,23 @@
  * The blob also carries a face-key-encrypted attempt counter so that
  * exponential backoff state transfers to new devices when the blob is
  * fetched from the libp2p network.
+ *
+ * ⚠ What that counter is and is NOT. It is sealed under the ENROLLMENT face key,
+ * which is only recoverable by decrypting `encryptedCanonical` with the PIN — so
+ * it can be read only on a recovery that already succeeded, never as a gate
+ * before one. It therefore carries backoff state between a user's own devices;
+ * it is not, and cannot be, a defence against PIN guessing. No such defence is
+ * possible in the blob: the blob is public by design (gossiped and archived so
+ * recovery does not depend on any one peer), so an attacker holding it has
+ * exactly the inputs the legitimate user has before the PIN is known, and can in
+ * any case brute-force `pinVerifier` offline while ignoring the counter
+ * entirely. What actually costs the attacker is the KDF — PBKDF2-SHA-512 at
+ * 600k iterations, ~300 ms per guess (see pin-crypto.ts). Enforced rate limiting
+ * would have to live on the relay that serves the blob, and does not today.
+ *
+ * The live enforcement path is local IndexedDB (`checkPinLockout`) plus signed
+ * `LockoutNotice` gossip — both in pin-crypto.ts, neither of which reads this
+ * field.
  */
 
 import { KeyPair } from './crypto';
@@ -24,6 +41,8 @@ import {
   decryptWithFaceKey,
   quantizeDescriptor,
   compareFaces,
+  debugMetrics,
+  MATCH_THRESHOLD,
 } from './face-verify';
 import { bytesToHex } from './dag-block';
 import {
@@ -52,7 +71,13 @@ export interface EncryptedKeyBlob {
   pinSalt?: string;
   /** 0 = legacy face-only, 1 = face+PIN two-layer, 2 = face+PIN combined key (current) */
   pinVersion?: number;
-  /** face-key-encrypted JSON {failedAttempts, lockedUntil} - tamper-resistant attempt state */
+  /**
+   * JSON {failedAttempts, lockedUntil} encrypted with the ENROLLMENT face key
+   * (`deriveFaceKey(quantize(canonical), pub)`) — NOT the live scan, which
+   * cannot reproduce those quantization bins. Readable only once the canonical
+   * has been recovered with the PIN; see the module header for why that means
+   * it carries state rather than enforcing it.
+   */
   pinAttemptState?: string;
   /** AES-GCM(pinKey, "PINOK") - allows verifying PIN without decrypting full key blob */
   pinVerifier?: string;
@@ -110,6 +135,30 @@ async function decryptAttemptState(encrypted: string, faceKey: CryptoKey): Promi
   }
 }
 
+const NO_ATTEMPTS: Pick<PinAttemptState, 'failedAttempts' | 'lockedUntil'> = { failedAttempts: 0, lockedUntil: 0 };
+
+/**
+ * Read the embedded attempt counter with the face key it was WRITTEN under.
+ *
+ * That key is derived from the ENROLLMENT canonical descriptor — the one sealed
+ * into the blob — never from the live scan. The two are not interchangeable:
+ * `deriveFaceKey` quantizes into 0.1 bins, and reproducing a 128-D bin vector
+ * from a fresh camera frame is effectively impossible (that is the whole reason
+ * `encryptedCanonical` exists). Deriving the read key from the live scan, as
+ * this did, meant the counter never once decrypted and every recovery silently
+ * fell back to zero.
+ *
+ * Best-effort by design: a blob written before this field existed, or one whose
+ * counter is corrupt, must not block a legitimate recovery.
+ */
+async function readAttemptState(
+  blob: EncryptedKeyBlob,
+  faceKey: CryptoKey,
+): Promise<Pick<PinAttemptState, 'failedAttempts' | 'lockedUntil'>> {
+  if (!blob.pinAttemptState) return NO_ATTEMPTS;
+  return (await decryptAttemptState(blob.pinAttemptState, faceKey)) ?? NO_ATTEMPTS;
+}
+
 // ── Blob creation ─────────────────────────────────────────────────────────────
 
 /**
@@ -138,7 +187,10 @@ export async function createEncryptedKeyBlob(
   accountId: string = keys.pub,
 ): Promise<EncryptedKeyBlob> {
   const quantized = quantizeDescriptor(canonicalDescriptor);
-  const faceKey = await deriveFaceKey(quantized, accountId);  // used for pinAttemptState
+  // Enrollment-canonical face key. Seals pinAttemptState (and, for pinVersion=0,
+  // the keys themselves). recoverKeysWithFace re-derives exactly this key from
+  // the PIN-decrypted canonical, which is the only way the counter reads back.
+  const faceKey = await deriveFaceKey(quantized, accountId);
   const keysJson = JSON.stringify(keys);
 
   let encryptedKeys: string;
@@ -200,8 +252,15 @@ export async function verifyKeyBlobHash(blob: EncryptedKeyBlob, expectedAnchor: 
 
 /**
  * Re-encrypt the attempt state inside the blob with the face key.
- * Call this after each failed/successful PIN attempt so the state
- * is preserved even when the blob is transferred to a new device.
+ *
+ * `faceKey` MUST be the enrollment-canonical key — pass the one
+ * `recoverKeysWithFace` returns, which is derived from the stored canonical, or
+ * (on a face change) the key derived from the new canonical being sealed in.
+ * A live-scan key writes a counter nothing can ever read back.
+ *
+ * Necessarily only callable on a SUCCESSFUL recovery: producing that key needs
+ * the canonical, and the canonical needs the PIN. A failed attempt cannot update
+ * the blob — its counter lives in local IndexedDB (`recordPinFailure`).
  */
 export async function updateAttemptStateInBlob(
   blob: EncryptedKeyBlob,
@@ -216,6 +275,30 @@ export async function updateAttemptStateInBlob(
 }
 
 // ── Key recovery ──────────────────────────────────────────────────────────────
+
+/**
+ * The biometric gate, with the number it decided on written to the `[face]`
+ * trace — on a pass as well as a fail.
+ *
+ * This is the measurement the whole threshold rests on and it was the one thing
+ * never recorded. A failed recovery returned a bare `null`, so "a stranger tried"
+ * (distance ~0.9) and "the owner missed by a hair" (distance 0.46) were
+ * indistinguishable from the outside — including to us, which is why the
+ * quantized-comparison bug survived as long as it did. Logging the passes
+ * matters just as much: the threshold can only be judged against the spread of
+ * distances real recoveries actually produce.
+ *
+ * Same reasoning as the blink timeout logging in face-verify: never discard the
+ * near-miss, or you cannot tell a wrong answer from a tight threshold.
+ */
+function matchOrLog(storedCanonical: number[], liveDescriptor: number[]): boolean {
+  const { distance, match } = compareFaces(storedCanonical, liveDescriptor);
+  debugMetrics(
+    `recovery match distance=${distance.toFixed(3)} threshold=${MATCH_THRESHOLD} ` +
+    `margin=${(MATCH_THRESHOLD - distance).toFixed(3)} ${match ? 'PASS' : 'FAIL'}`,
+  );
+  return match;
+}
 
 export interface RecoveryResult {
   keys: KeyPair;
@@ -238,15 +321,12 @@ export async function recoverKeysWithFace(
   newDescriptor: number[],
   pin?: string,
 ): Promise<RecoveryResult | null> {
+  // Live-scan face key. ONLY the legacy pinVersion=0 path may use this: there
+  // the payload really is sealed under a live-reproducible key, which is the
+  // fragility that pinVersion≥1 exists to remove. The attempt counter is read
+  // per-branch, under the key it was written with (see readAttemptState).
   const quantized = quantizeDescriptor(newDescriptor);
   const faceKey = await deriveFaceKey(quantized, blob.pub);
-
-  // Read embedded attempt state (non-blocking - ignore if missing/corrupted)
-  const embeddedState = blob.pinAttemptState
-    ? await decryptAttemptState(blob.pinAttemptState, faceKey)
-    : null;
-
-  const attemptState = embeddedState ?? { failedAttempts: 0, lockedUntil: 0 };
 
   // ── Combined-key blob (pinVersion === 2) ───────────────────────────────────
   if (blob.pinVersion === 2) {
@@ -274,7 +354,20 @@ export async function recoverKeysWithFace(
 
     // Biometric verification: live scan must match stored canonical.
     // (compareFaces returns { distance, match } — must check .match, not the object.)
-    if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor)).match) return null;
+    //
+    // RAW descriptors on both sides. Comparing the QUANTIZED pair — as this did —
+    // is not the same test with a rounding error, it is a different and far
+    // stricter test: 0.1 bins on a unit-norm 128-D vector amplify distance by
+    // roughly a square root (raw 0.35 measures 0.55), so MATCH_THRESHOLD 0.45
+    // was enforcing ~0.21 raw. A face re-scanned under different lighting lands
+    // around 0.30–0.45 raw, which cleared the intended gate and failed the one
+    // actually running — an account enrolled in a dim room could not be
+    // recovered in daylight by its own owner. Quantization exists solely so the
+    // KEY derivation below reproduces its bins exactly; it has no business in a
+    // distance comparison. Raw @0.45 is also what the relay's Sybil check and
+    // dag-ledger.countMatchingFaceAccounts already use, so all three "is this
+    // the same human?" decisions now agree instead of contradicting each other.
+    if (!matchOrLog(storedCanonical, newDescriptor)) return null;
 
     // Derive combined key and decrypt
     const faceBytes = await deriveFaceRawBits(storedQuantized, blob.pub);
@@ -288,8 +381,10 @@ export async function recoverKeysWithFace(
       if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
     } catch { return null; }
 
+    // The enrollment-canonical face key: what sealed the counter, and what
+    // `updateAttemptStateInBlob` will re-seal it with via the returned faceKey.
     const resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
-    return { keys, faceKey: resolvedFaceKey, attemptState };
+    return { keys, faceKey: resolvedFaceKey, attemptState: await readAttemptState(blob, resolvedFaceKey) };
   }
 
   // ── Two-layer blob (pinVersion === 1) ─────────────────────────────────────
@@ -311,7 +406,8 @@ export async function recoverKeysWithFace(
           const storedCanonical = JSON.parse(canonicalJson) as number[];
           const storedQuantized = quantizeDescriptor(storedCanonical);
           resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
-          if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor)).match) return null;
+          // Raw on both sides — same reasoning as the pinVersion=2 path above.
+          if (!matchOrLog(storedCanonical, newDescriptor)) return null;
         } catch { /* fall back to live-scan key */ }
       }
     }
@@ -326,7 +422,11 @@ export async function recoverKeysWithFace(
       if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
     } catch { return null; }
 
-    return { keys, faceKey: resolvedFaceKey, attemptState };
+    // resolvedFaceKey is the enrollment-canonical key when the blob carries one,
+    // and falls back to the live-scan key only for a v1 blob written without it —
+    // which is also the key such a blob's counter was written under, so the two
+    // stay consistent either way.
+    return { keys, faceKey: resolvedFaceKey, attemptState: await readAttemptState(blob, resolvedFaceKey) };
   }
 
   // ── Legacy face-only blob (pinVersion === 0) ───────────────────────────────
@@ -336,7 +436,9 @@ export async function recoverKeysWithFace(
   try {
     const keys = JSON.parse(decrypted) as KeyPair;
     if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
-    return { keys, faceKey, attemptState };
+    // v0 sealed everything under the live-reproducible face key, and the payload
+    // above just decrypted with it — so here it IS the write key.
+    return { keys, faceKey, attemptState: await readAttemptState(blob, faceKey) };
   } catch {
     return null;
   }

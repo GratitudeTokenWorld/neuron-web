@@ -7,9 +7,52 @@ import { bytesToHex } from './dag-block';
 let modelsLoaded = false;
 
 const MODEL_URL = '/models';
+/**
+ * Euclidean distance below which two descriptors are the same person.
+ *
+ * Applies to RAW descriptors only — see `compareFaces`, which is the one place
+ * this is enforced. The same 0.45 is used by the relay's Sybil check
+ * (`relay/server.ts` findMatchingFace) and by `dag-ledger.countMatchingFaceAccounts`,
+ * both on raw descriptors. All three must agree: if recovery is stricter than the
+ * Sybil gate, the network refuses a second account for a face it will not let
+ * that same person recover with — which is the state this codebase was in.
+ *
+ * Measured against the real failure 2026-08-15 — the case reported as
+ * unrecoverable, run in both directions:
+ *
+ *     enrol dim    → recover natural light   distance=0.295  margin=0.155  PASS
+ *     enrol bright → recover dim             distance=0.285  margin=0.165  PASS
+ *
+ * A third of the budget still in hand, and the two agreeing to within 0.01 is
+ * the useful part: a lighting change costs a stable ~0.29 whichever way it runs,
+ * so this is a well-behaved signal and not a lucky sample. It is also the proof
+ * the bug was the quantization and not the threshold — quantizing amplifies raw
+ * 0.29 to ~0.51, so both scans failed by ~13% before the fix and pass by ~35%
+ * after it. Do not lower 0.45 toward 0.29: the margin is the room every other
+ * lighting, pose and camera combination has to fit inside, and the face is the
+ * only factor left standing once a PIN leaks.
+ */
 const MATCH_THRESHOLD = 0.45;
 const ENROLLMENT_SAMPLES = 3;
-/** Quantization bin size - coarser = more stable across sessions, less unique */
+/**
+ * Quantization bin size — coarser = more stable across sessions, less unique.
+ *
+ * ⚠ For KEY DERIVATION ONLY (`deriveFaceKey` / `deriveFaceRawBits` / `hashDescriptor`),
+ * and only ever applied to the *stored* canonical descriptor, which is recovered
+ * verbatim from the PIN-encrypted blob — so the bins are reproduced exactly and
+ * the coarseness costs nothing. NEVER quantize before a distance comparison:
+ * rounding to 0.1 bins on a unit-norm 128-D descriptor is a large fraction of the
+ * per-component RMS (~0.088), so it does not merely add noise, it AMPLIFIES
+ * distance by roughly a square root. Measured over the quantizer's own arithmetic:
+ *
+ *     raw 0.20 → 0.42    raw 0.35 → 0.55    raw 0.45 → 0.65
+ *
+ * Comparing quantized vectors at MATCH_THRESHOLD is therefore a raw threshold of
+ * ~0.21, less than half the intended gate. That is precisely what made an account
+ * enrolled in one lighting condition unrecoverable in another: the same face
+ * across a lighting change lands around 0.30–0.45 raw, comfortably inside the
+ * intended 0.45 and hopelessly outside the ~0.21 that was actually enforced.
+ */
 const QUANT_BIN = 0.1;
 
 export interface FaceDescriptor {
@@ -245,13 +288,21 @@ export async function captureFaceDescriptor(
 /**
  * Enroll a face: capture multiple samples, average into canonical descriptor,
  * then quantize for stable key derivation.
+ *
+ * Returns `'low-quality'` when the samples of this one sitting disagree so badly
+ * that the resulting identity could never be matched again (see
+ * ENROLL_SPREAD_LIMIT). Failing here is the whole point: the alternative is
+ * minting an account whose owner is locked out the moment the light changes,
+ * and by then the descriptor is sealed inside the key blob and on-chain.
  */
 export async function enrollFace(
   video: HTMLVideoElement,
   onProgress: (step: number, total: number, cue: CaptureCue) => void,
   guard?: PresenceGuard,
-): Promise<FaceMap | null> {
+): Promise<FaceMap | 'low-quality' | null> {
   const descriptors: number[][] = [];
+  /** Luma at each banked sample — trace only, so the spread has context. */
+  const lumas: number[] = [];
   let retries = 0;
   const pct = (n: number) => Math.round((n / ENROLLMENT_SAMPLES) * 100);
 
@@ -286,6 +337,7 @@ export async function enrollFace(
     }
     markSeen(guard);
     descriptors.push(desc.data);
+    lumas.push(frameBrightness(video));
     onProgress(i + 1, ENROLLMENT_SAMPLES, {
       label: `Hold still ${i + 1}/${ENROLLMENT_SAMPLES}`,
       guide: 'hold', left: pct(i + 1), right: pct(i + 1),
@@ -295,6 +347,32 @@ export async function enrollFace(
 
   if (guard?.lost) return null;
   if (descriptors.length < ENROLLMENT_SAMPLES) return null;
+
+  // ── Capture quality ───────────────────────────────────────────────────────
+  // Three samples of one face, seconds apart, should be nearly identical. How
+  // far apart they actually landed is the only honest estimate of how much of
+  // the match budget this enrollment has already spent before the user ever
+  // comes back in different light — so it is measured here, logged with the
+  // frame luma that produced it, and checked before the identity is sealed.
+  const spread = descriptorSpread(descriptors);
+  const lumaTxt = lumas.map(l => (l < 0 ? 'n/a' : l.toFixed(0))).join('/');
+  debugMetrics(
+    `enroll quality spread mean=${spread.mean.toFixed(3)} max=${spread.max.toFixed(3)} ` +
+    `(warn ${ENROLL_SPREAD_WARN.toFixed(2)}, reject ${ENROLL_SPREAD_LIMIT.toFixed(2)}) luma=${lumaTxt}`,
+  );
+  if (spread.max >= ENROLL_SPREAD_LIMIT) {
+    debugMetrics('enroll REJECTED: samples of one face are as far apart as two different people');
+    onProgress(ENROLLMENT_SAMPLES, ENROLLMENT_SAMPLES, {
+      label: 'Too dark or unsteady — add light and try again',
+      guide: 'search', state: 'fail', left: 0, right: 0,
+    });
+    return 'low-quality';
+  }
+  if (spread.max >= ENROLL_SPREAD_WARN) {
+    // Not a rejection — the band where the eventual tightened limit will be
+    // drawn, once traces show where good light and bad light actually separate.
+    debugMetrics('enroll MARGINAL: capture quality is in the warn band; recovery may be fragile');
+  }
 
   // Terminal cue: the bar reaches BOTH edges and turns confirmed-green (plus the
   // chime, via state 'ok'). Without it the last thing drawn was the third
@@ -838,8 +916,14 @@ export async function calibrateNeutral(
   return { ok: true, neutral };
 }
 
-/** Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics. */
-function debugMetrics(msg: string): void {
+/**
+ * Live tuning aid: `localStorage.neuron_debug = '1'` prints raw metrics.
+ *
+ * Exported so face-store can log the recovery match distance on the same
+ * `[face]` channel — that number and the enrollment spread have to be read side
+ * by side to mean anything, so they must not land in two different places.
+ */
+export function debugMetrics(msg: string): void {
   try { if (localStorage.getItem('neuron_debug') === '1') console.log(`[face] ${msg}`); } catch { /* no localStorage */ }
 }
 
@@ -1475,12 +1559,88 @@ export async function decryptWithFaceKey(encrypted: string, faceKey: CryptoKey):
 
 // ──── Comparison ────
 
+/**
+ * "Same person?" — Euclidean distance between two RAW (unquantized) descriptors.
+ *
+ * Pass canonical descriptors straight from `enrollFace`/the blob. Passing
+ * `quantizeDescriptor(...)` output silently halves the effective threshold (see
+ * QUANT_BIN) and is the bug that made cross-lighting recovery impossible; there
+ * is no reason to quantize before a comparison, because the bins buy stability
+ * that a distance metric already has.
+ */
 export function compareFaces(a: number[], b: number[]): { distance: number; match: boolean } {
   let sum = 0;
   for (let i = 0; i < 128; i++) sum += (a[i] - b[i]) ** 2;
   const distance = Math.sqrt(sum);
   return { distance, match: distance < MATCH_THRESHOLD };
 }
+
+/**
+ * How much the enrollment samples of one sitting disagree with each other.
+ *
+ * This is the capture-quality signal that actually predicts whether an account
+ * will be recoverable, and — unlike frame luminance — it needs no per-camera
+ * constant. Webcam auto-gain brightens a dark room until the *mean luma looks
+ * fine* while the sensor noise it amplifies is exactly what corrupts the
+ * descriptor, so a luma floor screens the wrong quantity. Descriptor spread
+ * measures the damage directly, whatever caused it (darkness, motion blur,
+ * backlight, a hand across the lens).
+ *
+ * `max` is the largest pairwise distance; `mean` is the average over all pairs.
+ */
+export function descriptorSpread(descriptors: number[][]): { mean: number; max: number } {
+  let sum = 0, max = 0, pairs = 0;
+  for (let i = 0; i < descriptors.length; i++) {
+    for (let j = i + 1; j < descriptors.length; j++) {
+      const d = compareFaces(descriptors[i], descriptors[j]).distance;
+      sum += d; pairs++;
+      if (d > max) max = d;
+    }
+  }
+  return { mean: pairs ? sum / pairs : 0, max };
+}
+
+/**
+ * Enrollment is rejected when its own samples are this far apart.
+ *
+ * Set to MATCH_THRESHOLD deliberately, and it is a floor on egregiousness rather
+ * than a tuned value: at this spread, three captures of ONE face taken within a
+ * couple of seconds are as far apart as two DIFFERENT people are permitted to
+ * be. Whatever such a canonical descriptor encodes, it is not a face the owner
+ * can reproduce later — no downstream threshold can rescue it, so banking it
+ * would mint an account that is unrecoverable by construction.
+ *
+ * Deliberately NOT tightened, and the first real traces are why. Measured
+ * 2026-08-15 on the same face and camera:
+ *
+ *     dim room + phone flashlight   spread mean=0.118 max=0.150   luma=147
+ *     decent natural light          spread mean=0.142 max=0.154   luma=172
+ *
+ * Two things fall out, both against the intuition this constant was built on.
+ * The BAD lighting scored the LOWER spread — a flashlight held on the face is
+ * unvarying, so its three samples agree closely while diffuse daylight shifts
+ * shading between them. Spread therefore measures capture *stability*, not
+ * capture *fidelity*, and a consistently poor capture scores well on it. And
+ * both readings sit around 0.15, a third of the way to the warn band — so any
+ * tightening that could catch a bad enrollment would reject the good one first.
+ *
+ * Note also that luma read 147 in a room lit only by a phone: exactly the
+ * auto-gain effect that rules out a luminance floor, now measured rather than
+ * argued. Neither quantity separates the conditions.
+ *
+ * What actually decides recoverability is the CROSS-SESSION distance
+ * (`matchOrLog` in face-store), which nothing recorded until now. Tighten this
+ * only if those traces show a bad enrollment landing near 0.45 — and rejecting a
+ * legitimate user is worse than accepting a marginal capture, so this stays a
+ * backstop against captures that cannot work at all.
+ */
+export const ENROLL_SPREAD_LIMIT = MATCH_THRESHOLD;
+/**
+ * Logged, not enforced. Both measured enrollments came in at ~0.15 against this
+ * 0.225, so nothing has yet been observed in the band — that gap is the evidence
+ * the limit above is not the binding constraint.
+ */
+export const ENROLL_SPREAD_WARN = MATCH_THRESHOLD / 2;
 
 // ──── Hashing ────
 

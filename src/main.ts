@@ -1032,7 +1032,8 @@ type FaceCaptureFailure =
   | { kind: 'presence' }
   | { kind: 'setup'; reason: 'flat' | 'multi-face' | 'timeout' }
   | { kind: 'challenge'; action: string }
-  | { kind: 'capture' };
+  | { kind: 'capture' }
+  | { kind: 'quality' };
 
 function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
   if (f.kind === 'presence') {
@@ -1049,6 +1050,12 @@ function faceCaptureErrorHtml(f: FaceCaptureFailure): string {
   }
   if (f.kind === 'challenge') {
     return `<span style="color:var(--danger)">Timed out on "${escHtml(f.action)}". Try again.</span>`;
+  }
+  if (f.kind === 'quality') {
+    // Spelled out because this is the one failure the user can definitively fix,
+    // and the one that silently cost people their accounts: a capture this
+    // inconsistent enrolls a face that will not match again later.
+    return '<span style="color:var(--danger)">The captures of your face did not agree with each other — usually too little light, or movement during capture. Face a light source (a window or lamp in front of you, not behind), hold still, and try again.</span>';
   }
   return '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>';
 }
@@ -1120,6 +1127,13 @@ async function challengeAndCapture(
   }
 
   const faceMap = await enrollFace(video, (_s, _t, cue) => renderCaptureCue(cue), presence);
+  if (faceMap === 'low-quality') {
+    // Refused BEFORE anything is sealed. Enrolling this would create an account
+    // that cannot be recovered once the lighting changes, and by then the
+    // descriptor is inside the key blob and on-chain — unfixable.
+    addLog('FaceID: capture quality too poor to enroll (samples disagree — add light, hold still)', 'error');
+    return { failure: { kind: 'quality' } };
+  }
   if (!faceMap) {
     addLog(`FaceID: ${presence.lost ? 'out of frame or too dark during capture' : 'capture failed'}`, 'error');
     return { failure: presence.lost ? { kind: 'presence' } : { kind: 'capture' } };
@@ -2083,7 +2097,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     const captured = await challengeAndCapture(video, turnHint);
     hideCameraModal();
     if ('failure' in captured) {
-      toast(captured.failure.kind === 'presence' ? 'Out of frame / Too dark!' : 'Face check failed', 'error');
+      toast(captured.failure.kind === 'presence' ? 'Out of frame / Too dark!'
+        : captured.failure.kind === 'quality' ? 'Not enough light — face not captured cleanly' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(captured.failure);
       restoreCreateBtn(); return;
     }
@@ -2327,13 +2342,18 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // peer-independent recovery), so the attacker needs only a username, the PIN
     // and a photo — without the challenges the face factor collapses in exactly
     // the case it exists for: a leaked/shoulder-surfed PIN.
-    // Same multi-sample enrollment as account creation so the quantized
-    // descriptor matches exactly (single-frame capture can differ enough to break
-    // the derived AES key).
+    // Same multi-sample enrollment as account creation, but NOT because the
+    // derived key depends on it: for pinVersion≥1 the face key comes from the
+    // canonical descriptor decrypted out of the blob with the PIN, so the live
+    // scan never feeds key derivation and never has to reproduce a quantization
+    // bin. Averaging still matters because the live scan is the biometric GATE
+    // (compareFaces vs the stored canonical), and a single frame is far noisier
+    // than a 3-sample mean — it spends match budget for nothing.
     const capturedR = await challengeAndCapture(video);
     hideCameraModal();
     if ('failure' in capturedR) {
-      toast(capturedR.failure.kind === 'presence' ? 'Out of frame / Too dark!' : 'Face check failed', 'error');
+      toast(capturedR.failure.kind === 'presence' ? 'Out of frame / Too dark!'
+        : capturedR.failure.kind === 'quality' ? 'Not enough light — face not captured cleanly' : 'Face check failed', 'error');
       statusEl.innerHTML = faceCaptureErrorHtml(capturedR.failure);
       finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return;
     }
@@ -2698,7 +2718,10 @@ $('#btnUpdateFace').addEventListener('click', async () => {
   const video = $<HTMLVideoElement>('#faceVideo');
   showCameraModal();
 
-  let faceMap: Awaited<ReturnType<typeof enrollFace>> | null = null;
+  // Typed from challengeAndCapture's success shape, not enrollFace's return —
+  // enrollFace can also report 'low-quality', which challengeAndCapture has
+  // already turned into a `failure` before anything reaches here.
+  let faceMap: import('./core/face-verify').FaceMap | null = null;
   try {
     setCameraStatus('<span class="spinner"></span> Loading face recognition models...');
     await loadModels();

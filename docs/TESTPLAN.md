@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 229-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 238-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
@@ -196,6 +196,43 @@ history here is `6ca3d64`, `97e1c9d`, `e99abc4` (claim ordering/replay).
    and history — key-blob served from a relay archive (`c9ac182`), chain from the
    delta archive. Do this once with relay #1 stopped (`pm2 stop neuron-relay`) to
    prove relay #2 alone suffices; restart afterwards.
+3. **Recover under DIFFERENT lighting from the one you enrolled in** — this is the
+   case that used to fail, so it is now part of the pass condition, not a bonus.
+   Enroll a fresh account in a dim room (lamp off, curtains drawn), then recover it
+   in good natural light, and once the other way round. **Pass:** both recover.
+
+   > **Verified 2026-08-15, both directions:** dim → natural light `distance=0.295
+   > margin=0.155 PASS`; bright → dim `distance=0.285 margin=0.165 PASS`. Both
+   > measure ~0.51 quantized, so both failed before the fix. The two agreeing to
+   > within 0.01 is the point — a lighting change costs a stable ~0.29 either way.
+
+   > Recovery compares the live scan to the stored canonical on **raw** descriptors
+   > at 0.45 — the same threshold the relay's Sybil check uses. It previously
+   > compared the *quantized* pair, which enforced ~0.21 raw and made a dim-room
+   > account unrecoverable in daylight by its own owner (`src/core/face-match.test.ts`
+   > pins the regression). Existing accounts need no migration: the stored
+   > descriptor never changed, only the gate.
+   >
+   > With `localStorage.neuron_debug = '1'` the flow logs two `[face]` lines that
+   > must be read together — enrollment quality, and the distance recovery
+   > actually decided on:
+   >
+   > ```
+   > [face] enroll quality spread mean=… max=… (warn 0.23, reject 0.45) luma=…
+   > [face] recovery match distance=… threshold=0.45 margin=… PASS/FAIL
+   > ```
+   >
+   > **The second line is the one that matters.** Capture it for every recovery,
+   > passing or failing: a threshold can only be judged against the spread of
+   > distances real successes produce, and a bare failure cannot distinguish a
+   > stranger (~0.9) from the owner missing by a hair (0.46).
+   >
+   > Enrollment spread does **not** track lighting — measured 2026-08-15, a dim
+   > room with a phone flashlight scored *better* (max 0.150) than decent natural
+   > light (0.154), and luma read 147 vs 172 because auto-gain hides darkness. So
+   > `ENROLL_SPREAD_LIMIT` stays a backstop against captures that cannot work at
+   > all, not a lighting gate. A rejected capture shows *"The captures of your face
+   > did not agree with each other"* and enrolls nothing.
 
 ## T6 — Username uniqueness + face limit
 
@@ -229,6 +266,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 | T3 | Transfers + offline claim | ☑ | Through G2 `/head-proof` packets; offline **and** wiped-recipient variants |
 | T4 | NFT mint/transfer/burn | ☑ | Re-verified 2026-08-10 incl. the A→B→A round trip: ownership sticks across refreshes and the claim lands without one. Discovery via inbox signal + `/pending-sends`; claims verify transfer packet + `/token` mint proof |
 | T5 | Recovery after wipe (1 relay down) | ☑ | Key-blob + chain from the archive; claim gated on own-chain sync |
+| T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix) |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
 
