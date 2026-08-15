@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 
 import {
   ProviderLedger, claimableEpochDay, MAX_OFFLINE_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_GRACE_MS,
-  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_DAY, BASE_STORAGE_RATE_MILLI, GB_BYTES,
+  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_DAY, MAX_HEARTBEATS_PER_DAY_HARD,
+  BASE_STORAGE_RATE_MILLI, GB_BYTES,
 } from './provider-ledger.js';
 import type { Block, StoragePayload } from '../core/block.js';
 
@@ -93,6 +94,26 @@ describe('heartbeat counting', () => {
     }
     expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
     expect(pl.countHeartbeatsLast24h(PUB, DAY + REWARD_EPOCH_MS - 1)).toBe(1);
+  });
+
+  it('rejects a flood only once it is far past any honest rate', () => {
+    const pl = registered(10, DAY);
+    // 24 blocks in one epoch — 4× what a fully-online provider produces. Every
+    // one before the ceiling applies (no honest chain is ever truncated); the
+    // one that crosses it is refused.
+    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY_HARD; i++) {
+      const ts = DAY + i * 60_000;
+      expect(pl.validate(blk('storage-heartbeat', ts, {}), ts)).toBeNull();
+      pl.apply(blk('storage-heartbeat', ts, {}), ts);
+    }
+    const over = DAY + MAX_HEARTBEATS_PER_DAY_HARD * 60_000;
+    expect(pl.validate(blk('storage-heartbeat', over, {}), over)).toMatch(/more than 24 heartbeats/);
+    // Still worth exactly one day's uptime credit: padding bought nothing.
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
+    expect(pl.submittedInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY_HARD);
+    // The ceiling is per epoch, so the next day starts clean.
+    const nextDay = DAY + REWARD_EPOCH_MS;
+    expect(pl.validate(blk('storage-heartbeat', nextDay, {}), nextDay)).toBeNull();
   });
 
   it('still takes address/usage reports from an uncounted heartbeat', () => {

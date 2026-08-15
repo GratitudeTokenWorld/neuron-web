@@ -40,6 +40,20 @@ export const HEARTBEAT_GRACE_MS = 60_000;
 /** Heartbeats a fully-online provider produces per reward epoch (24h / 4h). */
 export const MAX_HEARTBEATS_PER_DAY = 6;
 
+/**
+ * Hard ceiling on heartbeat blocks accepted per provider per epoch, counted or
+ * not. Four times the honest rate — no amount of clock skew, timer jitter or
+ * restart-storm reaches it, so the only chain that ever trips it is one
+ * deliberately padding itself.
+ *
+ * This is the one place a storage block is rejected mid-chain, which strands
+ * every later block on that chain (see `validate`). That is the intended
+ * outcome here and is safe *only* because the bar is set far above honest
+ * behaviour: without a ceiling, appending heartbeats is free for the spammer
+ * and costs every peer holding that shard the bandwidth and disk to carry them.
+ */
+export const MAX_HEARTBEATS_PER_DAY_HARD = 4 * MAX_HEARTBEATS_PER_DAY;
+
 /** Reward epoch: one day. `epochDay = floor(timestamp / REWARD_EPOCH_MS)`. */
 export const REWARD_EPOCH_MS = 24 * 60 * 60 * 1000;
 
@@ -121,6 +135,8 @@ export interface StorageProviderState {
 interface EpochRecord {
   /** Heartbeats in this epoch that satisfied the interval rule (spam is not counted). */
   heartbeats: number;
+  /** Every heartbeat block seen in this epoch, counted or not — the flood ceiling. */
+  submitted: number;
   /** Latest `storedBytes` reported inside this epoch, and when. */
   latestBytes: number;
   latestBytesAt: number;
@@ -275,6 +291,13 @@ export class ProviderLedger {
         if (block.timestamp > now + 10 * 60 * 1000) {
           return 'storage-heartbeat: timestamp too far in the future';
         }
+        // The flood ceiling — the only mid-chain rejection here, deliberately set
+        // 4× above the honest rate so only a padding chain reaches it. Counted off
+        // the chain itself, so every node draws the line at the same block.
+        const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
+        if (this.submittedInEpoch(block.accountId, epochDay) >= MAX_HEARTBEATS_PER_DAY_HARD) {
+          return `storage-heartbeat: more than ${MAX_HEARTBEATS_PER_DAY_HARD} heartbeats in one epoch`;
+        }
         return null;
       }
       case 'storage-reward': {
@@ -358,19 +381,23 @@ export class ProviderLedger {
     if (typeof s?.storedBytes === 'number' && s.storedBytes >= 0) p.lastActualStoredBytes = s.storedBytes;
     if (s?.countryCode && /^[A-Z]{2}$/.test(s.countryCode)) p.countryCode = s.countryCode;
 
+    // Every heartbeat counts toward the flood ceiling, even one worth no uptime —
+    // otherwise padding the chain with early blocks costs nothing at all.
+    const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
+    const rec = this.epochRecord(pub, epochDay);
+    rec.submitted += 1;
+
     // Only a heartbeat that satisfies the interval renews the lease or earns uptime.
     if (this.countsAsRenewal(pub, block.timestamp)) {
       p.lastHeartbeat = block.timestamp;
       this.recordHeartbeatTime(pub, block.timestamp);
-      const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
-      const rec = this.epochRecord(pub, epochDay);
       rec.heartbeats += 1;
       if (typeof s?.storedBytes === 'number' && s.storedBytes >= 0 && block.timestamp >= rec.latestBytesAt) {
         rec.latestBytes = s.storedBytes;
         rec.latestBytesAt = block.timestamp;
       }
-      this.pruneEpochs(pub, epochDay);
     }
+    this.pruneEpochs(pub, epochDay);
 
     // Count against *now*, not the block timestamp: a block can be up to an
     // interval old, and a window anchored on it reads high, then drops on the next
@@ -391,9 +418,14 @@ export class ProviderLedger {
 
   // ── Chain-derived evidence ───────────────────────────────────────────────────
 
-  /** Counted heartbeats inside a reward epoch. */
+  /** Counted heartbeats inside a reward epoch — what the reward is priced on. */
   heartbeatsInEpoch(pub: string, epochDay: number): number {
     return this.epochs.get(pub)?.get(epochDay)?.heartbeats ?? 0;
+  }
+
+  /** Every heartbeat block seen in an epoch, counted or not — what the ceiling bounds. */
+  submittedInEpoch(pub: string, epochDay: number): number {
+    return this.epochs.get(pub)?.get(epochDay)?.submitted ?? 0;
   }
 
   /** Latest reported stored GB inside a reward epoch (0 = nothing reported). */
@@ -468,7 +500,7 @@ export class ProviderLedger {
     let byEpoch = this.epochs.get(pub);
     if (!byEpoch) this.epochs.set(pub, (byEpoch = new Map()));
     let rec = byEpoch.get(epochDay);
-    if (!rec) byEpoch.set(epochDay, (rec = { heartbeats: 0, latestBytes: 0, latestBytesAt: 0 }));
+    if (!rec) byEpoch.set(epochDay, (rec = { heartbeats: 0, submitted: 0, latestBytes: 0, latestBytesAt: 0 }));
     return rec;
   }
 
