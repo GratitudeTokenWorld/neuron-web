@@ -615,10 +615,11 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      /* Mobile: 90% of the viewport width, uncapped — on a phone the feed should
-         be as large as the screen allows. PC is sized by height instead; see the
-         min-width query below. */
-      width: 90%;
+      /* Mobile: as wide as the screen allows — the square feed is width-bound on
+         a phone (a 96vw square is still well under the available height), so
+         every percent here is a percent of face size. PC is sized by height
+         instead; see the min-width query below. */
+      width: 96%;
       max-width: none;
       overflow: hidden;
       position: relative;
@@ -662,17 +663,35 @@
     .camera-modal-close:hover { background: var(--danger); }
 
     /* Mirrored: users expect a mirror when following left/right prompts. Detection
-       runs on the raw frames, so the CSS flip changes nothing for face-api. */
+       runs on the raw frames, so the CSS flip changes nothing for face-api.
+
+       SQUARE, via a centred `cover` crop. The capture surface is one shape on
+       every device (see capture-guide.ts): a 640x480 webcam and a 480x640 phone
+       both present the same 480x480 frame, so one framing band means one thing
+       everywhere and the guide is registered identically on both.
+
+       `object-fit: cover` here is safe — and was previously, correctly, refused.
+       The old objection was that cropping the DISPLAY alone shows a tighter
+       frame than the gate measures, so a view can read as well-framed while the
+       gate still says "move closer". That only holds when the crop is applied to
+       one of the two: `frac` and `centreX` are now measured against this same
+       centred square, so display and gate cannot disagree. Detection still runs
+       on the whole frame, so a second face just outside the square is still
+       caught. */
     .camera-modal video {
       width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
       display: block;
       background: #000;
       transform: scaleX(-1);
     }
     @media (min-width: 641px) {
-      /* Height drives the size; width: auto keeps the aspect ratio so the SVG
-         guide overlay (which fills the wrapper) stays registered to the image. */
-      .camera-modal video { height: 50vh; width: auto; max-width: 92vw; margin: 0 auto; }
+      /* Height drives the size and the square follows. `min(…, 92vw)` rather
+         than `max-width`: a max-width clamp would override the aspect ratio on a
+         narrow window and crop to a NON-square box, which is exactly the
+         display/metric mismatch this is built to avoid. */
+      .camera-modal video { height: min(50vh, 92vw); width: auto; margin: 0 auto; }
     }
 
     /* ── Step tracker ──────────────────────────────────────────────────────────
@@ -1176,23 +1195,20 @@
       <div class="camera-modal-video">
         <video id="faceVideo" autoplay muted playsinline></video>
         <div class="capture-guide" id="captureGuide" data-guide="" data-dir="left">
-          <!-- The viewBox is rewritten from the LIVE stream's aspect by
-               fitCaptureGuide(): the art is authored for 4:3 (200x150) but a
-               phone hands back a portrait stream, and a fixed landscape viewBox
-               letterboxes the guide inside a portrait box instead of covering
-               the frame the detector is reading.
+          <!-- CONSTANT viewBox — the feed is cropped to a square, so there is no
+               per-stream fitting step to get wrong and nothing to recompute when
+               a phone rotates. It is the same 200x150 art with the window cropped
+               to 150x150 about the face axis (x=100): the authored height already
+               mapped to the frame's SHORT side, which is exactly the square's.
+               Every cue still fits — the oval spans x 56-144 and the turn
+               chevrons reach x=28 (172 mirrored) inside bounds of 25 and 175.
+               Kept in sync with GUIDE_VIEWBOX in core/capture-guide.ts by a test.
 
-               It grows by moving min-y NEGATIVE rather than by wrapping the art
-               in a translated <g>. Deliberate: `.capture-guide g` hides every
-               group so `data-guide` can reveal one, and a wrapper <g> is caught
-               by that rule — an ancestor set to display:none cannot be undone by
-               a descendant, so the whole guide vanishes. Shifting the viewBox
-               adds the same space and leaves the art's own coordinates alone.
-
-               Width units are untouched on purpose: 200 units = frame WIDTH, the
-               same reference MIN/MAX_FACE_FRAC measures eye-span against, so the
-               oval and the framing gate can never drift apart. -->
-          <svg id="captureGuideSvg" viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+               Note there is no wrapper <g> here, and there must not be:
+               `.capture-guide g` hides every group so `data-guide` can reveal
+               one, and a descendant cannot un-hide a hidden ancestor — a wrapper
+               erases the entire guide. -->
+          <svg id="captureGuideSvg" viewBox="25 0 150 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
             <ellipse class="cg-oval" cx="100" cy="74" rx="44" ry="58"/>
             <!-- Chevrons POINT the way to turn: vertex on the outside, arms opening
                  back toward the face ("<<<" on the left). data-dir="right" mirrors

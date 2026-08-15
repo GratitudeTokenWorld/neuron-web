@@ -3,6 +3,7 @@
 // that re-registered every kernel and spammed the console with "already registered".
 import * as faceapi from '@vladmandic/face-api';
 import { bytesToHex } from './dag-block';
+import { squareSide, squareOriginX } from './capture-guide';
 
 let modelsLoaded = false;
 
@@ -577,9 +578,18 @@ function mouthMetrics(pts: Point[]): { lift: number; width: number; open: number
  * frame, while a body shift moves it a long way — measured here so a turn can
  * require yaw *without* displacement.
  */
-function frameCentreX(pts: Point[], videoWidth: number): number {
-  return ((pts[36].x + pts[45].x) / 2) / (videoWidth || 640);
+function frameCentreX(pts: Point[], video: FrameSize): number {
+  const side = squareSide(video.videoWidth, video.videoHeight);
+  const originX = squareOriginX(video.videoWidth, video.videoHeight);
+  // Relative to the VISIBLE square, not the full frame: 0 is its left edge and 1
+  // its right, so `CENTRE_MIN`/`CENTRE_MAX` bound where the user actually sees
+  // themselves. Against the full width, a face parked in a cropped-away band
+  // could read as centred while being off-screen.
+  return (((pts[36].x + pts[45].x) / 2) - originX) / side;
 }
+
+/** Just the two fields the framing maths needs off a video element. */
+interface FrameSize { videoWidth: number; videoHeight: number }
 
 function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
   const nose = pts[30];
@@ -597,7 +607,7 @@ function yawSignals(pts: Point[]): { skew: number; jawRatio: number } {
 interface FaceMetrics {
   ear: number; lift: number; width: number; open: number;
   yaw: number; skew: number; centreX: number; brow: number;
-  /** Eye span as a fraction of frame width — how big the head is. */
+  /** Eye span as a fraction of the SQUARE crop's side — how big the head is. */
   frac: number;
   /**
    * PERSPECTIVE shape: eye span over jaw width.
@@ -628,7 +638,7 @@ function browLift(pts: Point[]): number {
   return (lid - brow) / s;
 }
 
-function metricsOf(pts: Point[], videoWidth: number): FaceMetrics {
+function metricsOf(pts: Point[], video: FrameSize): FaceMetrics {
   const m = mouthMetrics(pts);
   const y = yawSignals(pts);
   const rightEAR = eyeAspectRatio(pts.slice(36, 42));
@@ -637,9 +647,9 @@ function metricsOf(pts: Point[], videoWidth: number): FaceMetrics {
     ear: (rightEAR + leftEAR) / 2,
     lift: m.lift, width: m.width, open: m.open,
     yaw: y.jawRatio, skew: y.skew,
-    centreX: frameCentreX(pts, videoWidth),
+    centreX: frameCentreX(pts, video),
     brow: browLift(pts),
-    frac: faceScale(pts) / (videoWidth || 640),
+    frac: faceScale(pts) / squareSide(video.videoWidth, video.videoHeight),
     shape: (() => {
       const jaw = Math.abs(pts[16].x - pts[0].x);
       return jaw < 1 ? 0 : faceScale(pts) / jaw;
@@ -701,8 +711,23 @@ export async function calibrateNeutral(
   const MAX_ROLL_DEG = 16;       // head tilt; beyond this the landmarks skew
   // Framing starts mid-range so the sweep has room in BOTH directions without
   // the face leaving the measurable band.
-  const MIN_FACE_FRAC = 0.15;    // eye span as a fraction of frame width
-  const MAX_FACE_FRAC = 0.32;
+  // Eye span as a fraction of the SQUARE crop's side (see capture-guide.ts).
+  //
+  // The measured values stay 0.15 / 0.32 — they came from traces and are left
+  // written as such. What changed is only the unit they are divided by: the
+  // traces were taken on a 640x480 feed against its 640px WIDTH, and the
+  // reference is now that same frame's 480px short side, so each is scaled by
+  // 640/480. Deliberately expressed as the ratio rather than pre-multiplied, so
+  // the traced numbers stay visible and nobody has to reverse-engineer whether
+  // 0.427 was measured or derived.
+  //
+  // Desktop framing is unchanged to the pixel. Portrait is what this fixes:
+  // width used to be the SHORT side there, so the same numbers demanded a
+  // 72-154px eye span where the laptop got 96-205px — a smaller face, held
+  // further away, for no reason but the orientation.
+  const SHORT_SIDE_RATIO = 4 / 3;
+  const MIN_FACE_FRAC = 0.15 * SHORT_SIDE_RATIO;
+  const MAX_FACE_FRAC = 0.32 * SHORT_SIDE_RATIO;
   const CENTRE_MIN = 0.25, CENTRE_MAX = 0.75;
   // Depth sweep, THREE legs: closer → back → closer.
   //
@@ -782,7 +807,7 @@ export async function calibrateNeutral(
     markSeen(guard);
 
     const pts = dets[0].landmarks!.positions as Point[];
-    const m = metricsOf(pts, video.videoWidth);
+    const m = metricsOf(pts, video);
     const rollDeg = Math.abs(Math.atan2(pts[45].y - pts[36].y, pts[45].x - pts[36].x) * 180 / Math.PI);
 
     // ── framing + pose, enforced in every phase ──────────────────────────────
@@ -1197,7 +1222,7 @@ export async function detectChallenge(
       const y = yawSignals(pts);
       yawSamples.push(y.jawRatio);
       skewSamples.push(y.skew);
-      centreSamples.push(frameCentreX(pts, video.videoWidth));
+      centreSamples.push(frameCentreX(pts, video));
       const pct = Math.round((widthSamples.length / CALIBRATION_FRAMES) * 100);
       onStatus?.({ label: 'Relax your face', guide, left: pct, right: pct });
       await sleep(30);
@@ -1269,7 +1294,7 @@ export async function detectChallenge(
       // sideways really does rotate the face relative to the lens. A rotation
       // pivots at the neck and keeps the face roughly in place; a shift carries
       // it across the frame. So yaw must arrive WITHOUT the face having moved.
-      const driftΔ = Math.abs(frameCentreX(pts, video.videoWidth) - centreNeutral);
+      const driftΔ = Math.abs(frameCentreX(pts, video) - centreNeutral);
       const stayedPut = driftΔ <= CENTRE_DRIFT_MAX;
       // ...and the yaw must be far more than the drift by itself could produce.
       const explained = TRANSLATION_YAW_GAIN * driftΔ;
