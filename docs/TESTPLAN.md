@@ -30,9 +30,19 @@ $env:BOOTSTRAP_ADDRS = '/ip4/<IP1>/tcp/9090/ws/p2p/<PEERID1>,/ip4/<IP2>/tcp/9090
 
 Rules that will save you a debugging session:
 
-- **Open the app at `http://localhost:5173` — not the LAN IP, not the tunnel.**
+- **On a desktop, open the app at `http://localhost:5173` — not the LAN IP.**
   `localhost` is a secure context (camera works) that still allows plain `ws://` and
-  `http://` to the raw-IP relays. The `https` tunnel would block both as mixed content.
+  `http://` to the raw-IP relays. A LAN IP is *not* a secure context, so the camera
+  is refused outright.
+- **On a phone, the `npm run tunnel` URL is the only option, and it now works.**
+  Face capture needs a secure context, so there is no `http://` route to a camera
+  on a phone. The tunnel is `https`, which used to block every plain-`http://`
+  call to the raw-IP relays as mixed content — silently reducing account creation
+  to *"1 of 2 attesters responded"* and leaving the phone with only the
+  same-origin dev relay for every archive query. The dev server now proxies each
+  bootstrap relay under `/dev-relay/<n>` so both work. ⚠ That proxy is a **dev-only
+  workaround that must be deleted before any shipped build, testnet included** —
+  CLAUDE.md → *Remove before production*.
 - Two "users" = two browser *profiles* (or normal + incognito), so each has its own
   IndexedDB. Same machine is fine.
 - Relay logs while testing: `ssh ubuntu@<IP> "pm2 logs neuron-relay --lines 50"`.
@@ -306,6 +316,31 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
    wipe (`[Archive] WIPED by operator`), `generation` increments on both
    `/relay-info`, and every open browser clears on next refresh.
 
+## T8 — Storage provider lifecycle (NOT YET RUN)
+
+Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
+
+1. **Register.** Storage tab → pick an account, capacity, Serve.
+   **Pass:** your row appears with the declared GB, `RATE/DAY` **0** (you hold no
+   bytes — declared capacity earns nothing), and `UPTIME` 100% / `SCORE` 1.000
+   (one heartbeat was due, one was sent).
+2. **Discovery.** On the *other* device, open the Storage tab.
+   **Pass:** the first device appears within ~15 s, with its capacity, and with
+   `—` in UPTIME / SPOT CHECK / SCORE / RATE / EARNED. Those dashes are correct:
+   that node holds none of the other's chain and has fetched nothing from it yet.
+   (Discovery is `GET /providers` — it does **not** arrive by gossip; the two
+   accounts are almost certainly in different shards.)
+3. **Heartbeat interval.** Immediately hit Serve again on the same account.
+   **Pass:** refused with `Heartbeat interval not reached (next in ~239min)`.
+4. **Deregister.** Stop Serving. **Pass:** the row disappears on both devices
+   (the other within one discovery poll). Re-register and heartbeat: **Pass:** it
+   is still refused until the 4h interval elapses — deregistering must not reset
+   the clock (that bug paid a full day's reward for 60 s of work).
+5. **Reward.** Needs a provider registered before a UTC day boundary, heartbeats
+   during that day, and a claim the day after (rewards settle a day behind, and
+   pay only for bytes actually held). **Not testable in one sitting** — see the
+   open question in the handoff before writing this step.
+
 ## Result log
 
 | # | Test | Result | Notes |
@@ -318,6 +353,8 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 | T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix). Pre-v3 run, but the biometric gate it measured is unchanged by v3 |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
+| T8 | Storage provider lifecycle | ☐ | **Steps 1–4 not yet run.** Register/discover/interval/deregister were all exercised ad-hoc during development on 2026-08-15 (both devices saw each other, rate correctly 0) but not as a recorded pass. Step 5 (reward) needs a day boundary — decide the approach first |
+| — | Mobile capture (part of T1) | ☑ | 2026-08-15: account created on a phone through the tunnel. Required three fixes — the capture guide was letterboxed on a portrait feed, close-eyes was unpassable below ~8 fps, and the attesters were unreachable over `https`. Face flows had never been run on a phone before |
 
 **Automated pre-check.** Before the manual matrix, run the live probe — it
 covers everything about the archive API that does *not* need a face:
