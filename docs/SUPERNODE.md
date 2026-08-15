@@ -61,6 +61,21 @@ tier answer queries without becoming an authority.
 information-theoretically independent of it: reading the file yields nothing,
 and a single rogue relay cannot reconstruct. Any 2 of n suffice, so one relay
 being down does not block recovery.
+
+> ⚠ **KNOWN GAP — share sets do not self-heal (found 2026-08-15).** `n` is fixed
+> at account creation: an account created while only two attesters were
+> reachable is **2-of-2 and has no redundancy at all** — losing either custodian
+> makes it permanently unrecoverable — and a relay that comes back later never
+> receives a share for it. Verified in dev: an account created with relay-2
+> stopped still holds shares on only two relays after relay-2 returned.
+> The fix is a **share refresh**: whenever the client legitimately holds the
+> secret (right after creation or a successful recovery), re-split across all
+> currently-reachable attesters and re-store with a newer `ts` — the
+> newest-signed-`ts`-wins rule already makes that a rotation rather than a new
+> mechanism. Until that ships, treat "how many relays were up at creation" as
+> the account's durability, and prefer creating accounts with all attesters
+> online. Same principle as Phase 3 content durability: repair must outpace
+> churn, and a set fixed at creation degrades monotonically.
 | `POST /log-reload` | dev telemetry sink | — |
 
 **`/recovery-share/release` is the exception to "a relay can serve or withhold,
