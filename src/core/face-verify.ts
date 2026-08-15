@@ -4,6 +4,7 @@
 import * as faceapi from '@vladmandic/face-api';
 import { bytesToHex } from './dag-block';
 import { squareSide, squareOriginX } from './capture-guide';
+import { closureHold, MIN_HOLD_SAMPLES } from './eye-hold';
 
 let modelsLoaded = false;
 
@@ -1446,17 +1447,16 @@ export async function detectChallenge(
       const closedBelow = openRef - margin;
       if (ear >= closedBelow + margin * 0.5) sawEyesOpen = true;   // clearly open first
 
-      // Mean over the LAST CLOSE_HOLD_MS, but only once the buffer actually
-      // covers that much history.
-      const recent = earWindow.filter(e => now - e.t <= CLOSE_HOLD_MS);
-      // Coverage comes from the FULL buffer, not from `recent`: `recent` only
-      // holds the last CLOSE_HOLD_MS by construction, so its own span can never
-      // reach that value — measuring it there made the hold unsatisfiable and
-      // the bar sat at 100% forever. (Second time; the same trap as before.)
-      const span = earWindow.length ? now - earWindow[0].t : 0;
-      const windowMean = recent.reduce((a, b) => a + b.ear, 0) / (recent.length || 1);
-      const held = span >= CLOSE_HOLD_MS && recent.length >= 4;
-      debugFrames(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms n=${recent.length} held=${held}`);
+      // Sustained-for and measured-enough are separate requirements, resolved
+      // separately — see eye-hold.ts. Collapsing them into one time-boxed window
+      // made the pass require ~8 fps, which a phone does not reach: the bar ran
+      // to 100% and the check could never fire, however long the eyes stayed
+      // shut. `fps` is logged so a slow device is visible in the trace instead
+      // of having to be inferred from it.
+      const hold = closureHold(earWindow, now, CLOSE_HOLD_MS);
+      const { mean: windowMean, held } = hold;
+      const span = hold.bufferSpan;
+      debugFrames(`eyes ear=${ear.toFixed(3)} mean=${windowMean.toFixed(3)} openRef=${openRef.toFixed(3)} threshold=${closedBelow.toFixed(3)} span=${span}ms sampleSpan=${hold.sampleSpan}ms n=${hold.samples.length} fps=${hold.fps.toFixed(1)} held=${held}`);
 
       if (sawEyesOpen && held && windowMean <= closedBelow) {
         onStatus?.({ label: 'Eyes closed detected', guide: 'eyes', left: 100, right: 100, state: 'ok' });
@@ -1475,7 +1475,14 @@ export async function detectChallenge(
       // that says "nearly there" while nothing is happening. Bar and test must
       // read the same number or one of them is lying.
       const depth = openRef > 0 ? (openRef - windowMean) / margin : 0;
-      const pct = Math.max(0, Math.min(99, Math.round(depth * Math.min(1, span / CLOSE_HOLD_MS) * 100)));
+      // The bar is scaled by EVERY term the pass depends on — depth, time, and
+      // the number of frames averaged. Leaving the sample term out is what let
+      // it read 100% while the check could not fire; a bar that completes on a
+      // subset of the conditions is a bar that lies, and this file has now been
+      // bitten by that three times.
+      const coverage = Math.min(1, span / CLOSE_HOLD_MS)
+        * Math.min(1, hold.samples.length / MIN_HOLD_SAMPLES);
+      const pct = Math.max(0, Math.min(99, Math.round(depth * coverage * 100)));
       // Feed the reference ONLY with frames that are not part of a closure —
       // otherwise a long hold drags the reference down to meet the closure and
       // the test can never fire (observed: openRef decaying 0.329 -> 0.304 while

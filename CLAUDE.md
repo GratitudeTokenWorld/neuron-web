@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **322 tests / 61 files passing**, `npm run build` clean.
+Current baseline: **330 tests / 62 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -272,13 +272,23 @@ Changes here need adversarial tests, not just happy-path ones.
   `[face]` lines), compute rest-vs-action separation, and set the threshold from
   the data. Three traps that have each bitten more than once:
   - *Bar and test measuring different things.* A progress bar that divides by a
-    different reference than the pass condition reads "nearly there" while the
-    check can never fire. Fixed twice (close-eyes, head turn).
+    different reference than the pass condition — or that is scaled by only SOME
+    of the terms the pass depends on — reads "nearly there" while the check can
+    never fire. Fixed three times (close-eyes twice, head turn). Scale the bar by
+    every term, or it lies.
   - *A rolling reference fed by frames that are part of the action.* It chases the
     action, the threshold runs away, and the check becomes unpassable. Feed a
     reference only from frames that are clearly NOT the action.
   - *Time-based windows assume ~16 fps* (60 ms poll). On slow hardware a "400 ms
     window" holds one frame and the √n noise averaging silently stops working.
+    **Never let a time-boxed window carry a minimum sample count** — "4 frames
+    inside 500 ms" is "at least 8 fps" written so it cannot be seen, and a phone
+    at 3-5 fps could not pass close-eyes at all while the bar showed 100%
+    (reported 2026-08-15, pre-dating the square-frame work). Sustained-for and
+    measured-enough are separate requirements: judge duration on the whole
+    buffer, and let the averaged window reach further back when frames are
+    scarce. `src/core/eye-hold.ts` is that decision, pure and tested **at a frame
+    rate** — the variable no earlier test varied.
   Detection uses `detectAllFaces` everywhere and aborts on >1 face:
   `detectSingleFace` does **not** fail on two faces, it returns the highest-scoring
   one — which let a photo held beside a real head supply the enrolled descriptor.
