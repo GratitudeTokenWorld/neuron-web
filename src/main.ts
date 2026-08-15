@@ -902,6 +902,55 @@ function setCameraStatus(html: string) {
   $('#cameraStatus').innerHTML = html;
 }
 
+/** Art canvas the wireframe guides are authored in: 200 units = the frame's WIDTH. */
+const GUIDE_ART_W = 200;
+const GUIDE_ART_H = 150;
+
+/**
+ * Re-fit the wireframe guide to the stream's real aspect ratio.
+ *
+ * The guides are authored on a 4:3 canvas, which is what a laptop webcam hands
+ * back. A phone hands back a PORTRAIT stream, and the feed is shown whole (never
+ * cropped — cropping would show a tighter frame than face-api sees, and the
+ * framing gate measures eye-span against the full frame width). So a fixed
+ * landscape viewBox letterboxes the guide: on a 3:4 box the art covers only 56%
+ * of the height, sitting in a band across the middle while the face fills the
+ * frame around it.
+ *
+ * The fix is to grow the viewBox vertically to the stream's true aspect and
+ * re-centre the art in it. Horizontal units are left alone on purpose: 200 units
+ * = frame width is the same reference `MIN_FACE_FRAC`/`MAX_FACE_FRAC` measure
+ * against, so the oval the user frames into and the gate that judges the framing
+ * stay in the same units. Changing that is how a guide starts saying "you're in
+ * the circle" while the check still says "move closer".
+ */
+function fitCaptureGuide(video: HTMLVideoElement): void {
+  const svg = document.getElementById('captureGuideSvg');
+  const art = document.getElementById('captureGuideArt');
+  if (!svg || !art) return;
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return;                       // metadata not in yet; caller retries
+  // Never shrink below the authored canvas: a landscape-but-wider-than-4:3 feed
+  // (16:9 laptop cams) would otherwise crop the oval's top and bottom off.
+  const viewH = Math.max(GUIDE_ART_H, (GUIDE_ART_W * h) / w);
+  svg.setAttribute('viewBox', `0 0 ${GUIDE_ART_W} ${viewH.toFixed(2)}`);
+  art.setAttribute('transform', `translate(0 ${((viewH - GUIDE_ART_H) / 2).toFixed(2)})`);
+}
+
+/**
+ * Fit now, and again whenever the stream or the layout changes. `resize` covers
+ * a phone rotating mid-capture (the track's dimensions swap), `loadedmetadata`
+ * covers a camera that reports its size late.
+ */
+function watchCaptureGuideFit(video: HTMLVideoElement): void {
+  const fit = () => fitCaptureGuide(video);
+  fit();
+  video.addEventListener('loadedmetadata', fit);
+  video.addEventListener('resize', fit);      // fires when the track's dimensions change
+  window.addEventListener('resize', fit);
+}
+
 /**
  * Render one capture cue: header line + centre-out progress bar + the wireframe
  * animation over the feed. Single source of truth, so the three surfaces can
@@ -1070,7 +1119,13 @@ function setCaptureSteps(done: number, active = -1): void {
 function setCaptureStepCount(n: number): void {
   const host = document.getElementById('captureSteps');
   if (!host) return;
-  host.innerHTML = Array.from({ length: Math.max(1, n) }, (_, i) => `<i>${i}</i>`).join('');
+  const count = Math.max(1, n);
+  host.innerHTML = Array.from({ length: count }, (_, i) => `<i>${i}</i>`).join('');
+  // Box height and font size are derived from `100cqw / --steps` — the width one
+  // section actually gets. CSS cannot count its own children, so the count has
+  // to come from here, or a 14-step recovery renders at 7-step proportions and
+  // the numerals overflow their boxes.
+  host.style.setProperty('--steps', String(count));
 }
 
 /** Clear bar + guide between phases so a stale animation never lingers. */
@@ -2254,6 +2309,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
+    watchCaptureGuideFit(video);   // registers the wireframe guide to THIS stream's aspect
 
 
     // Step 2: Pre-fetch relay challenges BEFORE face capture, then show the challenge
@@ -2539,6 +2595,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
 
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
+    watchCaptureGuideFit(video);   // registers the wireframe guide to THIS stream's aspect
 
     // Recovery gets the SAME anti-spoofing as enrollment. It is the flow that
     // hands over the keys, and the key-blob is public by design (gossiped for
@@ -3060,6 +3117,7 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     await loadModels();
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
+    watchCaptureGuideFit(video);   // registers the wireframe guide to THIS stream's aspect
     // Full challenge + continuity: this flow REBINDS the account's biometric, so
     // a swapped face here silently re-points the identity at someone else.
     const captured = await challengeAndCapture(video);
