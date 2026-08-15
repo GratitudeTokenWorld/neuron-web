@@ -182,7 +182,7 @@ export function planShareRefresh(statuses: readonly ShareStatus[]): RefreshPlan 
 }
 
 /** Ask every base whether it holds a share (no secret material crosses). */
-export async function fetchShareStatuses(
+async function fetchShareStatuses(
   bases: readonly string[],
   accountId: string,
   network: string,
