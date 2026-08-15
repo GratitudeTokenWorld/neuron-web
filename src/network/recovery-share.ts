@@ -108,6 +108,130 @@ export async function storeRecoveryShare(
   return { stored: results.filter(Boolean).length, mode: 'shamir' };
 }
 
+// ── Share refresh (redundancy repair) ────────────────────────────────────────
+//
+// `n` is fixed when an account is created, so a set written while some relays
+// were unreachable stays that small forever: an account created with two
+// attesters up is 2-of-2 — lose either custodian and it is unrecoverable — and
+// a relay returning later never receives a share. Same failure Phase 3 exists
+// to prevent for content: durability is a FLOW, and a set fixed at creation
+// degrades monotonically. So whenever the client legitimately holds the secret
+// (right after creation or a successful recovery) it re-splits across every
+// reachable attester, riding the relays' newest-signed-ts-wins rule.
+
+/** One relay's answer to "do you hold a share for this account?" */
+export interface ShareStatus {
+  base: string;
+  has: boolean;
+  x: number | null;
+  ts: number;
+}
+
+export interface RefreshPlan {
+  /** Bases holding a share from the CURRENT (newest) split. */
+  holders: string[];
+  /** True when re-splitting would strictly increase the custodian count. */
+  shouldRefresh: boolean;
+  reason: string;
+}
+
+/**
+ * Decide whether to re-split — pure, because getting this wrong DESTROYS
+ * redundancy rather than merely failing to add it.
+ *
+ * Two rules, both load-bearing:
+ *  - Only ever EXPAND. Re-splitting across fewer relays than currently hold
+ *    shares would overwrite good custodians with a smaller set; a transient
+ *    outage during a refresh would then quietly reduce durability, which is
+ *    worse than the gap being repaired.
+ *  - Count only CURRENT-generation holders. Shares from different splits
+ *    combine into garbage, so a relay still holding an older split is not a
+ *    usable custodian and must not be counted as one.
+ */
+export function planShareRefresh(statuses: readonly ShareStatus[]): RefreshPlan {
+  const reachable = statuses.map(s => s.base);
+  const held = statuses.filter(s => s.has);
+  const newestTs = held.reduce((m, s) => Math.max(m, s.ts), 0);
+  const holders = held.filter(s => s.ts === newestTs).map(s => s.base);
+  if (reachable.length < 2) {
+    return { holders, shouldRefresh: false, reason: 'fewer than 2 relays reachable — cannot maintain k=2' };
+  }
+  if (reachable.length <= holders.length) {
+    return { holders, shouldRefresh: false, reason: `already spread across ${holders.length} custodian(s)` };
+  }
+  return {
+    holders,
+    shouldRefresh: true,
+    reason: `${holders.length} custodian(s) for ${reachable.length} reachable relays`,
+  };
+}
+
+/** Ask every base whether it holds a share (no secret material crosses). */
+export async function fetchShareStatuses(
+  bases: readonly string[],
+  accountId: string,
+  network: string,
+  timeoutMs = 5_000,
+): Promise<ShareStatus[]> {
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetch(
+        `${base}/recovery-share/status?accountId=${encodeURIComponent(accountId)}&network=${encodeURIComponent(network)}`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const body = await res.json() as { has?: boolean; x?: number | null; ts?: number };
+      return { base, has: !!body.has, x: body.x ?? null, ts: Number(body.ts ?? 0) };
+    }),
+  );
+  // Unreachable relays are simply absent — never counted as non-holders, which
+  // would make a transient outage look like lost redundancy and trigger a
+  // pointless (and, per the expand-only rule, refused) re-split.
+  return results.flatMap(r => (r.status === 'fulfilled' ? [r.value] : []));
+}
+
+export interface RefreshResult {
+  refreshed: boolean;
+  /** Custodians holding a usable, current-generation share afterwards. */
+  custodians: number;
+  reason: string;
+}
+
+/**
+ * Repair redundancy: re-split the secret across every reachable attester.
+ *
+ * Safe to call whenever the secret is in hand; it no-ops unless the custodian
+ * count would actually grow. On a partial write it retries once, because
+ * landing exactly ONE new-generation share is the single dangerous outcome —
+ * the relays that kept the old split and the one that took the new one can no
+ * longer combine with each other.
+ */
+export async function refreshShareRedundancy(
+  bases: readonly string[],
+  accountId: string,
+  network: string,
+  secret: Uint8Array,
+  enginePriv: string,
+  timeoutMs = 6_000,
+): Promise<RefreshResult> {
+  const statuses = await fetchShareStatuses(bases, accountId, network, timeoutMs);
+  const plan = planShareRefresh(statuses);
+  if (!plan.shouldRefresh) {
+    return { refreshed: false, custodians: plan.holders.length, reason: plan.reason };
+  }
+  const targets = statuses.map(s => s.base);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { stored } = await storeRecoveryShare(targets, accountId, network, secret, enginePriv, timeoutMs);
+    if (stored >= 2) {
+      return { refreshed: true, custodians: stored, reason: `re-split across ${stored} of ${targets.length} relays` };
+    }
+  }
+  // Both attempts landed <2 shares: the relays are in worse shape than the
+  // status probe suggested. Report it loudly — the caller logs it, and the
+  // next successful session retries from scratch.
+  return { refreshed: false, custodians: 0, reason: 'refresh could not reach 2 relays — redundancy unchanged or degraded' };
+}
+
 /** A relay's drawn recovery challenge, kept with the base that issued it. */
 export interface RelayRecoveryChallenge {
   base: string;

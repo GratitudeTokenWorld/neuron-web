@@ -232,6 +232,16 @@ check(
     });
     check(rel.status === 400, `${r.name} refuses a release without a valid challenge (400, got ${rel.status})`);
 
+    // Share status: reports holding without leaking secret material, and must
+    // answer for an unknown account (the client's refresh planner treats an
+    // error as "unreachable", which would wrongly suppress a repair).
+    const stRes = await fetch(`${r.http}/recovery-share/status?accountId=${keys.pub}&network=testnet`);
+    const st = stRes.ok ? await stRes.json() as Record<string, unknown> : {};
+    check(
+      stRes.status === 200 && st.has === false && st.shareHex === undefined,
+      `${r.name} reports share status for an unknown account without leaking material`,
+    );
+
     // A recovery challenge must be drawn server-side, ordered and distinct.
     const chRes = await fetch(`${r.http}/recovery-share/challenge`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-network': 'testnet' }, body: '{}',

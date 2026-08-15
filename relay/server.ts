@@ -1025,6 +1025,21 @@ async function main() {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
 
+      } else if (req.method === 'GET' && req.url?.startsWith('/recovery-share/status?')) {
+        // Does this relay hold a share for the account, and from which split?
+        // Returns NO secret material — only the x-coordinate (a public index)
+        // and the split's ts, which is exactly what a client needs to decide
+        // whether redundancy has degraded and a refresh is warranted.
+        // Deliberately not rate-limited: it leaks strictly less than the
+        // key-blob endpoint already does (whose 404/200 reveals the same
+        // account existence), and gating it would make self-healing depend on
+        // a quota that a legitimate client spends on every session.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const rec = recoveryShareStore.get(`${network}:${String(q.get('accountId') || '')}`);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(rec ? { has: true, x: rec.x ?? null, ts: rec.ts } : { has: false }));
+
       } else if (req.method === 'POST' && req.url === '/recovery-share/challenge') {
         // Draw THIS relay's action sequence for a release attempt. Server-drawn
         // and single-use: a sniffed legit performance satisfies one specific

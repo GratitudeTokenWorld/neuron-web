@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 260-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 267-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
@@ -307,7 +307,7 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
 covers everything about the archive API that does *not* need a face:
 
 ```sh
-npx tsx scripts/g1-resolve-smoke.mts    # 38 checks; expect ALL CHECKS PASSED
+npx tsx scripts/g1-resolve-smoke.mts    # 40 checks; expect ALL CHECKS PASSED
 ```
 
 It publishes a signed account record and a real signed sender chain to relay-1

@@ -55,6 +55,8 @@ tier answer queries without becoming an authority.
 | `POST /recovery-share` | store this relay's **Shamir 2-of-n share** of the account's v3 secret, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{x}:{share}:{ts}` by the account's engine key (the x-coordinate is inside the signature so it cannot be stripped/renumbered); newest signed `ts` wins |
 | `POST /recovery-share/challenge` | draw this relay's ordered action sequence (3 distinct of 5) for one release attempt | single-use session; a stolen performance matches a fresh draw ~1-in-60, under the release backoff |
 | `POST /recovery-share/release` | **the recovery gate**: release this relay's share after verifying the trajectory proof + `nid` match | `verifyTrajectory` (ordered actions, ratio floor, human pacing, one-person descriptors — pure module, vitest-pinned) then every descriptor matched to the account's `nid`; per-account exponential backoff (3 free, then 30s·4ⁿ up to 24h) + per-IP cap; response ECDH-wrapped to the client's ephemeral key |
+| `GET /recovery-share/status?accountId=&network=` | `{has, x, ts}` — whether this relay holds a share and from which split. **No secret material** | client-side only: feeds `planShareRefresh`, which decides whether custody redundancy has degraded |
+| `POST /log-reload` | dev telemetry sink | — |
 
 **Two relays must release before an account recovers.** The secret is Shamir
 2-of-n across the attesters, so this box's `.relay-recovery-shares.json` is
@@ -62,21 +64,22 @@ information-theoretically independent of it: reading the file yields nothing,
 and a single rogue relay cannot reconstruct. Any 2 of n suffice, so one relay
 being down does not block recovery.
 
-> ⚠ **KNOWN GAP — share sets do not self-heal (found 2026-08-15).** `n` is fixed
-> at account creation: an account created while only two attesters were
-> reachable is **2-of-2 and has no redundancy at all** — losing either custodian
-> makes it permanently unrecoverable — and a relay that comes back later never
-> receives a share for it. Verified in dev: an account created with relay-2
-> stopped still holds shares on only two relays after relay-2 returned.
-> The fix is a **share refresh**: whenever the client legitimately holds the
-> secret (right after creation or a successful recovery), re-split across all
-> currently-reachable attesters and re-store with a newer `ts` — the
-> newest-signed-`ts`-wins rule already makes that a rotation rather than a new
-> mechanism. Until that ships, treat "how many relays were up at creation" as
-> the account's durability, and prefer creating accounts with all attesters
-> online. Same principle as Phase 3 content durability: repair must outpace
-> churn, and a set fixed at creation degrades monotonically.
-| `POST /log-reload` | dev telemetry sink | — |
+**Share sets self-heal (`GET /recovery-share/status` + client refresh).** `n`
+used to be fixed at account creation, so an account created while only two
+attesters were reachable stayed **2-of-2 forever** — one custodian loss from
+unrecoverable — and a relay returning later never received a share. The client
+now re-splits across every reachable attester whenever it legitimately holds
+the secret: after creation, after a successful recovery, and once per session
+for any local account with the secret cached. The relays' newest-signed-`ts`-wins
+rule makes that a rotation, not a new mechanism.
+
+The refresh is **expand-only** and counts only current-generation holders
+(`planShareRefresh`, unit-tested): re-splitting across *fewer* relays than
+currently hold shares would overwrite good custodians with a smaller set, so a
+transient outage during a refresh must never be able to reduce durability. A
+relay still holding an older split is not a usable custodian (shares from
+different splits do not combine) and is counted as missing. `status` returns
+only `{has, x, ts}` — never share bytes.
 
 **`/recovery-share/release` is the exception to "a relay can serve or withhold,
 never forge".** The share is not client-verifiable content — it is a secret the

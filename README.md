@@ -8,7 +8,7 @@ face+PIN identity, relay) carried over and being re-platformed onto a new
 - `src/engine/` is the new scalable core — a tested library that the app's
   ledger/consensus/storage are being refactored onto. The engine **is** wired in
   (`node.ts` runs `EngineLedger`); the remaining seam is the app-layer types +
-  `storage-manager` (see `CLAUDE.md`). Test suite: 260 passing.
+  `storage-manager` (see `CLAUDE.md`). Test suite: 267 passing.
 - The full design + threat model + measured results: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Ops: relay/super-node deployment [`docs/SUPERNODE.md`](docs/SUPERNODE.md), cloud
   provisioning [`docs/CLOUD.md`](docs/CLOUD.md), manual E2E matrix
@@ -57,7 +57,7 @@ src/
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
 - **Engine** (`src/engine/` + `src/ledger/`) — phases 0–2 done, Phase 2 consensus
   (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
-  **260 tests passing, engine + storage typechecked**, all 7 scale-invariants
+  **267 tests passing, engine + storage typechecked**, all 7 scale-invariants
   demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
   `EngineLedger` (`src/network/node.ts`).
 - **Scale invariant restored** — the two known `O(N)` violations are closed

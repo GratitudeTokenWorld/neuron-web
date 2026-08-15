@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **260 tests / 57 files passing**, `npm run build` clean.
+Current baseline: **267 tests / 58 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-10)
@@ -65,7 +65,7 @@ Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
   chain is held at all.
 
 TESTPLAN T1–T7 all green on the two-relay dev network. Run the live probe
-`npx tsx scripts/g1-resolve-smoke.mts` (38 checks) after every relay deploy.
+`npx tsx scripts/g1-resolve-smoke.mts` (40 checks) after every relay deploy.
 
 **Next: Phase 3 wiring** — `storage-manager.ts` off the legacy `DAGLedger` onto
 `src/engine/content` (`EngineLedger.createStorage*` are deliberate `deferred()`

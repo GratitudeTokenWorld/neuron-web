@@ -8,7 +8,7 @@ import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCre
 import { bakedBootstrapAddrs, peerIdFromMultiaddr } from './network/libp2p-network';
 import { loadModels, startCamera, stopCamera, enrollFace, detectChallenge, captureFaceDescriptor, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor, newPresenceGuard, holdPresence, calibrateNeutral, CHALLENGE_EXPRESSIONS, EXPRESSIONS_PER_RUN, type ChallengeAction } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey, deriveTripleKey, generateRecoveryShare } from './core/face-store';
-import { storeRecoveryShare, releaseRecoveryShare, fetchRecoveryChallenges, type RelayRecoveryChallenge } from './network/recovery-share';
+import { storeRecoveryShare, releaseRecoveryShare, fetchRecoveryChallenges, refreshShareRedundancy, type RelayRecoveryChallenge } from './network/recovery-share';
 import type { TrajectoryProof, ActionProof, RecoveryAction } from './core/recovery-challenge';
 import { acquireTabLock } from './core/tab-lock';
 import { engineKeysFromAppPrivate, engineAccountId } from './ledger/key-bridge';
@@ -29,6 +29,44 @@ import {
 /** Hex of a recovery share for the device cache — shares are handled as bytes everywhere else. */
 function shareToHex(share: Uint8Array): string {
   return Array.from(share).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Accounts whose share redundancy was already checked this session. */
+const shareRefreshChecked = new Set<string>();
+
+/**
+ * Repair share redundancy for one account, at most once per session.
+ *
+ * `n` is fixed at creation, so an account created while a relay was down stays
+ * at that width forever and a returning relay never receives a share — the
+ * account is one custodian loss from unrecoverable. This heals it at the
+ * moments the client provably holds the secret. Fire-and-forget: it must never
+ * delay or fail a user action, and the next session simply retries.
+ */
+function repairShareRedundancy(accountId: string, secret: Uint8Array, enginePriv: string): void {
+  if (shareRefreshChecked.has(accountId)) return;
+  shareRefreshChecked.add(accountId);
+  void refreshShareRedundancy(node.relayHttpBases(), accountId, node.ledger.network, secret, enginePriv)
+    .then(r => {
+      if (r.refreshed) addLog(`Recovery: share redundancy repaired — ${r.reason}`, 'success');
+      else if (r.custodians === 0) addLog(`Recovery: share redundancy NOT repaired — ${r.reason}`, 'error');
+    })
+    .catch(() => { /* best-effort; retried next session */ });
+}
+
+/**
+ * Session sweep: heal every local account that still has its secret cached.
+ * This is what actually repairs an account that is never recovered — the
+ * creation/recovery hooks only fire on those events, and a degraded set would
+ * otherwise sit at 2-of-2 indefinitely.
+ */
+async function sweepShareRedundancy(): Promise<void> {
+  for (const acc of localAccounts) {
+    try {
+      const cached = await getCachedRecoveryShare(acc.pub);
+      if (cached) repairShareRedundancy(acc.pub, cached, engineKeysFromAppPrivate(acc.keys.priv).priv);
+    } catch { /* skip this account */ }
+  }
 }
 
 // ──── Single-tab lock ────
@@ -1910,6 +1948,10 @@ async function startNode() {
     }, 6_000);
     // Keys are now loaded — reschedule the heartbeat timer with accurate lastHeartbeat timing.
     node.storage.rescheduleHeartbeat();
+    // Heal share custody once the relay set is actually reachable. Delayed so
+    // relay discovery has settled: probing too early would see a thin fleet,
+    // and the expand-only rule would (correctly) decline the repair we want.
+    setTimeout(() => { void sweepShareRedundancy(); }, 8_000);
     // Deregister any local provider that has been offline for more than 24h.
     await node.storage.deregisterStaleLocalProviders();
     for (const acc of localAccounts) {
@@ -2310,6 +2352,10 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // This device has proved itself (it IS the enrollment) — cache the share so
     // PIN/face changes here never need a relay round trip.
     await cacheRecoveryShare(accountId, shareToHex(recoveryShare));
+    // If some attester was unreachable just now, this account is narrower than
+    // the relay fleet — heal it as soon as the missing relay is back, rather
+    // than leaving it one custodian loss from unrecoverable.
+    repairShareRedundancy(accountId, recoveryShare, engineKeys.priv);
 
     const pinSalt = keyBlob.pinSalt!;
     const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
@@ -2613,7 +2659,12 @@ $('#btnRecoverFace').addEventListener('click', async () => {
 
     // This device just completed a full face+PIN+share recovery — it has proved
     // itself. Cache the share so PIN/face changes here work offline.
-    if (recoveryShare) await cacheRecoveryShare(blob.pub, shareToHex(recoveryShare));
+    if (recoveryShare) {
+      await cacheRecoveryShare(blob.pub, shareToHex(recoveryShare));
+      // A recovery is the strongest moment to repair custody: the secret is in
+      // hand and the relay set was just probed for real.
+      repairShareRedundancy(blob.pub, recoveryShare, engineKeysFromAppPrivate(keys.priv).priv);
+    }
 
     // Reset attempt counter on successful recovery
     await recordPinSuccess(blob.pub);
