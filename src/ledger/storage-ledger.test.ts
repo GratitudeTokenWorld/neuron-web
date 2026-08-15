@@ -237,6 +237,21 @@ describe('reward minting — the adversarial surface', () => {
     expect(claim(DAY1 + REWARD_EPOCH_MS + 1).result.error).toMatch(/already rewarded/);
   });
 
+  it('rejects a reward that bills any day but the one before its own block', async () => {
+    const { ledger, keys, chain } = await provider(10);
+    fullDayOfHeartbeats(ledger, chain, 4);
+    const amount = BigInt(BASE_STORAGE_RATE_MILLI * 4);
+    // Dated day -1, so it may bill day -2 and nothing else. Billing the running
+    // day is refused even though the provider genuinely has evidence for it.
+    const { result } = chain.push(
+      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 1, storedGB: 4 },
+      { amount, balance: MINT + amount },
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/may only claim epoch/);
+    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT));
+  });
+
   it('rejects a balance change on register, deregister or heartbeat', async () => {
     const { ledger, chain } = await provider(10);
     for (const type of ['storage-register', 'storage-heartbeat', 'storage-deregister'] as const) {

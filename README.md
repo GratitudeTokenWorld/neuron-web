@@ -9,7 +9,7 @@ users.
 - `src/engine/` is the new scalable core — a tested library that the app's
   ledger/consensus/storage are being refactored onto. The engine **is** wired in
   (`node.ts` runs `EngineLedger`); the remaining seam is the app-layer types +
-  `storage-manager` (see `CLAUDE.md`). Test suite: 270 passing.
+  `storage-manager` (see `CLAUDE.md`). Test suite: 312 passing.
 - The full design + threat model + measured results: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Ops: relay/super-node deployment [`docs/SUPERNODE.md`](docs/SUPERNODE.md), cloud
   provisioning [`docs/CLOUD.md`](docs/CLOUD.md), manual E2E matrix
@@ -58,7 +58,7 @@ src/
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
 - **Engine** (`src/engine/` + `src/ledger/`) — phases 0–2 done, Phase 2 consensus
   (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
-  **308 tests passing, engine + storage typechecked**, all 7 scale-invariants
+  **312 tests passing, engine + storage typechecked**, all 7 scale-invariants
   demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
   `EngineLedger` (`src/network/node.ts`).
 - **Scale invariant restored** — three `O(N)` violations closed. G1 + G2
@@ -73,10 +73,13 @@ src/
   attesters and released only to a relay-verified live action sequence under
   server-side backoff. The previous scheme was PIN-strength only, which a test
   in `src/core/face-match.test.ts` still demonstrates as the control case.
-- **Next** — Phase 3 (storage): the CID-native backend seam and a filesystem
-  adapter are in (`src/storage/`); still to do are the on-chain storage-provider
-  ops, replica leases + repair, and the file index → DHT. Then Phase 4, and the
-  app-layer type seam paid down per caller. Manual validation: `docs/TESTPLAN.md`.
+- **Next** — Phase 3 (storage): the CID-native backend seam, a filesystem
+  adapter (`src/storage/`), and the on-chain provider economy are in — capacity,
+  liveness **leases** (a heartbeat renews custody; an expired lease stops
+  counting toward redundancy) and evidence-priced rewards, with
+  `storage-manager` moved off the legacy ledger. Still to do: the repair loop,
+  the publish handoff, and the file index → DHT. Then Phase 4, and the app-layer
+  type seam paid down per caller. Manual validation: `docs/TESTPLAN.md`.
 
 ## Engine — measured scale invariants
 

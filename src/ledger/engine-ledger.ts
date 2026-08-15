@@ -665,34 +665,39 @@ export class EngineLedger extends EventEmitter {
     const head = this.getAccountHead(pub);
     if (!head) return { error: 'Account not opened' };
     if (this.equivocated.has(pub)) return { error: 'Account frozen' };
-    const epochDay = claimableEpochDay(Date.now());
+    // ONE clock read for both the claim and the block timestamp. A reward may only
+    // bill `claimableEpochDay(block.timestamp)`, so reading the clock twice across
+    // a midnight boundary would produce a block that fails its own validation —
+    // and being rejected mid-chain would strand everything after it.
+    const now = Date.now();
+    const epochDay = claimableEpochDay(now);
     const terms = this.providerLedger.rewardTerms(pub, epochDay);
     if (typeof terms === 'string') return { error: `Storage reward: ${terms}` };
     return this.appendStorageBlock(
       pub, keys, 'storage-reward', head.balance + BigInt(terms.amount),
       { epochDay, storedGB: terms.storedGB, heartbeatCount: terms.heartbeatCount },
-      BigInt(terms.amount),
+      BigInt(terms.amount), now,
     );
   }
 
   /** Sign, apply, and index one storage block on the account's own chain. */
   private appendStorageBlock(
     pub: string, keys: SignerKeys, type: Block['type'], balance: bigint,
-    storage: StoragePayload, amount?: bigint,
+    storage: StoragePayload, amount?: bigint, timestamp = Date.now(),
   ): { block?: Block; error?: string } {
     const head = this.getAccountHead(pub)!;
     const h = this.held.get(pub)!;
     const block = createBlock(
       {
         accountId: pub, index: head.index + 1, type, previousHash: head.hash, shard: head.shard,
-        timestamp: Date.now(), balance, storage, ...(amount !== undefined ? { amount } : {}),
+        timestamp, balance, storage, ...(amount !== undefined ? { amount } : {}),
       },
       keys.priv,
       h.acc,
     );
     h.chain.push(block);
     this.allBlocks.set(block.hash, block);
-    this.providerLedger.apply(block, Date.now());
+    this.providerLedger.apply(block, timestamp);
     this.emitStorageEvent(block);
     this.emit('block:added', block);
     this.emit('block:confirmed', block);

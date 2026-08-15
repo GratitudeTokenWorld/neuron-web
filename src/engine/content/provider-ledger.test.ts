@@ -261,6 +261,32 @@ describe('reward validation', () => {
     expect(err).toMatch(/storedGB/);
   });
 
+  it('may only bill the day before the block that carries it', () => {
+    const pl = registered(10, DAY - REWARD_EPOCH_MS);
+    const max = earned(pl, 100);
+    const ts = DAY + REWARD_EPOCH_MS;                 // a block dated day 101
+    expect(pl.validate(blk('storage-reward', ts, { epochDay: 100 }, BigInt(max)), ts)).toBeNull();
+    // Billing the running day, or any other day, is malformed — decidable from
+    // the block alone, so every node rejects it identically.
+    expect(pl.validate(blk('storage-reward', ts, { epochDay: 101 }, BigInt(max)), ts)).toMatch(/may only claim epoch 100/);
+    expect(pl.validate(blk('storage-reward', ts, { epochDay: 99 }, BigInt(max)), ts)).toMatch(/may only claim epoch 100/);
+  });
+
+  it('closes the stale-claim hole: an old day is refused by the rule, not by pruning', () => {
+    // Before this rule, a genuinely-earned day stayed claimable until its
+    // evidence aged out of retention, and only THEN became unverifiable — so the
+    // same block was valid on a node that held the history and rejected by one
+    // that had pruned it. Rejection mid-chain strands every later block.
+    const pl = registered(10, DAY - REWARD_EPOCH_MS);
+    const max = earned(pl, 100);
+    const muchLater = DAY + 60 * REWARD_EPOCH_MS;
+    const err = pl.validate(blk('storage-reward', muchLater, { epochDay: 100 }, BigInt(max)), muchLater);
+    expect(err).toMatch(/may only claim epoch 159/);
+    // The refusal does not depend on whether the evidence is still retained: it
+    // is a property of the block, so it is the same answer on every node forever.
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);
+  });
+
   it('rejects a non-positive or malformed reward', () => {
     const pl = registered(10, DAY - REWARD_EPOCH_MS);
     earned(pl, 100);

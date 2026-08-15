@@ -520,15 +520,29 @@ built yet — see CLAUDE.md → *Where to pick up*.
   declared at **epoch start** (a bump minutes before claiming pays nothing),
   metered on bytes actually reported held, capped by that declaration, scaled by
   counted heartbeats / 6.
-- **Rewards settle a day behind** (`claimableEpochDay`). Pricing the *running*
-  day paid whatever fraction had elapsed, and since a claim closes the epoch
-  permanently, a provider polling for eligibility every 30 min locked in 1/6 of
-  what it earned. A completed day is also the only day whose uptime is a fact.
-- **An early heartbeat is accepted and not counted — never rejected.** Rejecting
-  a validly-signed, correctly-linked block mid-chain truncates it, and every
-  later block then fails as non-sequential (the failure that made NFTs vanish on
-  reload). So heartbeat spam applies to the chain and earns nothing; safety
-  comes from the reward ceiling, which counts only renewals.
+- **A reward bills the day before its own block, and only that day**
+  (`claimableEpochDay`, enforced in `validate`). Two problems collapse into one
+  rule. Pricing the *running* day paid whatever fraction had elapsed, and since
+  a claim closes the epoch permanently, a provider polling every 30 min locked
+  in 1/6 of what it earned. And a claim for an *old* day would find its
+  heartbeat evidence pruned past `RETAIN_EPOCHS` — so the same block was valid
+  on a node still holding the history and rejected by one that had pruned it,
+  mid-chain, stranding everything after it. Pinning the claim to the block's own
+  timestamp keeps the evidence exactly one day old, so the retention window can
+  never be reached and no second constant has to be kept below it. The rule is
+  decidable from the block alone: a violating block is *malformed*, not merely
+  unverifiable, so every node agrees without holding any state. (Issuance must
+  therefore read the clock **once** for both the claim and the timestamp — twice
+  across midnight builds a block that fails its own validation.)
+- **An early heartbeat is accepted and not counted; only a flood is rejected.**
+  Rejecting a validly-signed, correctly-linked block mid-chain truncates it, and
+  every later block then fails as non-sequential (the failure that made NFTs
+  vanish on reload) — so honest jitter must never be refused. But
+  accept-and-ignore alone left chain growth unbounded, free to the spammer and
+  paid for by every peer holding that shard. `MAX_HEARTBEATS_PER_DAY_HARD`
+  (24/epoch, 4× the honest rate) is the one mid-chain rejection in the storage
+  path, set far enough above any real provider that only a padding chain reaches
+  it. Uptime credit still comes only from counted renewals.
 - **Two independent guards on the mint.** A `storage-reward` is the only block
   type that creates UNIT, and its chain stays single and valid — so neither
   fraud proofs nor committees ever look at it. `addBlock` enforces balance
@@ -692,7 +706,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 0 — Foundations | **done** | `src/engine/core` — accumulator, light-verify, identity/nullifier, attestations, partition |
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
-| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10, parity done 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Provider economy on-chain: four `storage-*` engine block types, `src/engine/content/provider-ledger.ts` (registry + **lease liveness** + reward evidence, 23 tests), reward minting guarded by balance conservation *and* an on-chain evidence ceiling (`src/ledger/storage-ledger.test.ts`, 15 tests), `storage-manager.ts` off the legacy `DAGLedger`. Still to do: repair loop, publish handoff, file index → DHT |
+| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10, parity done 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Provider economy on-chain: four `storage-*` engine block types, `src/engine/content/provider-ledger.ts` (registry + **lease liveness** + reward evidence, 26 tests), reward minting guarded by balance conservation *and* an on-chain evidence ceiling (`src/ledger/storage-ledger.test.ts`, 17 tests), `storage-manager.ts` off the legacy `DAGLedger`. Still to do: repair loop, publish handoff, file index → DHT |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 41/41 |

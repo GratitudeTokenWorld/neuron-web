@@ -304,6 +304,20 @@ export class ProviderLedger {
         const claimed = block.storage;
         if (!claimed || typeof claimed.epochDay !== 'number') return 'storage-reward: missing epochDay';
         if (block.amount === undefined || block.amount <= 0n) return 'storage-reward: amount must be positive';
+        // A reward may ONLY bill the day before the block that carries it.
+        //
+        // This is what keeps the reward verifiable forever. Evidence is retained
+        // for RETAIN_EPOCHS; a claim for anything older would find the heartbeats
+        // pruned and be rejected — mid-chain, stranding every later block. Pinning
+        // the claim to the block's own timestamp means the evidence is always one
+        // day old, so the retention window can never be reached and there is no
+        // second constant to keep below it. The rule is decidable from the block
+        // alone, so every node agrees without holding any state: a violating block
+        // is malformed, not merely unverifiable.
+        const billable = claimableEpochDay(block.timestamp);
+        if (claimed.epochDay !== billable) {
+          return `storage-reward: may only claim epoch ${billable} (the day before this block), got ${claimed.epochDay}`;
+        }
         const terms = this.rewardTerms(block.accountId, claimed.epochDay);
         if (typeof terms === 'string') return `storage-reward: ${terms}`;
         if (block.amount > BigInt(terms.amount)) {

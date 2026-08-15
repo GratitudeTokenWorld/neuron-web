@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **308 tests / 60 files passing**, `npm run build` clean.
+Current baseline: **312 tests / 60 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -64,13 +64,21 @@ inherited:
 - **The heartbeat is the lease renewal.** `isLive()` / `liveStorageProviders()`
   answer custody questions; `getStorageProviders()` (unfiltered) answers routing
   ones. `MAX_OFFLINE_MS` = 3 heartbeat intervals = 12h.
-- **An early heartbeat is accepted and not counted, never rejected.** Rejecting
-  a validly-signed block mid-chain truncates it and strands every later block as
-  non-sequential — the failure that made NFTs vanish on reload. Safety comes
-  from the reward ceiling, which only counts renewals.
-- **Rewards settle a day behind** (`claimableEpochDay`). Pricing the running day
-  paid whatever fraction had elapsed, and a claim closes the epoch for good — so
-  a provider polling every 30 min locked in 1/6 of what it earned.
+- **An early heartbeat is accepted and not counted; only a flood is rejected.**
+  Rejecting a validly-signed block mid-chain truncates it and strands every later
+  block as non-sequential — the failure that made NFTs vanish on reload — so
+  honest jitter must never be refused. `MAX_HEARTBEATS_PER_DAY_HARD` (24/epoch,
+  4× honest) is the sole mid-chain rejection, set where only a padding chain
+  reaches it. Uptime credit comes only from counted renewals.
+- **A reward bills the day before its own block, and only that day**
+  (`claimableEpochDay`, enforced in `validate`). Billing the running day paid a
+  partial day and closed the epoch for good (polling every 30 min locked in 1/6);
+  billing an *old* day would find the evidence pruned past `RETAIN_EPOCHS` and be
+  rejected mid-chain by exactly those nodes that had pruned it. One rule kills
+  both: evidence is always one day old, and the rule is decidable from the block
+  alone, so every node agrees with no retained state. **Issuance must read the
+  clock once** for the claim and the timestamp — twice across midnight builds a
+  block that fails its own validation.
 
 **What remains, in this order** — the decisions in *Storage custody rules*
 below constrain all of it:
