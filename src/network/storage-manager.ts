@@ -1181,7 +1181,19 @@ export class StorageManager extends EventEmitter {
 
     try {
       const start = Date.now();
+      // A large file is a manifest plus N chunks, and ONE failure used to throw
+      // out of this loop — so every later chunk went unattempted and the next
+      // retry restarted from the manifest. A 101 MB video therefore sat at
+      // 1.2 KB (the manifest alone) across unlimited retries: attempts never
+      // accumulated. Found by Lucian, 2026-08-16.
+      //
+      // Now each CID is independent. Already-held chunks are skipped, so retries
+      // get cheaper as they converge, and a flaky link costs one chunk per round
+      // instead of the whole transfer.
+      const failed: string[] = [];
+      let fetched = 0;
       for (const c of allCids) {
+        if (await this.store.isCached(c).catch(() => false)) continue;   // keep what we already have
         console.log(`[StorageManager] handleCacheRequest: caching ${c.slice(0, 20)}…`);
         try {
           // 10-minute timeout per chunk — relay connections can be slow (~50 KB/s)
@@ -1194,12 +1206,31 @@ export class StorageManager extends EventEmitter {
           const broadFallbacks = this.store.getAllPeerFallbacks().filter(
             p => p !== req.uploaderSmokeAddr && !providedFallbacks.includes(p),
           );
-          if (broadFallbacks.length === 0) throw primaryErr;
-          console.log(`[StorageManager] handleCacheRequest: primary failed (${errStr(primaryErr)}), trying ${broadFallbacks.length} broad fallback(s)`);
-          await this.store.cache(c, 180_000, undefined, req.uploaderPub as string | undefined, broadFallbacks);
+          try {
+            if (broadFallbacks.length === 0) throw primaryErr;
+            console.log(`[StorageManager] handleCacheRequest: primary failed (${errStr(primaryErr)}), trying ${broadFallbacks.length} broad fallback(s)`);
+            await this.store.cache(c, 180_000, undefined, req.uploaderPub as string | undefined, broadFallbacks);
+          } catch (finalErr) {
+            failed.push(c);
+            console.warn(`[StorageManager] handleCacheRequest: ${c.slice(0, 20)}… FAILED — ${errStr(finalErr)}`);
+            continue;                                  // the next chunk may well succeed
+          }
         }
+        fetched++;
         console.log(`[StorageManager] handleCacheRequest: cached ${c.slice(0, 20)}… OK`);
       }
+
+      // Custody is all-or-nothing: holding 12 of 14 chunks is not holding the
+      // file, and a receipt claiming otherwise would let the uploader count this
+      // node as a replica and stop retrying. Say what happened and wait for the
+      // next round, which will only have to fetch what is still missing.
+      if (failed.length > 0) {
+        console.warn(`[StorageManager] handleCacheRequest: ${req.cid.slice(0, 16)}… incomplete — `
+          + `${allCids.length - failed.length}/${allCids.length} held, ${failed.length} still missing. `
+          + `No receipt published; will retry.`);
+        return;
+      }
+      void fetched;
       const latencyMs = Date.now() - start;
       console.log(`[StorageManager] Cached ${req.cid.slice(0, 16)}... in ${latencyMs}ms`);
 
