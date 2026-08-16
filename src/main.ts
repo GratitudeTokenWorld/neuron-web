@@ -3641,6 +3641,39 @@ function wireNodeEvents() {
       setTimeout(() => location.reload(), 800);
     });
   });
+  // ── Catch up after the tab was backgrounded ────────────────────────────────
+  //
+  // A mobile browser throttles a hidden tab's timers to a crawl and may suspend
+  // them entirely. That silently stops the 20 s re-publish, which is the ONLY
+  // backstop for a gossip message that raced the mesh and was dropped —
+  // GossipSub is fire-and-forget, so a block published when no peer was yet
+  // subscribed to its shard topic is simply lost.
+  //
+  // The visible failure: register as a storage provider on a phone, put the
+  // phone down, and the registration exists locally forever while no relay ever
+  // archives it. Every other device asks the archives, so the provider is
+  // invisible to the whole network. Found by Lucian, 2026-08-16 — bob's chain
+  // sat at headIndex 0 on all three relays while his register block was index 1.
+  //
+  // Coming back to the foreground therefore has to re-assert everything a
+  // stalled tab may have failed to send. Cheap: a full publish is bounded by the
+  // blocks this node owns, which is what the scale invariant bounds anyway.
+  let hiddenSince = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') { hiddenSince = Date.now(); return; }
+    // Ignore a flick to another tab and back; only a real pause can have
+    // stalled a 20 s timer.
+    if (hiddenSince === 0 || Date.now() - hiddenSince < 10_000) { hiddenSince = 0; return; }
+    const awayMs = Date.now() - hiddenSince;
+    hiddenSince = 0;
+    addLog(`Foreground after ${Math.round(awayMs / 1000)}s — re-publishing local state`, 'info');
+    void node.broadcastLocalState().catch(() => {});
+    // A missed heartbeat window is a lapsed lease; re-arm against the real
+    // on-chain timing rather than whatever the throttled timer thinks.
+    node.storage.rescheduleHeartbeat();
+    void node.refreshStorageProviders();
+  });
+
   node.net.on('peer:connected', (url: unknown) => {
     addLog(`Relay connected: ${url}`, 'success');
   });

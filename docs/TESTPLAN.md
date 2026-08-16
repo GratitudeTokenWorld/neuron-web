@@ -349,6 +349,16 @@ like they are on different networks, because in the way that matters they are.
 Timings below are written at production values; divide by 120 under `fast`
 (4h → 2min, 24h → 12min, 12h lease → 6min).
 
+⚠ **Keep the phone tab foregrounded and the screen awake.** A mobile browser
+throttles a hidden tab's timers to a crawl, which stops the 20 s re-publish —
+the only backstop for a gossip message that raced the mesh and was dropped. A
+provider registered on a backgrounded phone can stay invisible to the entire
+network, because every other device learns providers by ASKING the archives and
+no archive ever received the block. Returning to the foreground now re-publishes
+(`Foreground after Ns — re-publishing local state` in the app log), but under
+`fast` timing a 6-minute lease also lapses while you are away, so the tab being
+visible is part of the test setup, not a nicety.
+
 ## T8 — Storage provider lifecycle (NOT YET RUN)
 
 Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
