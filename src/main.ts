@@ -3948,7 +3948,28 @@ function refreshStorage() {
   const statsDiv = $('#myStorageStats');
   const stopArea = $('#stopServingArea');
 
-  if (servingAccount) {
+  // Custody is per-DEVICE. An account recovered onto a second browser is still
+  // registered against the device that made the registration, so from here it
+  // will never heartbeat, earn or accept a cache request. Say so, instead of
+  // rendering a serving row that is quietly inert — that cost an afternoon
+  // waiting for a transfer that could not happen.
+  const otherDevice = servingAccount && node.storage.registeredOnAnotherDevice(servingAccount.pub);
+  if (otherDevice) {
+    serveForm.style.display = 'block';
+    statsDiv.style.display = 'none';
+    stopArea.style.display = 'none';
+    const note = $('#serveStorageForm');
+    if (note && !note.querySelector('[data-other-device]')) {
+      const div = document.createElement('div');
+      div.setAttribute('data-other-device', '1');
+      div.style.cssText = 'background:rgba(245,158,11,.1);border:1px solid var(--warning);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;';
+      div.innerHTML = '⚠ <strong>Registered on another device.</strong> Storage custody is per-device, '
+        + 'so this browser will not heartbeat, earn or cache for this account. '
+        + 'Set a capacity and Serve here to take over custody.';
+      note.prepend(div);
+    }
+  } else if (servingAccount) {
+    document.querySelector('[data-other-device]')?.remove();
     serveForm.style.display = 'none';
     statsDiv.style.display = 'block';
     stopArea.style.display = 'block';

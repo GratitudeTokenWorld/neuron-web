@@ -621,6 +621,17 @@ export class StorageManager extends EventEmitter {
   rescheduleHeartbeat(): void {
     if (!this.started) return;
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+    // Called once keys are registered, which is the first moment this is
+    // answerable — and the last moment before a user starts wondering why
+    // nothing is happening.
+    for (const [pub] of this.localKeys) {
+      if (!this.registeredOnAnotherDevice(pub)) continue;
+      const p = this.ledger.storageProviders.get(pub);
+      console.warn(`[StorageManager] ${pub.slice(0, 12)}… is registered as a provider on a DIFFERENT device `
+        + `(${p?.deviceId?.slice(0, 8)}… vs ${getDeviceId().slice(0, 8)}…) — it will not heartbeat, earn or `
+        + `cache from here. Re-register on this device to take over custody.`);
+      this.emit('storage:other-device', { pub });
+    }
     this.scheduleNextHeartbeat();
   }
 
@@ -635,6 +646,22 @@ export class StorageManager extends EventEmitter {
   }
 
   async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    // The automatic path skips a provider registered on another device; the
+    // manual button did not, so it could append to a chain another device is
+    // actively extending. Nothing forked in practice only because the interval
+    // check refused it — had the other device been quiet for one interval, this
+    // would have built on a possibly-stale head and forked the account, which is
+    // indistinguishable from a deliberate double-sign and freezes it network-wide.
+    //
+    // Refusing here also makes the per-device rule discoverable at the exact
+    // moment someone tries to work around it.
+    if (this.registeredOnAnotherDevice(pub)) {
+      return {
+        success: false,
+        error: 'This account is registered as a provider on another device. '
+          + 'Storage custody is per-device — re-register here to take it over.',
+      };
+    }
     const smokeAddr = await this.store.getSmokeHostname();
     const actualStoredBytes = this.store.isStarted() ? await this.store.storageUsedBytes() : 0;
     const countryCode = await getCountryCode();
@@ -1723,6 +1750,29 @@ export class StorageManager extends EventEmitter {
   isServing(pub: string): boolean {
     const provider = this.ledger.storageProviders.get(pub);
     return !!provider && provider.capacityGB > 0;
+  }
+
+  /**
+   * Registered as a provider, but on a DIFFERENT device than this one.
+   *
+   * Custody is per-device, not per-account: the registration records the
+   * `deviceId` that made it, and heartbeats, rewards and cache requests all skip
+   * an account whose registration belongs elsewhere. That is deliberate — two
+   * browsers holding the same account must not both claim to hold the same
+   * bytes — but it was entirely silent. Recover an account onto a second
+   * browser and its Storage tab shows a full serving row that will never
+   * heartbeat, never earn and never accept a cache request, with nothing on
+   * screen saying why. Reported by Lucian, 2026-08-16, after recovering bob into
+   * Edge and waiting for a transfer that could not happen.
+   *
+   * Re-registering from this device rebinds it: `createStorageRegister` stamps
+   * the current `getDeviceId()`.
+   */
+  registeredOnAnotherDevice(pub: string): boolean {
+    const provider = this.ledger.storageProviders.get(pub);
+    const localDeviceId = getDeviceId();
+    return !!provider && provider.capacityGB > 0
+      && !!provider.deviceId && !!localDeviceId && provider.deviceId !== localDeviceId;
   }
 
   /**
