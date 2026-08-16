@@ -2,6 +2,7 @@ import { verify as engineVerify } from '../engine/core/keys';
 import { decodeBlock, verifyBlock, type Block } from '../engine/core/block';
 import { hexToBytes, type Hex } from '../engine/core/hash';
 import type { CounterpartyPacket, MintProof } from '../engine/core/counterparty-proof';
+import type { FileRecord } from '../engine/content/file-index';
 
 /**
  * G1 fix — on-demand account/username resolution (client side).
@@ -238,6 +239,62 @@ export async function fetchProviders(
     }
   }
   return [...byHash.values()];
+}
+
+/**
+ * File-record lookup (GET /files) — the union across relays, plus what each
+ * archive says it holds.
+ *
+ * The last `O(N)` in storage: every node used to ingest a global `files` topic
+ * and persist a record for every file on the network. Now a node keeps only its
+ * OWN files and asks here for anything else — the shape G1 and G3 settled on.
+ *
+ * Records are returned unverified; `foldFileRecords` (engine/content/file-index)
+ * does that, rebuilding each payload from the record's own fields so a relay
+ * cannot serve an inflated size under a valid signature. Asking every relay and
+ * taking the union means one relay cannot hide a file either.
+ *
+ * `archiveTotals` is per-relay ON PURPOSE. No node knows how many files exist on
+ * the network, and summing the relays would double-count everything they both
+ * hold while still missing whatever neither does. The caller gets the raw
+ * per-archive figures and must present them as what an archive can see.
+ */
+export async function fetchFileRecords(
+  bases: readonly string[],
+  network: string,
+  query: { cid?: string; owner?: string; limit?: number } = {},
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+  timeoutMs = 5_000,
+): Promise<{ records: FileRecord[]; archiveTotals: number[] }> {
+  const params = new URLSearchParams({ network });
+  if (query.cid) params.set('cid', query.cid);
+  if (query.owner) params.set('owner', query.owner);
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+
+  const results = await Promise.allSettled(
+    bases.map(async (base) => {
+      const res = await fetchFn(`${base}/files?${params.toString()}`, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`files ${res.status}`);
+      return (await res.json()) as { records?: FileRecord[]; total?: number };
+    }),
+  );
+
+  // Union, newest-per-CID. A relay serving a stale announcement must not
+  // outrank another relay's newer withdrawal of the same file.
+  const byCid = new Map<string, FileRecord>();
+  const archiveTotals: number[] = [];
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    if (typeof r.value?.total === 'number') archiveTotals.push(r.value.total);
+    for (const rec of r.value?.records ?? []) {
+      if (!rec || typeof rec.cid !== 'string') continue;
+      const prev = byCid.get(rec.cid);
+      if (!prev || Number(rec.timestamp) > Number(prev.timestamp)) byCid.set(rec.cid, rec);
+    }
+  }
+  return { records: [...byCid.values()], archiveTotals };
 }
 
 /**

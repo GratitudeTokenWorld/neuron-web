@@ -49,6 +49,9 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 // held even when light clients holding a shard go offline.
 import { decodeBlock, encodeBlock, verifyBlock } from '../src/engine/core/block.js';
 import { selectDiscoveryBlocks } from '../src/engine/content/provider-discovery.js';
+import {
+  selectFileRecords, isWellFormedFileRecord, payloadFor,
+} from '../src/engine/content/file-index.js';
 import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
 // vitest can pin them (this file is covered by no typecheck and no test — keep
@@ -100,6 +103,10 @@ const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || inData('.relay-accounts.json'
 // Username uniqueness registry (attester-enforced, Phase 3): the first account
 // attested for a username owns it; a later different-account claim is rejected.
 const USERNAMES_FILE = process.env.USERNAMES_FILE || inData('.relay-usernames.json');
+// File-record archive (the last O(N) in storage). Clients used to ingest a
+// global `files` topic and persist every record; now they keep only their own
+// and ASK here for anything else. See src/engine/content/file-index.ts.
+const FILES_FILE = process.env.FILES_FILE || inData('.relay-files.json');
 // The first OPERATOR_COUNT accounts attested become "operators" — the only
 // accounts allowed to wipe this relay's archive (a signed network reset). All
 // other accounts' resets are ignored. Survives wipes (kept like identity keys).
@@ -484,6 +491,84 @@ function archiveAccountRecord(acc, network) {
   dlog(`[Archive] Stored account record user=${acc.username} acct=${String(acc.pub).slice(0, 12)}…`);
 }
 
+// ── File-record archive (the last O(N) in storage) ───────────────────────────
+// `${network}:${cid}` → file record (cid, sizeBytes, mimeType, uploaderPub, sig).
+//
+// Only records the uploader actually SIGNED are stored, for the same reason
+// account records are verified here: without it, anyone could gossip forged
+// records under someone else's pub and evict the real ones — a denial-of-service
+// on the archive rather than a forgery, but just as effective. The signature is
+// the app's WebCrypto ECDSA P-256 over a payload rebuilt from the record's own
+// fields (never the string in the envelope), so an inflated size cannot ride a
+// valid signature.
+const fileStore = new Map();
+let filesDirty = false;
+// The archive tier is allowed to be big, but not unbounded and not silent: past
+// this many records the oldest are dropped and the drop is logged. A cap nobody
+// mentions reads as "we have everything" when we do not.
+const MAX_FILE_RECORDS = 200_000;
+
+async function loadFiles() {
+  try {
+    for (const r of JSON.parse(await fs.readFile(FILES_FILE, 'utf8'))) {
+      if (r && r.cid && r.network) fileStore.set(`${r.network}:${r.cid}`, r);
+    }
+    console.log(`[Archive] Loaded ${fileStore.size} file record(s)`);
+  } catch { /* none yet */ }
+}
+async function saveFiles() {
+  if (!filesDirty) return;
+  filesDirty = false;
+  await atomicWrite(FILES_FILE, JSON.stringify([...fileStore.values()]));
+}
+setInterval(() => { saveFiles().catch(() => {}); }, 5_000);
+
+/**
+ * Verify the app-layer (WebCrypto JWK) signature on a file record.
+ * The relay's other archives verify with the engine's @noble keys; file
+ * announcements are signed by the app key, so this is the WebCrypto path.
+ */
+async function verifyAppSignature(signature, pub, payload) {
+  try {
+    const { d, s: sig } = JSON.parse(String(signature));
+    if (d !== payload) return false;
+    const jwk = JSON.parse(atob(String(pub)));
+    delete jwk.d; delete jwk.key_ops;
+    const key = await globalThis.crypto.subtle.importKey(
+      'jwk', { ...jwk, key_ops: ['verify'] },
+      { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
+    );
+    return await globalThis.crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' }, key,
+      Uint8Array.from(atob(sig), c => c.charCodeAt(0)),
+      new TextEncoder().encode(payload),
+    );
+  } catch { return false; }
+}
+
+/** Archive a file announcement seen on the files topic (verified, newest wins). */
+async function archiveFileRecord(rec, network) {
+  if (!ARCHIVE_ENABLED || !isWellFormedFileRecord(rec)) return;
+  const key = `${network}:${rec.cid}`;
+  const existing = fileStore.get(key);
+  // Newest wins, and a stale re-announcement can never revive a withdrawal.
+  if (existing && Number(existing.timestamp) >= Number(rec.timestamp)) return;
+  if (!(await verifyAppSignature(rec.signature, rec.uploaderPub, payloadFor(rec)))) return;
+  // A tombstone is stored, not deleted: a client that already holds the file has
+  // to be able to LEARN it was withdrawn, and an absent row cannot say that.
+  fileStore.set(key, { ...rec, network });
+  filesDirty = true;
+  if (fileStore.size > MAX_FILE_RECORDS) {
+    const excess = fileStore.size - MAX_FILE_RECORDS;
+    const oldest = [...fileStore.entries()]
+      .sort((a, b) => Number(a[1].timestamp) - Number(b[1].timestamp))
+      .slice(0, excess);
+    for (const [k] of oldest) fileStore.delete(k);
+    console.log(`[Archive] File store at cap — dropped ${excess} oldest record(s)`);
+  }
+  dlog(`[Archive] Stored file record cid=${String(rec.cid).slice(0, 16)}…${rec.removed ? ' (withdrawn)' : ''}`);
+}
+
 // ── Username uniqueness (Phase 3, attester-enforced) ──────────────────────────
 const usernameRegistry = new Map(); // username (lowercased) → accountId
 let usernameDirty = false;
@@ -542,6 +627,7 @@ function performNetworkWipe(newGeneration, source) {
   recoveryShareStore.clear(); recoverySharesDirty = true;
   usernameRegistry.clear(); usernameDirty = true;       // free the names
   accountStore.clear(); accountsDirty = true;           // wipe the directory too
+  fileStore.clear(); filesDirty = true;                 // and the file index
   for (const e of faceDescriptorDB) e.count = 0;
   pendingFaceUses.clear();                              // provisional holds are moot now
   saveFaceDB().catch(() => {});
@@ -740,7 +826,7 @@ async function main() {
   // Not gated on ARCHIVE_ENABLED: shares are identity infrastructure (the third
   // key factor), not archival convenience — a pure relay must still serve them.
   await loadRecoveryShares();
-  if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); await loadAccounts(); }
+  if (ARCHIVE_ENABLED) { await loadEngineBlocks(); await loadKeyBlobs(); await loadAccounts(); await loadFiles(); }
 
   // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
   let relayAddrs = [];
@@ -812,6 +898,40 @@ async function main() {
         res.end(JSON.stringify({
           blocks: selected.map(b => bytesToHex(encodeBlock(b))),
         }));
+
+      } else if (req.url?.startsWith('/files')) {
+        // File index: GET /files?network=<n>[&cid=<c>][&owner=<p>][&limit=<k>]
+        //
+        // Replaces the global `files` gossip topic, which handed every file
+        // record on the network to every node — O(total files) per node, the
+        // same shape as G1's accounts topic and G3's keyblobs topic. Clients now
+        // keep only the records for files they OWN and ask here for the rest.
+        //
+        // Untrusted, like /resolve and /providers: what is served is the
+        // UPLOADER's own signed record, and the client rebuilds the payload from
+        // the record's fields before verifying, so this relay cannot invent a
+        // file, misreport a size, or attribute one to the wrong account. It can
+        // only choose which real records to show — and a client asking several
+        // relays sees the union.
+        //
+        // `total` is this archive's own record count, NOT a network total. No
+        // node knows a network total; reporting one would be exactly the
+        // "unmeasured default rendered as a fact" this codebase keeps tripping
+        // over. Clients that want a network figure aggregate across relays and
+        // must label it as what the archives can see.
+        const q = new URL(req.url, 'http://localhost').searchParams;
+        const network = q.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+        const scoped = [];
+        for (const rec of fileStore.values()) {
+          if (rec.network === network) scoped.push(rec);
+        }
+        const records = selectFileRecords(scoped, {
+          cid: q.get('cid') || undefined,
+          owner: q.get('owner') || undefined,
+          limit: Number(q.get('limit')) || undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ records, total: scoped.length }));
 
       } else if (req.url?.startsWith('/resolve?')) {
         // G1 on-demand directory lookup: GET /resolve?username=<u>|pub=<p>&network=<n>
@@ -1609,6 +1729,8 @@ async function main() {
     pubsub.subscribe(`${pfx}/storage/cache-requests`);
     pubsub.subscribe(`${pfx}/storage/receipts`);
     pubsub.subscribe(`${pfx}/storage/delete-requests`);
+    // Archive file announcements so clients need not each hold the global index.
+    pubsub.subscribe(`${pfx}/files`);
     pubsub.subscribe(`${pfx}/lockouts`);
     // keyblobs / blob-requests topics: gone — blobs move over targeted HTTP
     // (POST/GET /keyblob) so no node ever receives a stranger's blob.
@@ -1689,6 +1811,15 @@ async function main() {
     // usernames on demand (/resolve) instead of ingesting the global topic.
     if (topic.endsWith('/accounts')) {
       try { archiveAccountRecord(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic)); } catch { /* malformed */ }
+      return;
+    }
+    // Same shape for files: the archive holds them so no client has to hold all
+    // of them. Verification is async (WebCrypto), and this listener is not — a
+    // failed verify simply drops the record, so nothing waits on the result.
+    if (topic.endsWith('/files')) {
+      try {
+        void archiveFileRecord(JSON.parse(new TextDecoder().decode(msg.data)), networkFromTopic(topic));
+      } catch { /* malformed */ }
       return;
     }
     // NOTE key-blobs no longer ride gossip in either direction — the global

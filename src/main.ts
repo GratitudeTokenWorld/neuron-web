@@ -1381,7 +1381,11 @@ function refreshTab() {
     case 'contracts': refreshContracts(); break;
     // Re-ask the archives when the tab is opened, so looking at the list is
     // itself a refresh rather than a view of whenever the last poll happened.
-    case 'storage': refreshStorage(); void node.refreshStorageProviders(); break;
+    case 'storage':
+      refreshStorage();
+      void node.refreshStorageProviders();
+      void refreshArchiveFileCount();
+      break;
   }
 }
 
@@ -1967,8 +1971,15 @@ async function startNode() {
     // relay discovery has settled: probing too early would see a thin fleet,
     // and the expand-only rule would (correctly) decline the repair we want.
     setTimeout(() => { void sweepShareRedundancy(); }, 8_000);
-    // Deregister any local provider that has been offline for more than 24h.
-    await node.storage.deregisterStaleLocalProviders();
+    // If our own custody lease lapsed while we were away, the network re-homed
+    // those bytes: discard them and refill from declared capacity rather than
+    // holding copies nobody is counting on (custody.ts → planRejoin).
+    await node.storage.reclaimLapsedLeases();
+    // One-time migration off the global file index. An older build persisted a
+    // record for every file it ever saw announced, and `start()` loads that back
+    // from IDB — filtering the live gossip alone would leave the O(N) set on
+    // disk. Runs here because "ours" is only decidable once keys are registered.
+    await node.storage.pruneForeignFileIndex();
     for (const acc of localAccounts) {
       if (node.ledger.getAccountHead(acc.pub)) continue;
       const stored = (acc as AccountWithKeys & { openBlock?: AccountBlock }).openBlock;
@@ -3782,6 +3793,30 @@ function setStorageTypeFields(type: string): void {
   if (active) active.style.display = 'block';
 }
 
+/**
+ * Files the ARCHIVES report holding. `null` = not measured yet.
+ *
+ * Not a network total and deliberately not presented as one: the global file
+ * index is gone (it was O(total files) on every node), so the only figure
+ * available is what each archive says it holds. Archives overlap, so the max is
+ * the honest summary and a sum would be a number nobody could stand behind.
+ */
+let archiveFileCount: number | null = null;
+
+/**
+ * Refresh that figure from the relays. Called when the Storage tab is opened
+ * rather than on a timer — a stat nobody is looking at is not worth a query
+ * against the archive tier.
+ */
+async function refreshArchiveFileCount(): Promise<void> {
+  try {
+    const { archiveTotals } = await node.lookupFiles({ limit: 1 });
+    if (archiveTotals.length === 0) return;   // keep "—" rather than claim zero
+    archiveFileCount = Math.max(...archiveTotals);
+    refreshStorage();
+  } catch { /* offline — leave the last measurement, or "—" */ }
+}
+
 function refreshStorage() {
   const options = localAccounts.map(a => `<option value="${escHtml(a.pub)}">${escHtml(a.username)}</option>`).join('');
   const noAcct = '<option value="">No accounts</option>';
@@ -3841,8 +3876,13 @@ function refreshStorage() {
     const totalCapGB = providers.reduce((s, p) => s + p.capacityGB, 0);
     const storedBytes = active.reduce((s, p) => s + p.lastActualStoredBytes, 0);
     const freeGB = Math.max(0, totalCapGB - storedBytes / 1_073_741_824);
-    const fileIndex = node.storage.getFileIndex();
-    const fileCount = fileIndex.size;
+    // Files on the network is a figure no node can know: the global `files`
+    // index is gone (it was O(total files) per node), so this is what the
+    // ARCHIVES report holding — the largest single archive's count, never a sum,
+    // because archives overlap and summing them would invent a number. Refreshed
+    // asynchronously by `refreshArchiveFileCount`; "—" until an archive answers,
+    // rather than 0, which would read as "the network has no files".
+    const fileCount = archiveFileCount;
     // Average only over providers we actually measure — folding in the neutral
     // placeholder score of a discovered provider would report a network average
     // that is partly made up.
@@ -3862,7 +3902,8 @@ function refreshStorage() {
       </div>`;
     statBar.innerHTML = [
       chip('Providers', `${active.length} / ${providers.length}`, active.length > 0 ? 'var(--success)' : 'var(--danger)'),
-      chip('Files', fileCount.toLocaleString(), fileCount > 0 ? 'var(--success)' : 'var(--text-muted)'),
+      chip('Files (archived)', fileCount === null ? '—' : fileCount.toLocaleString(),
+        fileCount ? 'var(--success)' : 'var(--text-muted)'),
       chip('Total Capacity', fmtGB(totalCapGB)),
       chip('Free Space', fmtGB(freeGB), freeGB > 1 ? 'var(--success)' : 'var(--warning)'),
       chip('Avg Uptime', `${Math.round(avgUptime * 100)}%`, avgUptime >= 0.8 ? 'var(--success)' : avgUptime >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
