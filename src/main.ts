@@ -3972,8 +3972,16 @@ function refreshStorage() {
       const lastReward = p.lastRewardEpoch > 0
         ? `${Math.round((Date.now() - p.lastRewardEpoch * 24 * 60 * 60 * 1000) / 3_600_000)}h ago`
         : 'Never';
+      // Bytes actually held is what the reward is metered on — declared capacity
+      // earns nothing — so it belongs on the provider's own row, not only in the
+      // network table. "empty" rather than "0 B": a provider that is up and
+      // holding nothing is a specific, expected state during setup, and it
+      // explains a RATE/DAY of 0 that would otherwise look broken.
+      const myUsed = p.lastActualStoredBytes > 0
+        ? `<div style="font-size:10px;color:var(--text-muted)">${fmtBytes(p.lastActualStoredBytes)} used</div>`
+        : '<div style="font-size:10px;color:var(--text-muted)">empty — declared capacity earns nothing</div>';
       $('#myProviderStatsRow').innerHTML = `<tr>
-        <td>${p.capacityGB.toLocaleString()} GB</td>
+        <td>${p.capacityGB.toLocaleString()} GB${myUsed}</td>
         <td title="${p.heartbeatsLast24h} renewal block(s) in the counting window (one epoch + half an interval of slack)">${
           uptime}${uptimeFraction === undefined ? '' : ` (${shown}/${due} renewals)`}</td>
         <td>${latency}</td>
