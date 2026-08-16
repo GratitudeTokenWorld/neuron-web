@@ -34,6 +34,7 @@ import { ping } from '@libp2p/ping';
 import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { promises as fs } from 'fs';
+import { createHmac } from 'crypto';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { applyGossipsubCompat } from '../src/network/gossipsub-compat.js';
@@ -107,6 +108,16 @@ const USERNAMES_FILE = process.env.USERNAMES_FILE || inData('.relay-usernames.js
 // global `files` topic and persist every record; now they keep only their own
 // and ASK here for anything else. See src/engine/content/file-index.ts.
 const FILES_FILE = process.env.FILES_FILE || inData('.relay-files.json');
+// TURN shared secret, generated on the box by the coturn setup and never
+// committed (`.relay-*` is gitignored). Absent = this relay offers no TURN, and
+// /turn-credentials 404s so clients fall back to STUN.
+const TURN_SECRET_FILE = process.env.TURN_SECRET_FILE || inData('.relay-turn-secret');
+const TURN_PORT = Number(process.env.TURN_PORT || 3478);
+const TURN_TTL_SECONDS = 3600;
+// Address clients should send TURN traffic to. Defaults to the Host header the
+// client already reached us on, which is correct for the raw-IP dev boxes; set
+// it explicitly if the relay ever sits behind a proxy with a different name.
+const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
 // The first OPERATOR_COUNT accounts attested become "operators" — the only
 // accounts allowed to wipe this relay's archive (a signed network reset). All
 // other accounts' resets are ignored. Survives wipes (kept like identity keys).
@@ -900,6 +911,36 @@ async function main() {
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify({
           blocks: selected.map(b => bytesToHex(encodeBlock(b))),
+        }));
+
+      } else if (req.url?.startsWith('/turn-credentials')) {
+        // Time-limited TURN credentials, coturn's REST-API scheme:
+        //   username   = <unix-expiry>:<name>
+        //   credential = base64(HMAC-SHA1(shared-secret, username))
+        //
+        // Minted per request so the shared secret never leaves the box. Baking a
+        // long-term credential into the client bundle would hand this relay's
+        // bandwidth to anyone who opened devtools, permanently and unrevocably.
+        //
+        // Unauthenticated on purpose: TURN here is a public good for the dev
+        // network, coturn caps concurrent allocations (`total-quota`), and the
+        // credential expires within the hour. If that ever stops being true, gate
+        // it on an account signature — the mechanism is the same.
+        let secret = null;
+        try { secret = (await fs.readFile(TURN_SECRET_FILE, 'utf8')).trim(); } catch { /* no TURN here */ }
+        if (!secret) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'no TURN configured on this relay' }));
+          return;
+        }
+        const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
+        const username = `${expiry}:neuron`;
+        const credential = createHmac('sha1', secret).update(username).digest('base64');
+        const host = PUBLIC_HOST || req.headers.host?.split(':')[0] || '';
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({
+          urls: [`turn:${host}:${TURN_PORT}?transport=udp`, `turn:${host}:${TURN_PORT}?transport=tcp`],
+          username, credential, ttl: TURN_TTL_SECONDS,
         }));
 
       } else if (req.url?.startsWith('/files')) {

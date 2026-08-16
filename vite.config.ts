@@ -83,6 +83,7 @@ export default defineConfig(({ command }) => {
       // desktop and the phone. `/resolve` was proxied; nothing else was, and
       // `/files` inherited the gap when it landed.
       '/providers': { target: 'http://localhost:9092' },
+      '/turn-credentials': { target: 'http://localhost:9092' },
       '/files': { target: 'http://localhost:9092' },
       '/pending-sends': { target: 'http://localhost:9092' },
       '/head-proof': { target: 'http://localhost:9092' },

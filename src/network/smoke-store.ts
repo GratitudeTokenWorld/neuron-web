@@ -81,6 +81,56 @@ function webrtcSignalTopic(networkId: string, targetPeerId: string): string {
 const enc2 = new TextEncoder();
 const dec2 = new TextDecoder();
 
+/**
+ * ICE servers for smoke's WebRTC transport.
+ *
+ * Smoke has its OWN WebRTC stack, separate from libp2p's — libp2p's circuit
+ * relay does nothing for it — and it shipped with STUN alone. STUN only tells a
+ * peer its own public address; it cannot relay. Two peers behind symmetric NAT,
+ * which is every mobile carrier, therefore have no path at all and the
+ * connection dies at smoke's ~4 s internal timeout. Measured 2026-08-16: a
+ * 101 MB transfer to a phone failed in BOTH directions, including the
+ * mobile→desktop one the design assumed always worked.
+ *
+ * TURN relays instead of merely observing. Credentials are TIME-LIMITED and
+ * minted by a relay (`GET /turn-credentials`, coturn's REST-API scheme) so the
+ * shared secret never reaches a client bundle — a long-term credential baked
+ * into the app would hand anyone the relay's bandwidth, permanently.
+ *
+ * Cached until shortly before expiry, and STUN-only is the fallback: no relay
+ * reachable must degrade to today's behaviour, never to no connectivity. A
+ * plain `turn:` URL is fine from an HTTPS page — mixed-content rules cover
+ * fetch and script loads, not ICE servers.
+ */
+const STUN_ONLY: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+let turnBases: string[] = [];
+let iceCache: { servers: RTCIceServer[]; until: number } | null = null;
+
+/** Relay HTTP bases to mint TURN credentials from. Set by the node on start. */
+export function setTurnCredentialBases(bases: readonly string[]): void {
+  turnBases = bases.filter(Boolean);
+  iceCache = null;                       // re-mint against the new set
+}
+
+async function iceServers(): Promise<RTCIceServer[]> {
+  const now = Date.now();
+  if (iceCache && iceCache.until > now) return iceCache.servers;
+  const servers: RTCIceServer[] = [...STUN_ONLY];
+  let until = now + 10 * 60_000;
+  await Promise.all(turnBases.map(async (base) => {
+    try {
+      const res = await fetch(`${base}/turn-credentials`, { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) return;
+      const c = await res.json() as { urls?: string[]; username?: string; credential?: string; ttl?: number };
+      if (!c.urls?.length || !c.username || !c.credential) return;
+      servers.push({ urls: c.urls, username: c.username, credential: c.credential });
+      if (c.ttl) until = Math.min(until, now + c.ttl * 900);   // 90% of ttl, in ms
+    } catch { /* this relay serves no TURN — another may */ }
+  }));
+  iceCache = { servers, until };
+  return servers;
+}
+
 class GossipSubHub {
   #adapter: GossipSubAdapter;
   #myTopic: string;
@@ -93,7 +143,7 @@ class GossipSubHub {
   }
 
   async configuration(): Promise<RTCConfiguration> {
-    return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    return { iceServers: await iceServers() };
   }
 
   async address(): Promise<string> { return this.#adapter.peerId; }
@@ -156,7 +206,7 @@ class RelayHub {
   }
 
   async configuration(): Promise<RTCConfiguration> {
-    return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    return { iceServers: await iceServers() };
   }
 
   async address(): Promise<string> {

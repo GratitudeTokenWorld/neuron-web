@@ -6,7 +6,7 @@ import { foldProviderBlocks } from '../engine/content/provider-discovery';
 import { pollIntervalMs } from '../engine/content/custody';
 import { foldFileRecords, type FileRecord } from '../engine/content/file-index';
 import { allDevRelayBases } from './dev-relay-proxy';
-import { SmokeStore, GossipSubAdapter } from './smoke-store';
+import { SmokeStore, GossipSubAdapter, setTurnCredentialBases } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
 import { VoteManager, Vote } from '../core/vote';
@@ -782,6 +782,10 @@ export class NeuronNode extends EventEmitter {
     // Retried early rather than attempted once: the first try races relay
     // connection setup, and a single miss used to mean an empty provider list
     // for the whole session.
+    // Smoke's WebRTC needs TURN to reach a peer behind symmetric NAT (every
+    // mobile carrier). Credentials are minted per-relay and time-limited, so the
+    // bases have to be handed over rather than baked in.
+    setTurnCredentialBases(this.relayResolveBases());
     setTimeout(() => { void this.discoverProvidersWithRetry(); }, 8000);
     this.scheduleProviderDiscovery();
     // Slice 4c: bootstrap — pull our own accounts' chains from holders (the
