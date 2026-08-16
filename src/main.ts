@@ -3969,8 +3969,16 @@ function refreshStorage() {
       // The unrounded evidence stays in the tooltip for debugging.
       const shown = uptimeFraction === undefined ? 0 : Math.round(uptimeFraction * due);
       const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
+      // An epoch index times a HARDCODED 24h — which stopped being the epoch
+      // length the moment a timing profile existed, so under `fast` this
+      // produced a timestamp far in the future and read "-59066340h ago".
+      // Reported by Lucian, 2026-08-16.
+      //
+      // Measured from the END of the billed epoch, which is when the reward
+      // became claimable and, within one poll, when it was issued. `lastReward`
+      // itself only records WHICH epoch was paid, not when the block landed.
       const lastReward = p.lastRewardEpoch > 0
-        ? `${Math.round((Date.now() - p.lastRewardEpoch * 24 * 60 * 60 * 1000) / 3_600_000)}h ago`
+        ? fmtAgo(Math.max(0, Date.now() - (p.lastRewardEpoch + 1) * REWARD_EPOCH_MS))
         : 'Never';
       // Bytes actually held is what the reward is metered on — declared capacity
       // earns nothing — so it belongs on the provider's own row, not only in the
