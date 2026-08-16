@@ -209,3 +209,43 @@ in this order:
 Provisioning the box itself (Node, pm2, relay, TLS, `PEER_RELAYS` federation, bootstrap
 peer IDs) is covered by [SUPERNODE.md](SUPERNODE.md) — this document stops at "you have
 a reachable VM".
+
+## TURN (coturn) — content transfer across NAT
+
+Added 2026-08-16. Smoke's WebRTC had STUN only, which discovers a peer's public
+address but cannot relay — so two peers behind symmetric NAT (every mobile
+carrier) had no path and transfers died at smoke's ~4 s timeout. Measured: a
+101 MB transfer to a phone failed in BOTH directions, including the
+mobile->desktop one the design assumed always worked.
+
+Per box:
+
+```sh
+sudo apt-get install -y coturn
+openssl rand -hex 32 > ~/neuron-web/.relay-data/.relay-turn-secret   # never commit; .relay-* is gitignored
+chmod 600 ~/neuron-web/.relay-data/.relay-turn-secret
+# /etc/turnserver.conf: use-auth-secret + static-auth-secret=<that secret>,
+# realm=neuron, listening-port=3478, min-port=49160, max-port=49200,
+# external-ip=<box public ip>, no-tls, no-dtls.
+sudo sed -i 's/^#*TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn
+sudo systemctl enable --now coturn
+```
+
+Security group (`neuron-relay`) — **run from PowerShell with `os.ps1`, not
+`os.sh`; the bash script silently does nothing there**:
+
+```powershell
+.\scripts\os.ps1 security group rule create --ingress --protocol udp --dst-port 3478:3478   --remote-ip 0.0.0.0/0 neuron-relay
+.\scripts\os.ps1 security group rule create --ingress --protocol tcp --dst-port 3478:3478   --remote-ip 0.0.0.0/0 neuron-relay
+.\scripts\os.ps1 security group rule create --ingress --protocol udp --dst-port 49160:49200 --remote-ip 0.0.0.0/0 neuron-relay
+```
+
+**Verify from OUTSIDE, not from the config.** A raw STUN Binding Request to
+`<ip>:3478` must answer `Binding Success` (port genuinely open), and an
+unauthenticated TURN Allocate must answer `401` with `realm="neuron"` (a relay,
+not merely a STUN responder, and not giving bandwidth away). Both were confirmed
+this way; `systemctl is-active` proves neither.
+
+Clients never see the secret: the relay mints time-limited credentials at
+`GET /turn-credentials` (coturn REST scheme, 1 h ttl) and the client caches to
+90% of that, falling back to STUN-only when no relay answers.
