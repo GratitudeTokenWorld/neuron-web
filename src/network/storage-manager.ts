@@ -4,9 +4,10 @@
  * Manages the lifecycle of NeuronChain's built-in storage ledger:
  *
  *   Providers register with a capacity (GB) via a storage-register block.
- *   Every ~4 hours, active providers broadcast a storage-heartbeat block (proof of uptime).
- *   Once per day, providers self-issue a storage-reward block that mints new UNIT:
- *     reward = BASE_RATE × capacityGB × (heartbeatCount / MAX_HEARTBEATS_PER_DAY)
+ *   Every heartbeat interval, active providers broadcast a storage-heartbeat block
+ *   (proof of uptime). Once per reward epoch, providers self-issue a storage-reward
+ *   block that mints new UNIT:
+ *     reward = BASE_RATE × storedGB × (heartbeatCount / MAX_HEARTBEATS_PER_EPOCH)
  *
  *   When a user stores content, StorageManager selects up to 10 providers from
  *   the ledger (weighted random by capacityGB × score), publishes a cache request,
@@ -22,21 +23,32 @@ import { EngineLedger } from '../ledger/engine-ledger';
 import type { StorageProviderState as StorageProvider } from '../engine/content/provider-ledger';
 import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
-import { AccountBlock, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY } from '../core/dag-block';
+import { AccountBlock } from '../core/dag-block';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
 import { getDeviceId, getCountryCode } from './node';
 import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
-import { claimableEpochDay } from '../engine/content/provider-ledger';
+// Timing comes from the engine, never from `core/dag-block`'s legacy copies of
+// the same numbers: those are fixed at production values, so under the `fast`
+// dev profile the heartbeat TIMER would still fire every 4h while the ledger
+// counted renewals every 2 min. Two clocks measuring the same thing is the bug
+// this file has now hit in three different guises.
+import {
+  claimableEpochDay, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS,
+} from '../engine/content/provider-ledger';
 import {
   REDUNDANCY_TARGET, MAX_REPLICA_TARGET, MIN_REPLICAS,
   CustodySignals, planRepair, planRejoin, pollIntervalMs, liveHolders,
 } from '../engine/content/custody';
 import type { Block as EngineBlock } from '../engine/core/block';
 
-const HEARTBEAT_JITTER_MS = 5 * 60 * 1000;          // ±5 min jitter so nodes don't all fire at once
-const REWARD_CHECK_INTERVAL_MS = 30 * 60 * 1000;    // check every 30 min whether today's reward is due
-const SPOT_CHECK_BASE_MS = 60 * 60 * 1000;          // hourly at dev scale; stretched by pollIntervalMs
-const RECEIPT_WINDOW_MS = 24 * 60 * 60 * 1000;      // keep receipts for 24h rolling window
+// Every cadence here is a FRACTION of the timing profile, not a wall-clock
+// constant. Under the `fast` dev profile a reward epoch is 12 minutes, and a
+// 30-minute reward poll would simply never fire inside one — the compressed
+// profile would look broken while behaving correctly.
+const jitterMs = () => HEARTBEAT_INTERVAL_MS / 48;            // ±5 min at production timing
+const rewardCheckMs = () => Math.max(5_000, REWARD_EPOCH_MS / 48);   // 30 min at production timing
+const spotCheckBaseMs = () => Math.max(10_000, REWARD_EPOCH_MS / 24); // 1 h at production timing
+const receiptWindowMs = () => REWARD_EPOCH_MS;                // one epoch of rolling receipts
 
 // REDUNDANCY_TARGET, MIN_REPLICAS and the repair rules live in
 // engine/content/custody.ts — pure, and covered by tests, which this file is not.
@@ -355,7 +367,7 @@ export class StorageManager extends EventEmitter {
     this.scheduleNextHeartbeat();
 
     // Check daily reward eligibility every 30 min
-    this.rewardInterval = setInterval(() => this.issueRewardsIfEligible(), REWARD_CHECK_INTERVAL_MS);
+    this.rewardInterval = setInterval(() => this.issueRewardsIfEligible(), rewardCheckMs());
     // Also check immediately on start (catches missed day-boundary events)
     setTimeout(() => this.issueRewardsIfEligible(), 5_000);
 
@@ -368,7 +380,7 @@ export class StorageManager extends EventEmitter {
     this.statsRefreshInterval = setInterval(() => {
       this.ledger.refreshHeartbeatCounts();
       this.emit('storage:providers-updated');
-    }, REWARD_CHECK_INTERVAL_MS);
+    }, rewardCheckMs());
 
     // Periodically re-announce own files so any peer that missed the original gossip
     // receives it without needing a page reload or reconnect.
@@ -498,7 +510,7 @@ export class StorageManager extends EventEmitter {
   private scheduleNextSpotCheck(): void {
     if (!this.started) return;
     const population = this.ledger.getStorageProviders().length;
-    const delay = pollIntervalMs(SPOT_CHECK_BASE_MS, population);
+    const delay = pollIntervalMs(spotCheckBaseMs(), population);
     this.spotCheckTimer = setTimeout(() => {
       this.runSpotChecks()
         .catch(() => {})
@@ -526,7 +538,7 @@ export class StorageManager extends EventEmitter {
       }
     }
 
-    const jitter = Math.random() * HEARTBEAT_JITTER_MS;
+    const jitter = Math.random() * jitterMs();
 
     if (minDueIn === 0) {
       // Past-due or first-ever heartbeat: wait for the first peer to connect before firing.
@@ -548,7 +560,7 @@ export class StorageManager extends EventEmitter {
         this.scheduleNextHeartbeat();
       };
       this.net.on('peer:connected', fire);
-      this.heartbeatTimer = setTimeout(fire, 45_000);
+      this.heartbeatTimer = setTimeout(fire, Math.min(45_000, HEARTBEAT_INTERVAL_MS / 4));
     } else {
       this.heartbeatTimer = setTimeout(async () => {
         try {
@@ -1415,7 +1427,7 @@ export class StorageManager extends EventEmitter {
     if (receipt.requesterPub === receipt.providerPub) return;
 
     // Prune receipts older than 24h
-    const cutoff = Date.now() - RECEIPT_WINDOW_MS;
+    const cutoff = Date.now() - receiptWindowMs();
     const list = (this.receipts.get(receipt.providerPub) || []).filter(r => r.timestamp > cutoff);
     list.push(receipt);
     this.receipts.set(receipt.providerPub, list);
@@ -1690,10 +1702,18 @@ export class StorageManager extends EventEmitter {
     return !!provider && provider.capacityGB > 0;
   }
 
-  /** Get uptime percentage for a provider based on the current rolling 24h window. */
-  getUptimePct(pub: string): number {
-    if (!this.ledger.storageProviders.has(pub)) return 0;
-    const current = this.ledger.countHeartbeatsLast24h(pub, Date.now());
-    return Math.round((current / MAX_HEARTBEATS_PER_DAY) * 100);
+  /**
+   * Uptime percentage, or `undefined` when it is not something we measured.
+   *
+   * Delegates to `ProviderLedger.uptimeFraction` — the single definition. This
+   * used to divide by a flat `MAX_HEARTBEATS_PER_DAY` while the SCORE beside it
+   * divided by heartbeats-since-registration, so the two columns disagreed about
+   * the same provider.
+   */
+  getUptimePct(pub: string): number | undefined {
+    const p = this.ledger.storageProviders.get(pub);
+    if (!p) return undefined;
+    const fraction = this.ledger.providerUptime(p);
+    return fraction === undefined ? undefined : Math.round(fraction * 100);
   }
 }

@@ -34,6 +34,9 @@ Cloud provisioning: [docs/CLOUD.md](docs/CLOUD.md).
 
 ```sh
 npm run dev          # Vite dev server + auto-spawned relay
+STORAGE_TIMING=fast npm run dev   # ⚠ dev only: 2-min heartbeat / 12-min epoch /
+                                  # 6-min lease, so storage is testable in a
+                                  # sitting. Wipe first; restart for BOTH devices
 npm run relay        # standalone relay (tsx relay/server.ts) — production entry
 npm run build        # → dist/ (static bundle)
 npm test             # vitest, all of src/**/*.test.ts
@@ -67,7 +70,7 @@ inherited:
 - **An early heartbeat is accepted and not counted; only a flood is rejected.**
   Rejecting a validly-signed block mid-chain truncates it and strands every later
   block as non-sequential — the failure that made NFTs vanish on reload — so
-  honest jitter must never be refused. `MAX_HEARTBEATS_PER_DAY_HARD` (24/epoch,
+  honest jitter must never be refused. `MAX_HEARTBEATS_PER_EPOCH_HARD` (24/epoch,
   4× honest) is the sole mid-chain rejection, set where only a padding chain
   reaches it. Uptime credit comes only from counted renewals.
 - **Providers are DISCOVERED by asking, not by broadcast** (`GET /providers`,
@@ -476,6 +479,28 @@ are fine unprompted.
 
 Deliberate, temporary workarounds that **must not ship in any built bundle**.
 Check this list before any deploy that is not a dev server.
+
+- **Compressed storage timing** (`STORAGE_TIMING=fast`, added 2026-08-16,
+  Lucian's call). Divides every storage duration by 120: a 2-minute heartbeat, a
+  12-minute reward epoch, a 6-minute lease. Every ratio is unchanged, so the
+  rules under test are the rules that ship — only the clock moves.
+
+  **Why it exists:** at production timing one storage cycle is a DAY, so
+  lease/repair/reward behaviour was being verified by reading the code. That is
+  how "deregistering resets the heartbeat clock" survived until someone ran it.
+
+  **Why it cannot ship:** a 6-minute lease would re-home every replica of every
+  provider that closed a laptop lid. It is also a CONSENSUS input — `validate()`
+  reads `REWARD_EPOCH_MS` — so a node on a different profile rejects a
+  correctly-signed reward block mid-chain and strands everything after it.
+  Relays do not validate storage blocks, so agreement is client-side only.
+
+  Structurally dev-only: `vite.config.ts` bakes `__STORAGE_TIMING__` as
+  `'normal'` with no env var, and the guarded call is then dead-code eliminated
+  (verified: the `fast` bundle is 440 bytes larger). The active profile is shown
+  as a ⚠ chip on the Storage tab so a two-device mismatch is visible rather than
+  silent. **Switching profiles requires a wipe** — `epochDay` is
+  `floor(ts / REWARD_EPOCH_MS)`, so existing epoch numbering becomes meaningless.
 
 - **Dev relay proxy** (`src/network/dev-relay-proxy.ts`, added 2026-08-15,
   Lucian's call). The Vite dev server proxies each raw-IP bootstrap relay under

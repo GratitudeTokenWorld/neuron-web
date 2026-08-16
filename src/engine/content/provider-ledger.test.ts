@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 
 import {
   ProviderLedger, claimableEpochDay, MAX_OFFLINE_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_GRACE_MS,
-  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_DAY, MAX_HEARTBEATS_PER_DAY_HARD,
-  BASE_STORAGE_RATE_MILLI, GB_BYTES,
+  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_EPOCH, MAX_HEARTBEATS_PER_EPOCH_HARD,
+  BASE_STORAGE_RATE_MILLI, GB_BYTES, applyStorageTiming, storageTiming,
 } from './provider-ledger.js';
 import type { Block, StoragePayload } from '../core/block.js';
 
@@ -101,16 +101,16 @@ describe('heartbeat counting', () => {
     // 24 blocks in one epoch — 4× what a fully-online provider produces. Every
     // one before the ceiling applies (no honest chain is ever truncated); the
     // one that crosses it is refused.
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY_HARD; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH_HARD; i++) {
       const ts = DAY + i * 60_000;
       expect(pl.validate(blk('storage-heartbeat', ts, {}), ts)).toBeNull();
       pl.apply(blk('storage-heartbeat', ts, {}), ts);
     }
-    const over = DAY + MAX_HEARTBEATS_PER_DAY_HARD * 60_000;
+    const over = DAY + MAX_HEARTBEATS_PER_EPOCH_HARD * 60_000;
     expect(pl.validate(blk('storage-heartbeat', over, {}), over)).toMatch(/more than 24 heartbeats/);
     // Still worth exactly one day's uptime credit: padding bought nothing.
     expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
-    expect(pl.submittedInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY_HARD);
+    expect(pl.submittedInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH_HARD);
     // The ceiling is per epoch, so the next day starts clean.
     const nextDay = DAY + REWARD_EPOCH_MS;
     expect(pl.validate(blk('storage-heartbeat', nextDay, {}), nextDay)).toBeNull();
@@ -152,14 +152,14 @@ describe('deregistering does not launder the account history', () => {
     // "first heartbeat, always due". Measured before the fix: 6/6 counted
     // heartbeats in 60 seconds, paying exactly what an honest 24h day pays.
     const pl = registered(1000, DAY - REWARD_EPOCH_MS);
-    churn(pl, DAY, MAX_HEARTBEATS_PER_DAY);
+    churn(pl, DAY, MAX_HEARTBEATS_PER_EPOCH);
 
     // Only the FIRST heartbeat of the day counts: the rest are inside the
     // interval, measured against a clock the attacker cannot destroy.
     expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
     const terms = pl.rewardTerms(PUB, 100);
     if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 1000 * (1 / MAX_HEARTBEATS_PER_DAY)));
+    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 1000 * (1 / MAX_HEARTBEATS_PER_EPOCH)));
     // ...which is a sixth of the full day it was trying to claim.
     expect(terms.amount).toBeLessThan(BASE_STORAGE_RATE_MILLI * 1000);
   });
@@ -168,10 +168,10 @@ describe('deregistering does not launder the account history', () => {
     // Churning is not itself an offence — a provider may legitimately leave and
     // rejoin. It just buys no uptime that the clock did not already allow.
     const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       churn(pl, DAY + i * HEARTBEAT_INTERVAL_MS, 1, 10);
     }
-    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);
   });
 
   it('does not refresh the lease grace by re-registering', () => {
@@ -193,7 +193,7 @@ describe('deregistering does not launder the account history', () => {
 describe('reward terms', () => {
   /** A full day of heartbeats reporting `storedBytes`, on epoch `day`. */
   function fullDay(pl: ProviderLedger, day: number, storedBytes: number): void {
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes }), ts);
     }
@@ -205,7 +205,7 @@ describe('reward terms', () => {
     const terms = pl.rewardTerms(PUB, 100);
     expect(typeof terms).not.toBe('string');
     if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.heartbeatCount).toBe(MAX_HEARTBEATS_PER_DAY);
+    expect(terms.heartbeatCount).toBe(MAX_HEARTBEATS_PER_EPOCH);
     expect(terms.storedGB).toBe(4);
     expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 4);
   });
@@ -227,7 +227,7 @@ describe('reward terms', () => {
     }
     const terms = pl.rewardTerms(PUB, 100);
     if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 6 * (2 / MAX_HEARTBEATS_PER_DAY)));
+    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 6 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
   });
 
   it('prices capacity as it stood at epoch START — a last-minute bump pays nothing', () => {
@@ -246,7 +246,7 @@ describe('reward terms', () => {
     // for custody — a provider could declare 1000GB, store nothing, and collect
     // the full rate forever.
     const pl = registered(1000, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 0 }), ts);
     }
@@ -260,11 +260,11 @@ describe('reward terms', () => {
     // Treating it as "assume full capacity" handed a free full-rate reward to
     // anyone who simply left the field out.
     const pl = registered(1000, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, {}), ts);      // no storedBytes at all
     }
-    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);  // uptime is real
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);  // uptime is real
     expect(pl.rewardTerms(PUB, 100)).toMatch(/zero/);                     // custody is not
   });
 
@@ -290,7 +290,7 @@ describe('reward terms', () => {
     expect(pl.rewardTerms(PUB, claimableEpochDay(morning))).toMatch(/no heartbeats/);
 
     // The rest of day 100 runs; the next day it is complete and prices on all of it.
-    for (let i = 1; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 1; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 6 * GB_BYTES }), ts);
     }
@@ -319,7 +319,7 @@ describe('reward terms', () => {
 
 describe('reward validation', () => {
   function earned(pl: ProviderLedger, day: number): number {
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 8 * GB_BYTES }), ts);
     }
@@ -367,7 +367,7 @@ describe('reward validation', () => {
     expect(err).toMatch(/may only claim epoch 159/);
     // The refusal does not depend on whether the evidence is still retained: it
     // is a property of the block, so it is the same answer on every node forever.
-    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_DAY);
+    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);
   });
 
   it('rejects a non-positive or malformed reward', () => {
@@ -389,7 +389,7 @@ describe('reward validation', () => {
 describe('score and free space', () => {
   it('meters the earning rate on bytes held, not capacity declared', () => {
     const pl = registered(100, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 2 * GB_BYTES }), ts);
     }
@@ -438,5 +438,145 @@ describe('epoch retention', () => {
     expect(pl.heartbeatsInEpoch(other, 40)).toBe(1);
     expect(pl.heartbeatsInEpoch(other, 10)).toBe(1);
     expect(pl.heartbeatsInEpoch(other, 0)).toBe(0);   // past provider 2's own window
+  });
+});
+
+// ── Timing profiles + the one uptime number ─────────────────────────────────
+
+describe('storage timing profiles', () => {
+  afterEach(() => { applyStorageTiming('normal'); });
+
+  it('defaults to production timing', () => {
+    expect(storageTiming().name).toBe('normal');
+    expect(HEARTBEAT_INTERVAL_MS).toBe(4 * 60 * 60 * 1000);
+    expect(REWARD_EPOCH_MS).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it('fast compresses every duration by the same factor', () => {
+    const normal = { i: HEARTBEAT_INTERVAL_MS, e: REWARD_EPOCH_MS, o: MAX_OFFLINE_MS };
+    applyStorageTiming('fast');
+    expect(HEARTBEAT_INTERVAL_MS).toBe(2 * 60 * 1000);
+    expect(REWARD_EPOCH_MS).toBe(12 * 60 * 1000);
+    // Same factor everywhere, or the compressed profile tests different rules
+    // from the ones that ship.
+    expect(normal.i / HEARTBEAT_INTERVAL_MS).toBe(120);
+    expect(normal.e / REWARD_EPOCH_MS).toBe(120);
+    expect(normal.o / MAX_OFFLINE_MS).toBe(120);
+  });
+
+  it('keeps every RATIO the reward maths depends on', () => {
+    for (const name of ['normal', 'fast']) {
+      applyStorageTiming(name);
+      expect(REWARD_EPOCH_MS / HEARTBEAT_INTERVAL_MS).toBe(MAX_HEARTBEATS_PER_EPOCH);
+      expect(MAX_HEARTBEATS_PER_EPOCH).toBe(6);
+      expect(MAX_HEARTBEATS_PER_EPOCH_HARD).toBe(24);
+      expect(MAX_OFFLINE_MS).toBe(3 * HEARTBEAT_INTERVAL_MS);
+    }
+  });
+
+  it('scales the grace so it never becomes a large slice of the interval', () => {
+    applyStorageTiming('normal');
+    expect(HEARTBEAT_GRACE_MS).toBe(60_000);          // the measured production value
+    applyStorageTiming('fast');
+    // A flat 60s of slack on a 2-minute interval would be half of it: heartbeats
+    // would count at twice the honest rate and the reward would follow.
+    expect(HEARTBEAT_GRACE_MS).toBeLessThanOrEqual(HEARTBEAT_INTERVAL_MS / 8);
+  });
+
+  it('refuses a profile whose epoch is not a whole number of intervals', () => {
+    // rewardTerms divides by MAX_HEARTBEATS_PER_EPOCH, so a fractional value
+    // pays a fully-online provider something other than 1.0.
+    expect(() => applyStorageTiming({ name: 'bad', heartbeatIntervalMs: 7_000, epochMs: 10_000 }))
+      .toThrow(/whole number of intervals/);
+    expect(() => applyStorageTiming('nonexistent')).toThrow(/unknown storage timing profile/);
+  });
+
+  it('leaves the constants untouched when a profile is rejected', () => {
+    const before = HEARTBEAT_INTERVAL_MS;
+    expect(() => applyStorageTiming('nonexistent')).toThrow();
+    expect(HEARTBEAT_INTERVAL_MS).toBe(before);
+  });
+
+  it('the lease and the heartbeat rules still hold under fast timing', () => {
+    applyStorageTiming('fast');
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+
+    // Live immediately, lapsed one lease later — same rule, 120× sooner.
+    expect(l.isLive(PUB, t0 + MAX_OFFLINE_MS - 1)).toBe(true);
+    expect(l.isLive(PUB, t0 + MAX_OFFLINE_MS)).toBe(false);
+
+    // An early heartbeat still does not count; an on-time one still does.
+    l.apply(blk('storage-heartbeat', t0 + 30_000, {}), t0 + 30_000);
+    expect(l.heartbeatsInEpoch(PUB, Math.floor(t0 / REWARD_EPOCH_MS))).toBe(1); // the first is always due
+    l.apply(blk('storage-heartbeat', t0 + 40_000, {}), t0 + 40_000);
+    expect(l.heartbeatsInEpoch(PUB, Math.floor(t0 / REWARD_EPOCH_MS))).toBe(1); // too early to renew
+    // Due one interval after the last COUNTED renewal (t0+30s), not after t0.
+    const due = t0 + 30_000 + HEARTBEAT_INTERVAL_MS;
+    l.apply(blk('storage-heartbeat', due, {}), due);
+    expect(l.heartbeatsInEpoch(PUB, Math.floor(t0 / REWARD_EPOCH_MS))).toBe(2);
+  });
+});
+
+describe('uptimeFraction — one definition, not three', () => {
+  it('measures against heartbeats that were DUE, not a flat epoch', () => {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+    l.apply(blk('storage-heartbeat', t0, {}), t0);
+    const p = l.providers.get(PUB)!;
+
+    // One interval in, one heartbeat sent: perfect, not 1/6. Dividing by a flat
+    // 6 reported a perfectly behaved new provider at 17% — which is exactly what
+    // a freshly-recovered device showed while its score said otherwise.
+    expect(l.uptimeFraction(p, t0 + HEARTBEAT_INTERVAL_MS - 1)).toBe(1);
+    expect(l.expectedHeartbeats(p, t0 + HEARTBEAT_INTERVAL_MS - 1)).toBe(1);
+  });
+
+  it('falls as renewals are missed', () => {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+    l.apply(blk('storage-heartbeat', t0, {}), t0);
+    const p = l.providers.get(PUB)!;
+    // Four intervals later, still only the one heartbeat: five were due.
+    const later = t0 + 4 * HEARTBEAT_INTERVAL_MS;
+    p.heartbeatsLast24h = l.countHeartbeatsLast24h(PUB, later);
+    expect(l.expectedHeartbeats(p, later)).toBe(5);
+    expect(l.uptimeFraction(p, later)).toBeCloseTo(0.2, 5);
+  });
+
+  it('never exceeds 1', () => {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+    const p = l.providers.get(PUB)!;
+    p.heartbeatsLast24h = 99;
+    expect(l.uptimeFraction(p, t0)).toBe(1);
+  });
+
+  it('is UNDEFINED for a discovered provider — unknown is not 0%', () => {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+    const p = { ...l.providers.get(PUB)!, discovered: true as const };
+    expect(l.uptimeFraction(p, t0)).toBeUndefined();
+  });
+
+  it('agrees with the score it sits beside', () => {
+    // The bug: UPTIME divided by a flat 6 while SCORE divided by
+    // heartbeats-since-registration, so the two columns described the same
+    // provider differently. With no latency or spot-check evidence, score IS the
+    // uptime fraction.
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'dev-1' }), t0);
+    l.apply(blk('storage-heartbeat', t0, {}), t0);
+    const p = l.providers.get(PUB)!;
+    const at = t0 + HEARTBEAT_INTERVAL_MS - 1;
+    p.heartbeatsLast24h = l.countHeartbeatsLast24h(PUB, at);
+    l.updateScore(p, at);
+    expect(p.score).toBeCloseTo(l.uptimeFraction(p, at)!, 10);
   });
 });

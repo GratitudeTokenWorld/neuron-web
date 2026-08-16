@@ -7,7 +7,7 @@ import { deriveCommitment } from '../engine/core/identity.js';
 import { createBlock, type Block, type StoragePayload } from '../engine/core/block.js';
 import { AccountAccumulator } from '../engine/core/accumulator.js';
 import {
-  REWARD_EPOCH_MS, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY,
+  REWARD_EPOCH_MS, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_EPOCH,
   BASE_STORAGE_RATE_MILLI, MAX_OFFLINE_MS, GB_BYTES,
 } from '../engine/content/provider-ledger.js';
 
@@ -99,7 +99,7 @@ async function provider(capacityGB = 10) {
 
 /** A full day of heartbeats on epoch `TODAY - 2`, each reporting `storedGB` held. */
 function fullDayOfHeartbeats(ledger: EngineLedger, chain: Chain, storedGB: number): void {
-  for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+  for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
     const { result } = chain.push(
       ledger, 'storage-heartbeat', DAY1 + i * HEARTBEAT_INTERVAL_MS,
       { storedBytes: storedGB * GB_BYTES, smokeAddr: 'p1.example' },
@@ -161,7 +161,7 @@ describe('reward minting — the adversarial surface', () => {
 
     const { result } = chain.push(
       ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS,
-      { epochDay: TODAY - 2, storedGB: 4, heartbeatCount: MAX_HEARTBEATS_PER_DAY },
+      { epochDay: TODAY - 2, storedGB: 4, heartbeatCount: MAX_HEARTBEATS_PER_EPOCH },
       { amount: BigInt(expected), balance: MINT + BigInt(expected) },
     );
     expect(result.success).toBe(true);
@@ -283,7 +283,7 @@ describe('an early heartbeat must not truncate the chain', () => {
     expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
 
     // And the spam bought nothing: a reward still prices at 2/6 uptime.
-    const amount = BigInt(Math.floor(BASE_STORAGE_RATE_MILLI * 1 * (2 / MAX_HEARTBEATS_PER_DAY)));
+    const amount = BigInt(Math.floor(BASE_STORAGE_RATE_MILLI * 1 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
     const claim = chain.push(
       ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 2, storedGB: 1 },
       { amount, balance: chain.balance + amount },
@@ -331,7 +331,7 @@ describe('local issuance (the create* path)', () => {
     vi.setSystemTime(DAY0);
     await ledger.createStorageRegister(keys.pub, 10, keys, 'dev-earner');
 
-    for (let i = 0; i < MAX_HEARTBEATS_PER_DAY; i++) {
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       vi.setSystemTime(DAY1 + i * HEARTBEAT_INTERVAL_MS);
       const hb = await ledger.createStorageHeartbeat(keys.pub, keys, 'e.example', 6 * GB_BYTES);
       expect(hb.block).toBeDefined();

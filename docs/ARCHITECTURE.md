@@ -609,7 +609,7 @@ which is why `durable` is defined on final replica count and not on the ratio.
   every later block then fails as non-sequential (the failure that made NFTs
   vanish on reload) — so honest jitter must never be refused. But
   accept-and-ignore alone left chain growth unbounded, free to the spammer and
-  paid for by every peer holding that shard. `MAX_HEARTBEATS_PER_DAY_HARD`
+  paid for by every peer holding that shard. `MAX_HEARTBEATS_PER_EPOCH_HARD`
   (24/epoch, 4× the honest rate) is the one mid-chain rejection in the storage
   path, set far enough above any real provider that only a padding chain reaches
   it. Uptime credit still comes only from counted renewals.
@@ -629,6 +629,28 @@ which is why `durable` is defined on final replica count and not on the ratio.
   now durable per account, so deregistering costs the lease and gains nothing.
   The general shape to watch for: **any anti-abuse clock an account can reset by
   destroying its own record is not a clock.**
+
+#### One uptime number (fixed 2026-08-16)
+
+"How much of the time is this provider up?" was computed in three places with
+two different denominators. `updateScore` divided counted heartbeats by the
+heartbeats due *since registration*; `StorageManager.getUptimePct` and both UI
+call sites divided by a flat six. So the UPTIME column and the SCORE column
+beside it described the same provider differently, and a freshly-rejoined
+device read 17% next to a score that had priced it far higher. Reported by
+Lucian, 2026-08-16. `ProviderLedger.uptimeFraction` is now the only definition,
+and it returns `undefined` — rendered `—` — for a provider whose chain we do not
+hold, because that is unknown rather than zero.
+
+The same report exposed a second, larger problem: the Storage tab's **"Avg
+Uptime"** and **"Avg Score"** were averages over providers whose chain the node
+holds, which is its own accounts. On a two-device network each device averaged
+exactly one sample — its own — so one showed 67%, the other 17%, and neither was
+an average of anything. The sample size now travels with the figure, and none
+reads `—`. This is not incidental: a node *cannot* know a stranger's uptime
+history, by the Fan-IN decision immediately below. What it can honestly show
+about a discovered provider is the freshness of its latest signed heartbeat, and
+now does.
 
 ### Fan-IN: the invariant read from the other direction (decided 2026-08-15)
 

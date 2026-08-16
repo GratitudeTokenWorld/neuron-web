@@ -1,7 +1,7 @@
 # Manual E2E test plan — two-relay dev network
 
 The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 270-test suite cannot: live libp2p transport,
+matrix. It exercises everything the 470-test suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
@@ -316,6 +316,29 @@ The first 3 accounts attested by a fresh relay become its operators (`.relay-ope
    wipe (`[Archive] WIPED by operator`), `generation` increments on both
    `/relay-info`, and every open browser clears on next refresh.
 
+## Running T8–T9 in a sitting: compressed timing
+
+At production timing one storage cycle is a day, so T8 step 5 and T9 step 5 are
+untestable in one session. `STORAGE_TIMING=fast` divides every storage duration
+by 120 — 2-minute heartbeat, 12-minute reward epoch, 6-minute lease — leaving
+every ratio identical, so the rules exercised are the rules that ship.
+
+```sh
+# 1. WIPE FIRST. epochDay = floor(ts / REWARD_EPOCH_MS), so an existing chain's
+#    epoch numbering is meaningless under the other profile.
+#    (Relay side: docs/SUPERNODE.md → Resets. Client side: clear site data.)
+# 2. Restart the dev server. BOTH devices load from it, so both get the profile.
+STORAGE_TIMING=fast npm run dev
+```
+
+**Confirm before testing:** the Storage tab shows a ⚠ `Timing fast (2m beat)`
+chip on *both* devices. If one is missing it, that device is on production
+timing and will reject the other's reward blocks mid-chain — the two will look
+like they are on different networks, because in the way that matters they are.
+
+Timings below are written at production values; divide by 120 under `fast`
+(4h → 2min, 24h → 12min, 12h lease → 6min).
+
 ## T8 — Storage provider lifecycle (NOT YET RUN)
 
 Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
@@ -336,10 +359,17 @@ Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
    (the other within one discovery poll). Re-register and heartbeat: **Pass:** it
    is still refused until the 4h interval elapses — deregistering must not reset
    the clock (that bug paid a full day's reward for 60 s of work).
-5. **Reward.** Needs a provider registered before a UTC day boundary, heartbeats
-   during that day, and a claim the day after (rewards settle a day behind, and
-   pay only for bytes actually held). **Not testable in one sitting** — see the
-   open question in the handoff before writing this step.
+5. **Reward.** Needs a provider registered before an epoch boundary, heartbeats
+   through that epoch, and a claim in the next one (rewards settle one epoch
+   behind and pay only for bytes actually held). **Run this under
+   `STORAGE_TIMING=fast`**, where an epoch is 12 minutes: register, upload
+   something so the provider actually holds bytes, wait out an epoch boundary,
+   and watch for `[StorageManager] Reward issued: <n> milli-UNIT`.
+   **Pass:** the amount equals `1000 × storedGB × countedHeartbeats/6`, and a
+   second claim for the same epoch is refused (`epoch N already rewarded`).
+   **Also check:** the claim names the epoch *before* the block, never the
+   running one — a claim for the running epoch would pay a fraction of what was
+   earned and close the epoch permanently.
 
 ## T9 — Publish handoff and repair (NOT YET RUN)
 
@@ -370,8 +400,9 @@ Two devices, A (uploader) and B (registered storage provider, serving).
    first failure; only a second consecutive failure logs
    `Evicting <pub>… after 2 consecutive failures`. A single failure followed by a
    success must leave the holder set unchanged.
-5. **Rejoin past the lease discards.** Stop B for **more than 12 h**
-   (`MAX_OFFLINE_MS`), then start it. **Pass:** B logs
+5. **Rejoin past the lease discards.** Stop B for more than one lease —
+   **12 h at production timing, 6 minutes under `STORAGE_TIMING=fast`** — then
+   start it. **Pass:** B logs
    `Rejoin <pub>…: lease lapsed …h ago … discarding N CID(s)`, its stored bytes
    drop to ~0, and its free space on both devices' Storage tabs rises to the
    full declared capacity. Restarting B inside 12 h instead must log
@@ -416,8 +447,8 @@ is new.
 | T5.3 | Recovery across a lighting change | ☑ | Both directions verified 2026-08-15: dim→light `0.295`, bright→dim `0.285`, threshold `0.45` (~0.51 quantized — both would have failed before the fix). Pre-v3 run, but the biometric gate it measured is unchanged by v3 |
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
-| T8 | Storage provider lifecycle | ☐ | **Steps 1–4 not yet run.** Register/discover/interval/deregister were all exercised ad-hoc during development on 2026-08-15 (both devices saw each other, rate correctly 0) but not as a recorded pass. Step 5 (reward) needs a day boundary — decide the approach first |
-| T9 | Publish handoff + repair | ☐ | **Not yet run.** Written 2026-08-15 alongside the lease/repair work. Steps 1–4 are one sitting; step 5 needs a >12 h absence (`MAX_OFFLINE_MS`), so plan it overnight |
+| T8 | Storage provider lifecycle | ☐ | **Steps 1–4 not yet run.** Register/discover/interval/deregister were all exercised ad-hoc during development on 2026-08-15 (both devices saw each other, rate correctly 0) but not as a recorded pass. Step 5 (reward) is now runnable under `STORAGE_TIMING=fast` — the open question about a clock backdoor is closed: no backdoor, the whole profile compresses |
+| T9 | Publish handoff + repair | ☐ | **Not yet run.** Written 2026-08-15 alongside the lease/repair work. All five steps fit one sitting under `STORAGE_TIMING=fast` (6-minute lease) |
 | T10 | File index is no longer global | ☐ | **Not yet run, and BLOCKED on a relay deploy** — `GET /files` does not exist on the cloud boxes yet |
 | — | Mobile capture (part of T1) | ☑ | 2026-08-15: account created on a phone through the tunnel. Required three fixes — the capture guide was letterboxed on a portrait feed, close-eyes was unpassable below ~8 fps, and the attesters were unreachable over `https`. Face flows had never been run on a phone before |
 

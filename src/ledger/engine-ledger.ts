@@ -1336,6 +1336,19 @@ export class EngineLedger extends EventEmitter {
   updateProviderScore(provider: StorageProviderState): void {
     this.providerLedger.updateScore(provider);
   }
+  /**
+   * A provider's uptime as a 0..1 fraction, or `undefined` when we hold none of
+   * its chain and therefore measured nothing. The single definition — the UI,
+   * the score and `StorageManager.getUptimePct` all read it, because they used
+   * to compute it three different ways and disagree.
+   */
+  providerUptime(provider: StorageProviderState, now = Date.now()): number | undefined {
+    return this.providerLedger.uptimeFraction(provider, now);
+  }
+  /** Heartbeats this provider could have sent so far — the uptime denominator. */
+  expectedHeartbeats(provider: StorageProviderState, now = Date.now()): number {
+    return this.providerLedger.expectedHeartbeats(provider, now);
+  }
   purgeAccount(pub: string): void {
     this.held.delete(pub);
     this.providerLedger.providers.delete(pub);

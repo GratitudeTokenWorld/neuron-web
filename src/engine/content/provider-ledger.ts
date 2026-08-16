@@ -27,18 +27,68 @@ import type { Block } from '../core/block.js';
 /** Bytes in one gigabyte. */
 export const GB_BYTES = 1_073_741_824;
 
-/** Target interval between heartbeat (lease-renewal) blocks: ~4h. */
-export const HEARTBEAT_INTERVAL_MS = 4 * 60 * 60 * 1000;
+/**
+ * ⚠ DEV-ONLY TIMING PROFILES — see CLAUDE.md → *Remove before production*.
+ *
+ * At production timing a single storage cycle is a DAY: 4h between heartbeats,
+ * six of them to a reward epoch, twelve hours before a lease lapses. Nothing in
+ * the lease/repair/reward path can be exercised end-to-end in a sitting, so it
+ * was being verified by reading the code — which is how "deregistering resets
+ * the heartbeat clock" survived until someone thought to try it.
+ *
+ * `fast` divides every duration by 120: 2 min between heartbeats, a 12-minute
+ * reward epoch, a 6-minute lease. Every RATIO is identical, so the rules being
+ * tested are the rules that ship — only the clock moves.
+ *
+ * **Three things that will bite if forgotten.**
+ *
+ * 1. **Every node must agree.** These feed `validate()`: a peer on a different
+ *    epoch length rejects a correctly-signed reward block MID-CHAIN and strands
+ *    every block after it. Relays do not validate storage blocks (they check
+ *    hash + signature only), so this is a client-side agreement — but in dev
+ *    both devices load from one Vite server, so restart it for BOTH after
+ *    changing `STORAGE_TIMING`, and confirm the badge on the Storage tab matches.
+ * 2. **Switching profiles requires a wipe.** `epochDay` is
+ *    `floor(timestamp / REWARD_EPOCH_MS)`, so the epoch numbering of an existing
+ *    chain is meaningless under the other profile. Dev data is disposable
+ *    (CLAUDE.md → *Development mode*); reset before switching.
+ * 3. **`fast` must never ship.** A 6-minute lease on a real network would
+ *    re-home every replica of every provider that closed a laptop lid.
+ */
+export interface StorageTimingProfile {
+  name: string;
+  heartbeatIntervalMs: number;
+  /** Must be an exact multiple of the interval — see `MAX_HEARTBEATS_PER_EPOCH`. */
+  epochMs: number;
+}
+
+export const STORAGE_TIMING_PROFILES: Record<string, StorageTimingProfile> = {
+  normal: { name: 'normal', heartbeatIntervalMs: 4 * 60 * 60 * 1000, epochMs: 24 * 60 * 60 * 1000 },
+  fast: { name: 'fast', heartbeatIntervalMs: 2 * 60 * 1000, epochMs: 12 * 60 * 1000 },
+};
+
+/** Target interval between heartbeat (lease-renewal) blocks. */
+export let HEARTBEAT_INTERVAL_MS = STORAGE_TIMING_PROFILES.normal!.heartbeatIntervalMs;
 
 /**
  * Slack on the heartbeat interval. Timers jitter and clocks drift, so a renewal
- * arriving up to a minute early still counts — without this a provider that fires
- * at 3h59m silently loses a sixth of its day's uptime credit.
+ * arriving slightly early still counts — without this a provider that fires at
+ * 3h59m silently loses a sixth of its epoch's uptime credit.
+ *
+ * Derived rather than fixed, because a flat 60 s of slack on a 2-minute interval
+ * would be half the interval: heartbeats would count at twice the honest rate
+ * and the reward would follow. An eighth of the interval keeps the ratio the
+ * production profile has (60 s of 4 h is well under an eighth, so `normal` keeps
+ * exactly its measured 60 s).
  */
-export const HEARTBEAT_GRACE_MS = 60_000;
+export let HEARTBEAT_GRACE_MS = 60_000;
 
-/** Heartbeats a fully-online provider produces per reward epoch (24h / 4h). */
-export const MAX_HEARTBEATS_PER_DAY = 6;
+/**
+ * Heartbeats a fully-online provider produces per reward epoch (epoch ÷ interval).
+ * Six under both profiles — the ratio is what the reward maths depends on, not
+ * the wall-clock durations.
+ */
+export let MAX_HEARTBEATS_PER_EPOCH = 6;
 
 /**
  * Hard ceiling on heartbeat blocks accepted per provider per epoch, counted or
@@ -52,10 +102,10 @@ export const MAX_HEARTBEATS_PER_DAY = 6;
  * behaviour: without a ceiling, appending heartbeats is free for the spammer
  * and costs every peer holding that shard the bandwidth and disk to carry them.
  */
-export const MAX_HEARTBEATS_PER_DAY_HARD = 4 * MAX_HEARTBEATS_PER_DAY;
+export let MAX_HEARTBEATS_PER_EPOCH_HARD = 4 * MAX_HEARTBEATS_PER_EPOCH;
 
-/** Reward epoch: one day. `epochDay = floor(timestamp / REWARD_EPOCH_MS)`. */
-export const REWARD_EPOCH_MS = 24 * 60 * 60 * 1000;
+/** Reward epoch. `epochDay = floor(timestamp / REWARD_EPOCH_MS)`. */
+export let REWARD_EPOCH_MS = STORAGE_TIMING_PROFILES.normal!.epochMs;
 
 /**
  * The most recent epoch a reward may be claimed for: the last **completed** day,
@@ -72,8 +122,18 @@ export function claimableEpochDay(now: number): number {
   return Math.floor(now / REWARD_EPOCH_MS) - 1;
 }
 
-/** Base earning rate: 1 UNIT per stored GB per day, in milli-UNIT. */
+/** Base earning rate: 1 UNIT per stored GB per epoch, in milli-UNIT. */
 export const BASE_STORAGE_RATE_MILLI = 1_000;
+
+/**
+ * Uptime assumed for a provider whose chain we do not hold, when a number is
+ * unavoidable (the score formula needs one). Neutral, matching `UNKNOWN_SCORE`
+ * in provider-discovery: scoring the unknown as perfect made every node rank
+ * strangers above itself, and scoring it as zero would do the reverse. Anywhere
+ * a number is avoidable — every display — `uptimeFraction` returns `undefined`
+ * and the UI shows "—".
+ */
+export const UNKNOWN_UPTIME = 0.5;
 
 /**
  * How long a lease survives without a renewal before the provider is treated as
@@ -83,7 +143,55 @@ export const BASE_STORAGE_RATE_MILLI = 1_000;
  * day. This is the number the repair loop races: repair must re-place a replica
  * faster than leases expire, or durability decays.
  */
-export const MAX_OFFLINE_MS = 3 * HEARTBEAT_INTERVAL_MS;
+export let MAX_OFFLINE_MS = 3 * HEARTBEAT_INTERVAL_MS;
+
+/**
+ * Switch the timing profile. Every derived value is recomputed here — a value
+ * captured at module load would keep the old profile's number and disagree with
+ * the rest, which is the "two things measuring different things" failure this
+ * codebase keeps paying for.
+ *
+ * Importers see the change: these are `export let`, so ESM live bindings carry
+ * it. They are still read-only to every other module — only this one can assign.
+ *
+ * Call before any block is applied. Switching mid-chain re-numbers `epochDay`
+ * under existing blocks and invalidates their rewards.
+ */
+export function applyStorageTiming(profile: StorageTimingProfile | string): StorageTimingProfile {
+  const p = typeof profile === 'string' ? STORAGE_TIMING_PROFILES[profile] : profile;
+  if (!p) throw new Error(`unknown storage timing profile: ${String(profile)}`);
+  const perEpoch = p.epochMs / p.heartbeatIntervalMs;
+  if (!Number.isInteger(perEpoch) || perEpoch < 1) {
+    // Not pedantry: `rewardTerms` divides counted heartbeats by this, so a
+    // fractional value pays a full-uptime provider something other than 1.0.
+    throw new Error(`storage timing ${p.name}: epoch must be a whole number of intervals`);
+  }
+  HEARTBEAT_INTERVAL_MS = p.heartbeatIntervalMs;
+  REWARD_EPOCH_MS = p.epochMs;
+  MAX_HEARTBEATS_PER_EPOCH = perEpoch;
+  MAX_HEARTBEATS_PER_EPOCH_HARD = 4 * perEpoch;
+  MAX_OFFLINE_MS = 3 * p.heartbeatIntervalMs;
+  HEARTBEAT_GRACE_MS = Math.min(60_000, Math.floor(p.heartbeatIntervalMs / 8));
+  activeProfile = p;
+  return p;
+}
+
+let activeProfile: StorageTimingProfile = STORAGE_TIMING_PROFILES.normal!;
+
+/** Which profile is in force. Surfaced in the UI so a mismatch is visible, not silent. */
+export function storageTiming(): StorageTimingProfile {
+  return activeProfile;
+}
+
+// Selected at module load from the build-time define, so nothing can read a
+// constant before the profile is applied. `__STORAGE_TIMING__` is baked by
+// vite.config.ts from the STORAGE_TIMING env var; in Node (tests, relay,
+// scripts) the global is absent and production timing is the default.
+declare const __STORAGE_TIMING__: string | undefined;
+try {
+  const configured = typeof __STORAGE_TIMING__ === 'string' ? __STORAGE_TIMING__ : 'normal';
+  if (configured !== 'normal') applyStorageTiming(configured);
+} catch { /* unknown profile name — stay on production timing */ }
 
 /**
  * Per-provider epoch records retained. Generous, because the only cost is a few
@@ -92,8 +200,13 @@ export const MAX_OFFLINE_MS = 3 * HEARTBEAT_INTERVAL_MS;
  */
 const RETAIN_EPOCHS = 32;
 
-/** Recent heartbeat timestamps kept per provider — enough to count any 24h window. */
-const HEARTBEAT_RING = 2 * MAX_HEARTBEATS_PER_DAY;
+/**
+ * Recent heartbeat timestamps kept per provider — enough to count any full
+ * epoch window. A function, not a constant: capturing it at module load would
+ * freeze the production ring size onto a `fast` profile whose epoch holds the
+ * same six heartbeats but arrives 120× sooner.
+ */
+const heartbeatRing = () => 2 * MAX_HEARTBEATS_PER_EPOCH;
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -330,7 +443,7 @@ export class ProviderLedger {
     // hand a free full-capacity reward to anyone who simply omitted it.
     const actualGB = this.storedGBInEpoch(pub, epochDay);
     const effectiveGB = Math.min(actualGB, capacityAtStart);
-    const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1);
+    const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_EPOCH, 1);
     const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
     if (amount <= 0) return 'calculated reward is zero';
 
@@ -375,8 +488,8 @@ export class ProviderLedger {
         // 4× above the honest rate so only a padding chain reaches it. Counted off
         // the chain itself, so every node draws the line at the same block.
         const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
-        if (this.submittedInEpoch(block.accountId, epochDay) >= MAX_HEARTBEATS_PER_DAY_HARD) {
-          return `storage-heartbeat: more than ${MAX_HEARTBEATS_PER_DAY_HARD} heartbeats in one epoch`;
+        if (this.submittedInEpoch(block.accountId, epochDay) >= MAX_HEARTBEATS_PER_EPOCH_HARD) {
+          return `storage-heartbeat: more than ${MAX_HEARTBEATS_PER_EPOCH_HARD} heartbeats in one epoch`;
         }
         return null;
       }
@@ -402,7 +515,7 @@ export class ProviderLedger {
         if (typeof terms === 'string') return `storage-reward: ${terms}`;
         if (block.amount > BigInt(terms.amount)) {
           return `storage-reward: amount ${block.amount} exceeds maximum ${terms.amount} `
-            + `(${terms.storedGB.toFixed(3)}GB × ${(terms.heartbeatCount / MAX_HEARTBEATS_PER_DAY).toFixed(2)} uptime)`;
+            + `(${terms.storedGB.toFixed(3)}GB × ${(terms.heartbeatCount / MAX_HEARTBEATS_PER_EPOCH).toFixed(2)} uptime)`;
         }
         if ((claimed.storedGB ?? 0) > terms.storedGB + 1e-9) {
           return `storage-reward: storedGB ${claimed.storedGB} exceeds allowed ${terms.storedGB.toFixed(3)}`;
@@ -574,23 +687,53 @@ export class ProviderLedger {
    * reward at the current score, metered on bytes actually held (capped by declared
    * capacity) — declared-but-empty capacity earns nothing.
    */
-  updateScore(p: StorageProviderState, now: number = Date.now()): void {
-    // Uptime is scored against the heartbeats this provider could actually have
-    // sent since it registered, not against a flat 6-a-day. A node registered an
-    // hour ago can only ever have sent one, so dividing by 6 scored a perfectly
-    // behaved new provider at 0.167 and left it looking broken for its first
-    // day — while every provider we knew nothing about scored 1.0.
-    //
-    // NOTE this is deliberately NOT how the REWARD is metered. Pay is
-    // counted/6, because a fraction of a day's custody earns a fraction of a
-    // day's pay. Score answers a different question — how reliable is this
-    // provider — and that has to account for how long it has been around.
+  /**
+   * Heartbeats this provider could have sent inside the trailing epoch window.
+   *
+   * Bounded by how long it has been registered: a node registered one interval
+   * ago can only ever have sent one, so measuring it against a full epoch's
+   * worth reports a perfectly behaved new provider as mostly-down.
+   */
+  expectedHeartbeats(p: StorageProviderState, now: number): number {
     const elapsed = Math.max(0, Math.min(now - p.registeredAt, REWARD_EPOCH_MS));
-    const expected = Math.max(1, Math.min(
-      MAX_HEARTBEATS_PER_DAY,
+    return Math.max(1, Math.min(
+      MAX_HEARTBEATS_PER_EPOCH,
       Math.floor(elapsed / HEARTBEAT_INTERVAL_MS) + 1,
     ));
-    const uptimeFactor = Math.max(0.1, Math.min(1, p.heartbeatsLast24h / expected));
+  }
+
+  /**
+   * **The** uptime number: counted renewals over renewals that were due, 0..1.
+   *
+   * There were three of these and they disagreed. `updateScore` divided by
+   * heartbeats-since-registration; `StorageManager.getUptimePct` and the two UI
+   * call sites divided by a flat 6. So the SCORE column and the UPTIME column
+   * beside it were computed from different denominators, and a provider could
+   * read 17% next to a score that had priced it far higher — the same
+   * "bar and test measuring different things" trap the face-capture code has
+   * now been bitten by three times, in its storage costume.
+   *
+   * Returns `undefined` when there is nothing to measure: a DISCOVERED provider
+   * is one whose chain we do not hold, so we know its latest heartbeat and
+   * nothing about the ones before it. That is not 0% — it is unknown, and must
+   * render as such.
+   */
+  uptimeFraction(p: StorageProviderState, now: number = Date.now()): number | undefined {
+    if (p.discovered) return undefined;
+    return Math.min(1, p.heartbeatsLast24h / this.expectedHeartbeats(p, now));
+  }
+
+  updateScore(p: StorageProviderState, now: number = Date.now()): void {
+    // Uptime is scored against the heartbeats this provider could actually have
+    // sent since it registered, not against a flat epoch's worth — see
+    // `uptimeFraction`, which is the one definition every caller now shares.
+    //
+    // NOTE this is deliberately NOT how the REWARD is metered. Pay is
+    // counted / MAX_HEARTBEATS_PER_EPOCH, because a fraction of an epoch's
+    // custody earns a fraction of an epoch's pay. Score answers a different
+    // question — how reliable is this provider — and that has to account for how
+    // long it has been around.
+    const uptimeFactor = Math.max(0.1, this.uptimeFraction(p, now) ?? UNKNOWN_UPTIME);
     const latencyFactor = p.avgLatencyMs > 0
       ? Math.max(0.1, Math.min(1, 1_000 / p.avgLatencyMs))
       : 1;
@@ -651,6 +794,7 @@ export class ProviderLedger {
     let times = this.heartbeatTimes.get(pub);
     if (!times) this.heartbeatTimes.set(pub, (times = []));
     times.push(ts);
-    if (times.length > HEARTBEAT_RING) times.splice(0, times.length - HEARTBEAT_RING);
+    const ring = heartbeatRing();
+    if (times.length > ring) times.splice(0, times.length - ring);
   }
 }

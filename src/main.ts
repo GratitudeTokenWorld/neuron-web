@@ -16,6 +16,7 @@ import { devRelayBaseFor } from './network/dev-relay-proxy';
 import { sign as engineSignRecord } from './engine/core/keys';
 import { relayHttpBase } from './network/account-resolver';
 import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
+import { storageTiming } from './engine/content/provider-ledger';
 import type { TypedAttestation } from './engine/core/attestation';
 import { encodeBlock, decodeBlock } from './engine/core/block';
 import { bytesToHex, hexToBytes } from './engine/core/hash';
@@ -3817,6 +3818,15 @@ async function refreshArchiveFileCount(): Promise<void> {
   } catch { /* offline — leave the last measurement, or "—" */ }
 }
 
+/** Compact "how long ago", for freshness readouts. Sub-minute reads "just now". */
+function fmtAgo(ms: number): string {
+  if (ms < 60_000) return 'just now';
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
 function refreshStorage() {
   const options = localAccounts.map(a => `<option value="${escHtml(a.pub)}">${escHtml(a.username)}</option>`).join('');
   const noAcct = '<option value="">No accounts</option>';
@@ -3845,14 +3855,16 @@ function refreshStorage() {
     // Populate my stats row
     const p = node.ledger.storageProviders.get(servingAccount.pub);
     if (p) {
-      const uptime = `${node.storage.getUptimePct(p.pub)}%`;
+      const uptimePct = node.storage.getUptimePct(p.pub);
+      const uptime = uptimePct === undefined ? '—' : `${uptimePct}%`;
+      const due = node.ledger.expectedHeartbeats(p);
       const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
       const lastReward = p.lastRewardEpoch > 0
         ? `${Math.round((Date.now() - p.lastRewardEpoch * 24 * 60 * 60 * 1000) / 3_600_000)}h ago`
         : 'Never';
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB</td>
-        <td>${uptime} (${p.heartbeatsLast24h}/6 heartbeats)</td>
+        <td>${uptime} (${p.heartbeatsLast24h}/${due} heartbeats due)</td>
         <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
         <td>${formatUNIT(p.earningRate)}</td>
@@ -3870,9 +3882,11 @@ function refreshStorage() {
   const statBar = $('#storageNetworkStatBar') as HTMLElement | null;
   const providers = node.ledger.getStorageProviders();
   if (statBar) {
-    const ACTIVE_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
-    const active = providers.filter(p => p.lastHeartbeat > now - ACTIVE_MS);
+    // "Active" is the LEASE, not an arbitrary 24h window — a provider that
+    // stopped renewing is not somewhere content can live, and the lease is the
+    // rule the rest of the storage path already counts by.
+    const active = providers.filter(p => node.ledger.isProviderLive(p.pub, now));
     const totalCapGB = providers.reduce((s, p) => s + p.capacityGB, 0);
     const storedBytes = active.reduce((s, p) => s + p.lastActualStoredBytes, 0);
     const freeGB = Math.max(0, totalCapGB - storedBytes / 1_073_741_824);
@@ -3883,16 +3897,27 @@ function refreshStorage() {
     // asynchronously by `refreshArchiveFileCount`; "—" until an archive answers,
     // rather than 0, which would read as "the network has no files".
     const fileCount = archiveFileCount;
-    // Average only over providers we actually measure — folding in the neutral
-    // placeholder score of a discovered provider would report a network average
-    // that is partly made up.
+    // These are averages over the providers whose CHAIN THIS NODE HOLDS, which
+    // in practice means its own accounts — uptime history is not something a
+    // node can learn about a stranger (ARCHITECTURE.md → Fan-IN: network-wide
+    // uptime history is deliberately abandoned), so a discovered provider
+    // contributes nothing to measure.
+    //
+    // They were labelled "Avg Uptime" / "Avg Score" as though they described the
+    // network. On a two-device network each device was averaging exactly one
+    // sample — its own — so the laptop showed 67%, the phone showed 17%, and
+    // neither number was an average of anything. Reported by Lucian 2026-08-16.
+    // The sample size now travels with the figure, and 0 samples reads "—".
     const measured = active.filter(p => p.discovered !== true);
-    const avgUptime = measured.length
-      ? measured.reduce((s, p) => s + (p.heartbeatsLast24h / 6), 0) / measured.length
-      : 0;
-    const avgScore = measured.length
-      ? measured.reduce((s, p) => s + p.score, 0) / measured.length
-      : 0;
+    const avg = (pick: (p: typeof measured[number]) => number) =>
+      measured.length ? measured.reduce((sum, p) => sum + pick(p), 0) / measured.length : undefined;
+    const avgUptime = avg(p => node.ledger.providerUptime(p, now) ?? 0);
+    const avgScore = avg(p => p.score);
+    const sampleNote = measured.length === 0 ? 'none measured'
+      : measured.length === 1 ? '1 measured'
+      : `${measured.length} measured`;
+    const band = (v: number | undefined) => v === undefined ? 'var(--text-muted)'
+      : v >= 0.8 ? 'var(--success)' : v >= 0.4 ? 'var(--warning)' : 'var(--danger)';
     const totalEarned = providers.reduce((s, p) => s + p.totalEarned, 0);
     const fmtGB = (gb: number) => gb >= 1024 ? `${(gb / 1024).toFixed(2)} TB` : `${gb.toFixed(1)} GB`;
     const chip = (label: string, value: string, color = 'var(--accent)') =>
@@ -3900,15 +3925,28 @@ function refreshStorage() {
         <div style="font-size:10px;color:var(--text-muted);margin-bottom:2px;letter-spacing:.5px;text-transform:uppercase;">${label}</div>
         <div style="font-size:15px;font-weight:700;color:${color};">${value}</div>
       </div>`;
+    // A compressed timing profile is a CONSENSUS input: a peer on a different
+    // epoch length rejects a correctly-signed reward block mid-chain and strands
+    // everything after it. There is no way to detect that from a block, so the
+    // profile is shown on both devices and mismatches are read off the screen.
+    const timing = storageTiming();
+    const timingChip = timing.name === 'normal' ? '' : chip(
+      '⚠ Timing',
+      `${timing.name} (${Math.round(timing.heartbeatIntervalMs / 60_000)}m beat)`,
+      'var(--warning)',
+    );
     statBar.innerHTML = [
       chip('Providers', `${active.length} / ${providers.length}`, active.length > 0 ? 'var(--success)' : 'var(--danger)'),
       chip('Files (archived)', fileCount === null ? '—' : fileCount.toLocaleString(),
         fileCount ? 'var(--success)' : 'var(--text-muted)'),
       chip('Total Capacity', fmtGB(totalCapGB)),
       chip('Free Space', fmtGB(freeGB), freeGB > 1 ? 'var(--success)' : 'var(--warning)'),
-      chip('Avg Uptime', `${Math.round(avgUptime * 100)}%`, avgUptime >= 0.8 ? 'var(--success)' : avgUptime >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
-      chip('Avg Score', avgScore.toFixed(3), avgScore >= 0.8 ? 'var(--success)' : avgScore >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
+      chip(`Uptime (${sampleNote})`,
+        avgUptime === undefined ? '—' : `${Math.round(avgUptime * 100)}%`, band(avgUptime)),
+      chip(`Score (${sampleNote})`,
+        avgScore === undefined ? '—' : avgScore.toFixed(3), band(avgScore)),
       chip('Total Earned', formatUNIT(totalEarned)),
+      timingChip,
     ].join('');
   }
 
@@ -3934,14 +3972,32 @@ function refreshStorage() {
       // was the default value, not a result.
       const measuredPerf = node.storage.getReceipts(p.pub).length > 0;
       const noProbe = dash('not measured — no content has been fetched from this provider yet');
-      const uptime = unknown ? noChain : `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
+      // One definition, shared with the SCORE column beside it and with
+      // getUptimePct. These used to divide by a flat 6 while the score divided by
+      // heartbeats-since-registration, so the two columns disagreed about the
+      // same provider — 17% next to a score that had priced it far higher.
+      const uptimeFraction = node.ledger.providerUptime(p);
+      const uptime = uptimeFraction === undefined
+        ? noChain
+        : `${Math.round(uptimeFraction * 100)}%`;
+      // We cannot know a discovered provider's uptime HISTORY — that is the
+      // deliberately-abandoned network-wide record (ARCHITECTURE.md → Fan-IN).
+      // But its latest signed heartbeat came with the discovery record, and
+      // freshness IS directly checkable, so show that instead of nothing: it is
+      // the safety-critical half, and it answers "why can't I see the other
+      // device's stats?" honestly rather than with a dash.
+      const lastSeen = p.lastHeartbeat > 0
+        ? `<div style="font-size:10px;color:var(--text-muted)">seen ${fmtAgo(Date.now() - p.lastHeartbeat)}</div>`
+        : '';
+      const leaseLive = node.ledger.isProviderLive(p.pub);
       const latency = measuredPerf && p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : noProbe;
       const spotCheck = measuredPerf ? `${Math.round(p.spotCheckPassRate * 100)}%` : noProbe;
       const scoreColor = p.score >= 0.8 ? 'var(--success)' : p.score >= 0.4 ? 'var(--warning)' : 'var(--danger)';
       return `<tr${isMine ? ' style="background:rgba(34,211,238,0.04);"' : ''}>
-        <td>${copyBtn(p.pub)}${isMine ? ' <span style="color:var(--accent);font-size:11px;">(you)</span>' : ''}</td>
+        <td>${copyBtn(p.pub)}${isMine ? ' <span style="color:var(--accent);font-size:11px;">(you)</span>' : ''}${
+          leaseLive ? '' : ' <span style="color:var(--warning);font-size:11px;" title="lease lapsed — not counted toward redundancy until it heartbeats again">(lapsed)</span>'}</td>
         <td>${p.capacityGB.toLocaleString()} GB</td>
-        <td>${uptime}</td>
+        <td>${uptime}${lastSeen}</td>
         <td>${latency}</td>
         <td>${spotCheck}</td>
         <td>${unknown ? noChain : `<strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong>`}</td>

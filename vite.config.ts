@@ -112,6 +112,17 @@ export default defineConfig(({ command }) => {
     __REQUIRED_ATTESTERS__: JSON.stringify(
       process.env.REQUIRED_ATTESTERS ? Number(process.env.REQUIRED_ATTESTERS) : (process.env.LOCAL_ONLY ? 1 : 2),
     ),
+    // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION — `STORAGE_TIMING=fast` compresses
+    // every storage duration by 120× (2-min heartbeat, 12-min reward epoch,
+    // 6-min lease) so the lease/repair/reward cycle is testable in a sitting
+    // instead of a day. Ratios are unchanged, so the rules under test are the
+    // rules that ship. See provider-ledger.ts → StorageTimingProfile.
+    //
+    // A build with no env var bakes 'normal'. It is a CONSENSUS input, so every
+    // client must agree — restart the dev server for BOTH devices after changing
+    // it, wipe first (epoch numbering changes), and check the badge on the
+    // Storage tab.
+    __STORAGE_TIMING__: JSON.stringify(process.env.STORAGE_TIMING || 'normal'),
   },
   resolve: {
     alias: {
