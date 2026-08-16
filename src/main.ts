@@ -1473,6 +1473,19 @@ function refreshRelays() {
     list.innerHTML = '<p style="font-size:12px;color:var(--text-dim);margin:0;">No community relays known yet.</p>';
     return;
   }
+  // ONE ROW PER RELAY, not per address. The registry is keyed by multiaddr and a
+  // relay legitimately has several — a dev relay is reachable at
+  // /ip4/127.0.0.1/… from the laptop and at /dns4/<tunnel-host>/… from the
+  // phone — while "Live" is a property of the PEER. So the same relay appeared
+  // twice, both rows green, including for an address the device could not
+  // possibly reach: on the phone, a Live "localhost" relay. Reported by Lucian,
+  // 2026-08-16.
+  const grouped = new Map<string, typeof relays>();
+  for (const r of relays) {
+    const list = grouped.get(r.peerId);
+    if (list) list.push(r); else grouped.set(r.peerId, [r]);
+  }
+  const byPeer = [...grouped.entries()];
   const prevScroll = (list.querySelector('div') as HTMLDivElement | null)?.scrollLeft ?? 0;
   list.innerHTML = `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;"><table style="width:100%;min-width:480px;font-size:12px;border-collapse:collapse;">
     <thead><tr style="color:var(--text-dim);text-align:left;">
@@ -1482,29 +1495,33 @@ function refreshRelays() {
       <th style="padding:4px 8px;">Failures</th>
       <th style="padding:4px 8px;"></th>
     </tr></thead>
-    <tbody>${relays.map(r => {
-      const live = connected.has(r.peerId);
-      const ago = Math.floor((Date.now() - r.lastSeen) / 1000);
+    <tbody>${byPeer.map(([peerId, addrs]) => {
+      const live = connected.has(peerId);
+      const lastSeen = Math.max(...addrs.map(a => a.lastSeen));
+      const ago = Math.floor((Date.now() - lastSeen) / 1000);
       const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago / 60)}m ago` : `${Math.floor(ago / 3600)}h ago`;
+      const fails = Math.min(...addrs.map(a => a.failCount));
       return `<tr>
-        <td style="padding:4px 8px;" title="${live
-          ? 'direct libp2p connection open'
+        <td style="padding:4px 8px;vertical-align:top;" title="${live
+          ? 'direct libp2p connection open to this relay'
           : 'no direct libp2p connection. Over the HTTPS tunnel a phone CANNOT dial a raw-IP ws:// relay (mixed content), so only the same-origin dev relay is ever Live there — the others are still reached over HTTP and still carry your traffic via relay-to-relay federation.'}"><span style="color:${
           live ? 'var(--success)' : 'var(--warning)'}">&#9679;</span> ${live ? 'Live' : 'No P2P link'}</td>
-        <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim);" title="${escHtml(r.addr)}">${escHtml(trunc(r.addr, 40))}</td>
-        <td style="padding:4px 8px;">${agoStr}</td>
-        <td style="padding:4px 8px;">${r.failCount}</td>
-        <td style="padding:4px 8px;"><button class="btn btn-outline" style="padding:2px 8px;font-size:11px;" data-remove-relay="${escHtml(r.addr)}">Remove</button></td>
+        <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim);">${addrs.map(a =>
+          `<div title="${escHtml(a.addr)}">${escHtml(trunc(a.addr, 40))}</div>`).join('')}</td>
+        <td style="padding:4px 8px;vertical-align:top;">${agoStr}</td>
+        <td style="padding:4px 8px;vertical-align:top;">${fails}</td>
+        <td style="padding:4px 8px;vertical-align:top;"><button class="btn btn-outline" style="padding:2px 8px;font-size:11px;" data-remove-relay="${escHtml(addrs.map(a => a.addr).join('|'))}">Remove</button></td>
       </tr>`;
     }).join('')}</tbody></table></div>`;
   const scroller = list.querySelector('div') as HTMLDivElement | null;
   if (scroller && prevScroll) scroller.scrollLeft = prevScroll;
   list.querySelectorAll('[data-remove-relay]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const addr = btn.getAttribute('data-remove-relay')!;
-      await node.net.markRelayFailed(addr);
-      await node.net.markRelayFailed(addr);
-      await node.net.markRelayFailed(addr);
+      // Remove drops the RELAY, so every address it is known by goes — leaving
+      // one behind would resurrect the row on the next gossip.
+      for (const addr of btn.getAttribute('data-remove-relay')!.split('|')) {
+        for (let i = 0; i < 3; i++) await node.net.markRelayFailed(addr);
+      }
       refreshRelays();
     });
   });
