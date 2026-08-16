@@ -1000,6 +1000,7 @@ export class StorageManager extends EventEmitter {
     }
 
     const providers = this.selectProviders(target);
+    console.log(`[StorageManager] distributeContent: ${providers.length} provider(s) selected for ${cid.slice(0, 16)}…`);
     if (providers.length === 0) {
       // Staging, not failure. The bytes exist only here, so the CID must be
       // recorded durably and retried — a purely in-memory note is destroyed by
@@ -1135,14 +1136,23 @@ export class StorageManager extends EventEmitter {
       return;
     }
 
+    // Every rejection below says WHY. A silent `return` in this handler is
+    // indistinguishable from "the request never arrived", and telling those two
+    // apart consumed most of a day's debugging on 2026-08-16.
     const provider = this.ledger.storageProviders.get(myProviderPub);
     if (!provider || provider.capacityGB === 0) {
+      console.warn(`[StorageManager] Ignoring cache request: ${myProviderPub.slice(0, 12)}… is not a registered provider here`);
       return;
     }
 
-    // Only the device that registered should serve - prevents both devices from
-    // responding when the same account is loaded on two machines.
-    if (!this.servesFromThisDevice(myProviderPub)) return;   // fails closed
+    // Only the device that registered should serve — two devices writing for one
+    // account fork its chain, and a forked account is frozen permanently.
+    if (!this.servesFromThisDevice(myProviderPub)) {
+      console.warn(`[StorageManager] Ignoring cache request: ${myProviderPub.slice(0, 12)}… is registered on `
+        + `device ${provider.deviceId?.slice(0, 8) || '(none)'}…, this is ${getDeviceId().slice(0, 8)}…. `
+        + `Press Serve here to take over custody.`);
+      return;
+    }
 
     // Verify the uploader's signature
     const payload = `cache:${req.cid}:${req.uploaderPub}:${req.timestamp}`;
