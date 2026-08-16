@@ -755,6 +755,52 @@ predicted:
   for a scale it does not have. Applied to the provider poll and the spot-check
   sweep — the two fixed cadences this section warned about.
 
+### Multi-device custody: per-device chains (DECIDED 2026-08-16)
+
+**Decision (Lucian):** an account may serve storage from MANY devices. Declared
+capacity, stored bytes, uptime, score and rewards are all per-DEVICE. **Each
+device gets its own chain**, with the account signing a delegation.
+
+Two reasons, and the second is the one that rules out the obvious alternative:
+
+1. An account is one chain and a chain has ONE writer. The heartbeat is an
+   *unattended periodic* writer, so two devices on one chain eventually append at
+   the same index — equivocation, which voids the balance and freezes the account
+   network-wide. Today's per-device lock exists for exactly this, and it locked
+   the user out rather than solving it.
+2. **Devices must not be doxxed by sharing a chain.** One chain per person would
+   publish how many devices they run, their uptime patterns, their country codes
+   and their online hours, all correlated.
+
+**Also decided: devices of one account NEVER count as two replicas.** They share
+a failure domain — one owner, one home, one power cut — so counting them
+separately overstates durability exactly where it matters.
+
+#### The open question these two decisions create
+
+They pull against each other, and against the mint:
+
+- A **public** delegation ("device D belongs to account A") re-links precisely
+  what separate chains separated, defeating reason 2.
+- **No** delegation makes a device identity an unlinked keypair with no
+  personhood — and personhood is what currently gates minting
+  (attestation → account → registration → `storage-reward`). Rewards meter on
+  `storedBytes`, which is self-reported; spot-checks move *score*, not the
+  on-chain ceiling. So unlimited unlinked provider identities could mint.
+- And perfect unlinkability makes the replica rule unenforceable: the network
+  cannot decline to double-count devices it cannot tell are related.
+
+**The shape that resolves all three is already in the system: the nullifier.**
+An attester issues `nid#index` per human and the engine dedups it globally
+without ever seeing the biometric (Subsystem 5). A device would take
+`nid#device-N` — capped per human, verifiable by every node, with the chain never
+naming the account. Replica dedup then keys on the shared `nid`.
+
+The cost is a *pseudonymous device-group tag*: an observer can see that several
+providers are one person, but not which person. **Awaiting Lucian's call on
+whether that is acceptable** — if not, rule 2 cannot be network-enforced and
+becomes an honour-system hint.
+
 ### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
 
 A storage node's disk is an implementation detail behind one small CID-native
