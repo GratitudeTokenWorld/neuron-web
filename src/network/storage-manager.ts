@@ -25,7 +25,7 @@ import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
 import { AccountBlock } from '../core/dag-block';
 import { KeyPair } from '../core/crypto';
-import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
+import { signStorageMsg, verifyStorageMsg } from './storage-signing';
 import { getDeviceId, getCountryCode } from './node';
 import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
 // Timing comes from the engine, never from `core/dag-block`'s legacy copies of
@@ -443,15 +443,13 @@ export class StorageManager extends EventEmitter {
   // (`key-bridge.test.ts`). Only the key FORMAT the verifier was handed was
   // wrong, which is why nothing threw — it just never matched.
 
-  /** Sign a storage-gossip payload with the engine key derived from an app keypair. */
+  /** @see network/storage-signing — one definition, so signer and verifier cannot drift. */
   private signMsg(payload: string, keys: KeyPair): string {
-    return engineSign(payload, engineKeysFromAppPrivate(keys.priv).priv);
+    return signStorageMsg(payload, keys);
   }
 
-  /** Verify a storage-gossip payload against an account's engine id. */
   private verifyMsg(signature: unknown, payload: string, enginePub: string): boolean {
-    if (typeof signature !== 'string' || !signature) return false;
-    return engineVerify(signature, payload, enginePub);
+    return verifyStorageMsg(signature, payload, enginePub);
   }
 
   // ── Custody: who counts, and what to do about it ──────────────────────────

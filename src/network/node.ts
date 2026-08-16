@@ -4,6 +4,7 @@ import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
 import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof, fetchProviders, fetchFileRecords } from './account-resolver';
 import { foldProviderBlocks } from '../engine/content/provider-discovery';
 import { pollIntervalMs } from '../engine/content/custody';
+import { signStorageMsg, verifyStorageMsg } from './storage-signing';
 import { foldFileRecords, type FileRecord } from '../engine/content/file-index';
 import { allDevRelayBases } from './dev-relay-proxy';
 import { SmokeStore, GossipSubAdapter, setTurnCredentialBases } from './smoke-store';
@@ -1103,9 +1104,11 @@ export class NeuronNode extends EventEmitter {
         this.relayResolveBases(), this.ledger.network, query, undefined, undefined,
         (base, ok) => this.reportRelayBase(base, ok),
       );
-      const verified = await foldFileRecords(records, async (payload, pub, signature) => {
-        try { return (await verifySignature(signature, pub)) === payload; } catch { return false; }
-      });
+      // File records are engine-signed by `announceFile`; verifying them the app
+      // way rejected every one, so this returned an empty index however many the
+      // archives served.
+      const verified = await foldFileRecords(records, (payload, pub, signature) =>
+        verifyStorageMsg(signature, payload, pub));
       return { records: [...verified.values()], archiveTotals };
     } catch {
       return { records: [], archiveTotals: [] };   // offline or no archive reachable
@@ -1197,8 +1200,11 @@ export class NeuronNode extends EventEmitter {
     }
     // Broadcast to providers
     const ts = Date.now();
+    // ENGINE-signed: every provider verifies this against `ownerPub`, which is an
+    // engine id. Signing it the app way meant every delete request was silently
+    // rejected and providers kept withdrawn content indefinitely.
     const payload = `delete:${cids.join(',')}:${ownerPub}:${ts}`;
-    const signature = await signData(payload, keys);
+    const signature = signStorageMsg(payload, keys);
     this.net.publishDeleteRequest({ cids, ownerPub, timestamp: ts, signature });
   }
 
