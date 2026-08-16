@@ -1065,7 +1065,11 @@ export class NeuronNode extends EventEmitter {
    */
   async refreshStorageProviders(limit = 20): Promise<number> {
     try {
-      const blocks = await fetchProviders(this.relayResolveBases(), this.ledger.network, limit);
+      const bases = this.relayResolveBases();
+      const blocks = await fetchProviders(
+        bases, this.ledger.network, limit, undefined, undefined,
+        (base, ok) => this.reportRelayBase(base, ok),
+      );
       const records = foldProviderBlocks(blocks);
       this.ledger.setDiscoveredProviders(records);
       this.emit('storage:providers-updated');
@@ -1092,7 +1096,8 @@ export class NeuronNode extends EventEmitter {
     Promise<{ records: FileRecord[]; archiveTotals: number[] }> {
     try {
       const { records, archiveTotals } = await fetchFileRecords(
-        this.relayResolveBases(), this.ledger.network, query,
+        this.relayResolveBases(), this.ledger.network, query, undefined, undefined,
+        (base, ok) => this.reportRelayBase(base, ok),
       );
       const verified = await foldFileRecords(records, async (payload, pub, signature) => {
         try { return (await verifySignature(signature, pub)) === payload; } catch { return false; }
@@ -1229,12 +1234,44 @@ export class NeuronNode extends EventEmitter {
    *  the same-origin dev relay ('' → relative path via the Vite/nginx proxy). */
   relayHttpBases(): string[] { return this.relayResolveBases(); }
 
+  /**
+   * Which multiaddr each HTTP base came from, so a base that never answers can
+   * be retired via `markRelayFailed` (which keys on the addr). Rebuilt on every
+   * call — the known-relay set changes underneath it.
+   */
+  private readonly resolveBaseAddr = new Map<string, string>();
+
+  /**
+   * Feed an archive query's per-base outcome back into the relay registry.
+   *
+   * Without this, a base that has gone away is retried on EVERY `/resolve`,
+   * `/providers` and `/files` for the life of the profile — the known-relay set
+   * is persisted and expand-only, so the client's per-query cost grows with the
+   * number of relays it has ever met rather than the number that work. Eviction
+   * needs `RELAY_FAIL_EVICT` (3) CONSECUTIVE failures and any success resets the
+   * count, so a client that is merely offline for a moment keeps its relays.
+   *
+   * The same-origin base ('') is never reported: it is the page's own origin,
+   * not a relay we could retire, and it has no addr to key on.
+   */
+  private reportRelayBase(base: string, ok: boolean): void {
+    const addr = this.resolveBaseAddr.get(base);
+    if (!addr) return;
+    if (ok) this.net.recordRelaySeen(addr);
+    else void this.net.markRelayFailed(addr);
+  }
+
   private relayResolveBases(): string[] {
     const addrs = new Set<string>();
     for (const r of this.net.getKnownRelays()) if (r.addr) addrs.add(r.addr);
     for (const a of bakedBootstrapAddrs()) addrs.add(a);
     const bases = new Set<string>(['']);
-    for (const a of addrs) bases.add(relayHttpBase(a));
+    this.resolveBaseAddr.clear();
+    for (const a of addrs) {
+      const base = relayHttpBase(a);
+      if (base) this.resolveBaseAddr.set(base, a);
+      bases.add(base);
+    }
     // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION (see network/dev-relay-proxy.ts).
     // Over the HTTPS dev tunnel — the only way to reach a camera on a phone —
     // the raw-IP `http://` bases above are blocked as mixed content, leaving a

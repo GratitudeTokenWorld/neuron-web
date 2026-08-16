@@ -7,6 +7,8 @@ import {
   looksLikeAccountPub,
   resolveAccountFromRelays,
   fetchPendingSends,
+  fetchProviders,
+  fetchFileRecords,
   type AccountRecord,
   type PendingSendHint,
 } from './account-resolver';
@@ -197,5 +199,83 @@ describe('G1 — on-demand account resolution', () => {
     );
     expect(got?._version).toBe(7);
     expect(got?.faceMapHash).toBe('b'.repeat(64));
+  });
+});
+
+// ── Per-base outcome reporting ───────────────────────────────────────────────
+
+describe('BaseResultReporter — retiring a base that never answers', () => {
+  const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+  const bases = ['https://good.example', 'https://dead.example', ''];
+
+  it('reports success and failure per base, not just overall', async () => {
+    const seen: Array<[string, boolean]> = [];
+    const fetchFn = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.startsWith('https://dead.example')) throw new Error('ERR_NAME_NOT_RESOLVED');
+      if (u.startsWith('/')) return new Response(null, { status: 502 });
+      return ok({ blocks: [] });
+    }) as unknown as typeof fetch;
+
+    await fetchProviders(bases, 'testnet', 20, fetchFn, 1_000, (b, o) => seen.push([b, o]));
+
+    expect(seen).toHaveLength(3);
+    expect(new Map(seen).get('https://good.example')).toBe(true);
+    // A DNS failure and a 502 are both "did not answer" — one throws, the other
+    // resolves with !res.ok, and a reporter that only saw thrown errors would
+    // keep retrying a relay that is up but broken.
+    expect(new Map(seen).get('https://dead.example')).toBe(false);
+    expect(new Map(seen).get('')).toBe(false);
+  });
+
+  it('pairs each outcome with the base that produced it', async () => {
+    // allSettled preserves input order; if that ever stopped holding, every
+    // outcome would be attributed to the wrong relay and the healthy ones would
+    // be evicted instead.
+    const seen: Array<[string, boolean]> = [];
+    const many = Array.from({ length: 8 }, (_, i) => `https://r${i}.example`);
+    const fetchFn = (async (url: string | URL) => {
+      const i = Number(/r(\d+)\./.exec(String(url))?.[1]);
+      if (i % 2 === 0) throw new Error('down');
+      return ok({ blocks: [] });
+    }) as unknown as typeof fetch;
+
+    await fetchProviders(many, 'testnet', 20, fetchFn, 1_000, (b, o) => seen.push([b, o]));
+    for (const [base, good] of seen) {
+      const i = Number(/r(\d+)\./.exec(base)![1]);
+      expect(good).toBe(i % 2 === 1);
+    }
+  });
+
+  it('still returns the healthy relays\' data while reporting the dead one', async () => {
+    const fetchFn = (async (url: string | URL) => {
+      if (String(url).startsWith('https://dead.example')) throw new Error('down');
+      return ok({ blocks: [] });
+    }) as unknown as typeof fetch;
+    const seen: Array<[string, boolean]> = [];
+    const out = await fetchProviders(bases, 'testnet', 20, fetchFn, 1_000, (b, o) => seen.push([b, o]));
+    expect(Array.isArray(out)).toBe(true);            // one dead base does not fail the query
+    expect(seen.some(([, o]) => o)).toBe(true);
+  });
+
+  it('is optional — callers that do not care are unaffected', async () => {
+    const fetchFn = (async () => ok({ blocks: [] })) as unknown as typeof fetch;
+    await expect(fetchProviders(bases, 'testnet', 20, fetchFn, 1_000)).resolves.toEqual([]);
+  });
+
+  it('reports for file lookups too, and per archive', async () => {
+    const seen: Array<[string, boolean]> = [];
+    const fetchFn = (async (url: string | URL) => {
+      if (String(url).startsWith('https://dead.example')) throw new Error('down');
+      return ok({ records: [], total: 7 });
+    }) as unknown as typeof fetch;
+    const out = await fetchFileRecords(bases, 'testnet', {}, fetchFn, 1_000, (b, o) => seen.push([b, o]));
+    expect(new Map(seen).get('https://dead.example')).toBe(false);
+    expect(new Map(seen).get('https://good.example')).toBe(true);
+    // One entry PER ARCHIVE that answered, never summed: two archives each
+    // holding the same 7 files are 7 files, not 14. The caller takes the max
+    // and labels it as what an archive can see.
+    expect(out.archiveTotals).toEqual([7, 7]);
+    expect(Math.max(...out.archiveTotals)).toBe(7);
   });
 });

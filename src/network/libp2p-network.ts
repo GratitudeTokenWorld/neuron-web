@@ -598,6 +598,22 @@ export class Libp2pNetwork extends EventEmitter {
     this.emit('relays:updated');
   }
 
+  /**
+   * A relay answered — clear its failure streak.
+   *
+   * The counter `markRelayFailed` increments is CONSECUTIVE failures, so
+   * something has to reset it or a relay that fails twice over a week and works
+   * in between is eventually evicted for being reliable. `upsertKnownRelay` did
+   * that for the announcement path; the archive-query path had no equivalent.
+   */
+  recordRelaySeen(addr: string): void {
+    const record = this.knownRelayMap.get(addr);
+    if (!record || record.failCount === 0) return;
+    record.failCount = 0;
+    record.lastSeen = Date.now();
+    try { void (this.db as IDBPDatabase<any>).put('knownRelays', record); } catch { /* ignore */ }
+  }
+
   async markRelayFailed(addr: string): Promise<void> {
     const record = this.knownRelayMap.get(addr);
     if (!record) return;

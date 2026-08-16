@@ -73,6 +73,23 @@ export function relayHttpBase(addr: string | undefined): string {
   return '';
 }
 
+/**
+ * Told whether each base answered, so a caller can retire one that never does.
+ *
+ * Every archive query fans out to EVERY base a node has ever heard of, and the
+ * known-relay set is persisted and expand-only — so a base that has gone away
+ * costs a full timeout on every `/resolve`, `/providers` and `/files` for the
+ * life of the profile, and the client's per-query cost grows with the number of
+ * relays it has ever met rather than with the number that work. Fan-in read from
+ * the asking side.
+ *
+ * `Libp2pNetwork.markRelayFailed` already evicts after `RELAY_FAIL_EVICT`
+ * consecutive failures; it was fed only by libp2p DIAL failures, so a relay that
+ * was undialable-but-archived-over-HTTP — or, in dev, another device's dead
+ * tunnel hostname — was never retired.
+ */
+export type BaseResultReporter = (base: string, ok: boolean) => void;
+
 export type ResolveQuery = { username: string } | { pub: string };
 
 /** A compressed-point P-256 pub key hex — how we tell a pub from a username. */
@@ -217,6 +234,7 @@ export async function fetchProviders(
   limit = 20,
   fetchFn: typeof fetch = (...args) => fetch(...args),
   timeoutMs = 5_000,
+  onBaseResult?: BaseResultReporter,
 ): Promise<Block[]> {
   const results = await Promise.allSettled(
     bases.map(async (base) => {
@@ -229,7 +247,8 @@ export async function fetchProviders(
     }),
   );
   const byHash = new Map<string, Block>();
-  for (const r of results) {
+  for (const [i, r] of results.entries()) {
+    onBaseResult?.(bases[i]!, r.status === 'fulfilled');
     if (r.status !== 'fulfilled') continue;
     for (const hex of r.value?.blocks ?? []) {
       try {
@@ -265,6 +284,7 @@ export async function fetchFileRecords(
   query: { cid?: string; owner?: string; limit?: number } = {},
   fetchFn: typeof fetch = (...args) => fetch(...args),
   timeoutMs = 5_000,
+  onBaseResult?: BaseResultReporter,
 ): Promise<{ records: FileRecord[]; archiveTotals: number[] }> {
   const params = new URLSearchParams({ network });
   if (query.cid) params.set('cid', query.cid);
@@ -285,7 +305,8 @@ export async function fetchFileRecords(
   // outrank another relay's newer withdrawal of the same file.
   const byCid = new Map<string, FileRecord>();
   const archiveTotals: number[] = [];
-  for (const r of results) {
+  for (const [i, r] of results.entries()) {
+    onBaseResult?.(bases[i]!, r.status === 'fulfilled');
     if (r.status !== 'fulfilled') continue;
     if (typeof r.value?.total === 'number') archiveTotals.push(r.value.total);
     for (const rec of r.value?.records ?? []) {
