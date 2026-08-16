@@ -360,9 +360,28 @@ A network reset is honored **only** when **signed by an operator** — the first
 `OPERATOR_COUNT` (3) accounts this relay ever attests, recorded in
 `.relay-operators.json` and served (with the current `generation`) in `/relay-info`.
 An operator reset wipes **everything, everywhere**: the relay's stores (engine
-blocks, key-blobs, usernames, account records) **and** every connected client's
-local data (clients verify the operator signature before wiping; late/offline
-clients converge via the `generation` in `/relay-info` on next start/refresh).
+blocks — which includes every `storage-*` block — key-blobs, recovery shares,
+usernames, account records and the file-record archive) **and** every connected
+client's local data (clients verify the operator signature before wiping;
+late/offline clients converge via the `generation` in `/relay-info` on next
+start/refresh).
+
+**Client-side, "everything" means all four layers** (unified 2026-08-16 — the
+three reset paths used to disagree, and only the device that pressed the button
+did the whole job):
+
+| Layer | Cleared | Holds |
+|---|---|---|
+| IndexedDB | `applyReset` | engine blocks (incl. `storage-register`/`-heartbeat`/`-reward`), accounts, tracked CIDs, the own-file index, key-blobs |
+| Engine ledger | `EngineLedger.reset()` | the provider registry, and the **durable** first-registration/heartbeat clocks — those survive a `storage-deregister` by design, but not a network reset |
+| Content store | `SmokeStore.clearAllContent()` | the actual cached bytes: smoke FS `/blocks`, `/cached`, `/cached-meta`, `/chunk-index`, `/cache-groups`, plus OPFS chunks |
+| localStorage | `wipeLocalDeviceState()` | wallet keys, the content library, enrolled face maps |
+
+The content-store row is the one that used to be skipped on every device but the
+operator's. It matters more since the custody lease landed: `reclaimLapsedLeases`
+discards orphaned bytes by looking up the local **provider record**, which the
+reset has just destroyed — so it finds nothing to reclaim, and the bytes sit
+there consuming declared capacity and inflating reported `storedBytes` forever.
 Face **slot counts** are zeroed too — they count accounts, and the wipe just
 destroyed every account — while each face's descriptor + `nid` are **kept**, so
 one human still maps to one nullifier across a reset (otherwise

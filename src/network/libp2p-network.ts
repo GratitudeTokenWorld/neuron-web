@@ -650,6 +650,13 @@ export class Libp2pNetwork extends EventEmitter {
     const networkGeneration = status.generation;
     if (this.network === 'testnet' && networkGeneration > this.generation) {
       await this.applyReset(networkGeneration);
+      // Announce it, exactly as the gossip and poll paths do. `applyReset` only
+      // clears IndexedDB; the cached content blocks, the content library and the
+      // wallet keys live outside it and are cleared by the app's handler. Without
+      // this emit a device that was merely OFFLINE during a reset came back with
+      // its chain gone but its keys, its library and its cached bytes intact —
+      // the one reset path of the three that silently did half a job.
+      this.emit('generation:changed', true);
     }
     // Self-heal a device stranded ABOVE the network's generation (an unauthorized
     // reset used to bump it locally — see clearAll). Such a device drops all

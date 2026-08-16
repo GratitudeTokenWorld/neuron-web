@@ -1917,6 +1917,38 @@ async function switchNet(network: NetworkType) {
 }
 
 // ──── Reset ────
+
+/**
+ * Everything a network reset destroys on THIS device, beyond the IndexedDB
+ * stores `Libp2pNetwork.applyReset` handles.
+ *
+ * Extracted because the three reset paths disagreed about how much of it to do.
+ * The button did all of it; a device converging on a gossiped reset cleared only
+ * IDB and its wallet keys; a device that had merely been OFFLINE during the
+ * reset cleared only IDB and was not even told. So every device except the one
+ * that pressed the button came back holding:
+ *
+ *   - **cached content blocks** (smoke FS + OPFS) for content whose chain no
+ *     longer exists. Worse since the lease landed: `reclaimLapsedLeases` discards
+ *     orphaned bytes by looking up the local PROVIDER record — which the reset
+ *     just destroyed — so it finds nothing to reclaim and the bytes stay forever,
+ *     eating the declared capacity and inflating `storedBytes`.
+ *   - **the content library** (localStorage), listing files nobody holds.
+ *   - **the enrolled face maps**, from a network where the account is gone.
+ *
+ * Found while answering "does a testnet reset wipe storage too?" — 2026-08-16.
+ */
+async function wipeLocalDeviceState(): Promise<void> {
+  node.ledger.reset();
+  node.storage.resetState();
+  if (node.store.isStarted()) await node.store.clearAllContent().catch(() => {});
+  saveContentLibrary([]);
+  localAccounts = [];
+  node.localKeys.clear();
+  localStorage.removeItem(WALLET_KEY);
+  localStorage.removeItem('neuronchain_tab');
+  localStorage.removeItem('neuronchain_facemaps');
+}
 $('#btnResetChain').addEventListener('click', () => {
   if (node.ledger.network !== 'testnet') { toast('Reset only on testnet', 'error'); return; }
   $('#resetDialog').classList.add('active');
@@ -1930,15 +1962,7 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   // otherwise just this device is cleared and the shared relays are untouched.
   const op = localAccounts[0];
   const networkWide = await node.net.clearAll(op ? engineKeysFromAppPrivate(op.keys.priv) : undefined);
-  node.ledger.reset();
-  node.storage.resetState();
-  if (node.store.isStarted()) await node.store.clearAllContent().catch(() => {});
-  saveContentLibrary([]);
-  localAccounts = [];
-  node.localKeys.clear();
-  localStorage.removeItem(WALLET_KEY);
-  localStorage.removeItem('neuronchain_tab');
-  localStorage.removeItem('neuronchain_facemaps');
+  await wipeLocalDeviceState();
   // Reload page to fully clear in-memory state. Say which reset actually happened:
   // only an operator wipes the shared network; everyone else clears just this device.
   toast(networkWide ? 'Network reset - reloading...' : 'This device cleared (not an operator) - reloading...', 'success');
@@ -3560,19 +3584,24 @@ function wireNodeEvents() {
     }
   });
   node.on('generation:reset', () => {
-    // Another peer broadcast a higher generation - reload to clear all in-memory state.
+    // A reset reached us from the network (gossip, the 2-min poll, or the
+    // startup catch-up after being offline). Clear exactly what the button
+    // clears — the IDB half is already done, and the rest used to be skipped
+    // here, leaving orphaned cached bytes and a library of dead CIDs.
+    //
     // If recovery is in progress, defer the reload until it finishes so the user
-    // doesn't lose their face scan mid-flow.
-    localAccounts = [];
-    localStorage.removeItem(WALLET_KEY);
-    if (isRecovering) {
-      pendingGenerationReset = true;
-      toast('Network generation updated - will reload after recovery', 'info');
-      return;
-    }
-    toast('Network reset received - reloading...', 'info');
-    writeReloadLog('generation:reset from network peer');
-    setTimeout(() => location.reload(), 800);
+    // doesn't lose their face scan mid-flow. The wipe still runs: the chain it
+    // describes is already gone either way.
+    void wipeLocalDeviceState().catch(() => {}).finally(() => {
+      if (isRecovering) {
+        pendingGenerationReset = true;
+        toast('Network generation updated - will reload after recovery', 'info');
+        return;
+      }
+      toast('Network reset received - reloading...', 'info');
+      writeReloadLog('generation:reset from network peer');
+      setTimeout(() => location.reload(), 800);
+    });
   });
   node.net.on('peer:connected', (url: unknown) => {
     addLog(`Relay connected: ${url}`, 'success');
