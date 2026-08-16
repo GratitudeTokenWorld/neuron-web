@@ -1,5 +1,5 @@
 import { verifyBlock, type Block } from '../core/block.js';
-import type { StorageProviderState } from './provider-ledger.js';
+import { MAX_OFFLINE_MS, type StorageProviderState } from './provider-ledger.js';
 
 /**
  * Learning about storage providers you do not hold the chain of.
@@ -45,19 +45,34 @@ import type { StorageProviderState } from './provider-ledger.js';
  * Lives here rather than in `relay/` because `relay/` is typechecked by nothing
  * and tested by nothing.
  */
-export function selectDiscoveryBlocks(blocks: readonly Block[], limit: number): Block[] {
+export function selectDiscoveryBlocks(
+  blocks: readonly Block[],
+  limit: number,
+  now: number = Date.now(),
+): Block[] {
   const registers = new Map<string, Block>();
   const heartbeats = new Map<string, Block>();
+  const deregisters = new Map<string, Block>();
   for (const b of blocks) {
     const into = b.type === 'storage-register' ? registers
       : b.type === 'storage-heartbeat' ? heartbeats
+      : b.type === 'storage-deregister' ? deregisters
       : undefined;
     if (!into) continue;
     const prev = into.get(b.accountId);
     if (!prev || b.index > prev.index) into.set(b.accountId, b);
   }
+
+  /** Has this account left? Its newest storage block being a deregister says so. */
+  const gone = (pub: string) => {
+    const dr = deregisters.get(pub);
+    if (!dr) return false;
+    const reg = registers.get(pub);
+    return !reg || dr.index > reg.index;
+  };
+
   const ranked = [...registers.entries()]
-    .filter(([, reg]) => (reg.storage?.capacityGB ?? 0) > 0)
+    .filter(([pub, reg]) => (reg.storage?.capacityGB ?? 0) > 0 && !gone(pub))
     .sort((a, b) => (heartbeats.get(b[0])?.timestamp ?? 0) - (heartbeats.get(a[0])?.timestamp ?? 0))
     .slice(0, Math.max(0, limit));
 
@@ -66,6 +81,22 @@ export function selectDiscoveryBlocks(blocks: readonly Block[], limit: number): 
     out.push(reg);
     const hb = heartbeats.get(pub);
     if (hb && hb.index > reg.index) out.push(hb);
+  }
+
+  // Serve recent departures too — a TOMBSTONE, for the same reason the file
+  // index serves withdrawals. Omitting the provider is not enough: a client asks
+  // several relays and takes the UNION, so one relay that missed the deregister
+  // and still serves the register would resurrect it. The client folds by chain
+  // index, so a single relay carrying the departure is enough to settle it.
+  //
+  // Bounded by the same derived window as file tombstones: past
+  // `2 × MAX_OFFLINE_MS` the lease has lapsed by any measure, the provider
+  // cannot be selected for custody, and its stale register has long since sunk
+  // below the freshness ranking above.
+  for (const [pub, dr] of deregisters) {
+    if (!gone(pub)) continue;
+    if (now - dr.timestamp > 2 * MAX_OFFLINE_MS) continue;
+    out.push(dr);
   }
   return out;
 }
@@ -105,19 +136,31 @@ export const UNKNOWN_SCORE = 0.5;
 export function foldProviderBlocks(blocks: readonly Block[]): DiscoveredProvider[] {
   const registers = new Map<string, Block>();
   const heartbeats = new Map<string, Block>();
+  const deregisters = new Map<string, Block>();
 
   for (const b of blocks) {
-    if (b.type !== 'storage-register' && b.type !== 'storage-heartbeat') continue;
+    if (b.type !== 'storage-register' && b.type !== 'storage-heartbeat'
+      && b.type !== 'storage-deregister') continue;
     let ok = false;
     try { ok = verifyBlock(b); } catch { ok = false; }
     if (!ok) continue;
-    const into = b.type === 'storage-register' ? registers : heartbeats;
+    const into = b.type === 'storage-register' ? registers
+      : b.type === 'storage-heartbeat' ? heartbeats
+      : deregisters;
     const prev = into.get(b.accountId);
     if (!prev || b.index > prev.index) into.set(b.accountId, b);
   }
 
   const out: DiscoveredProvider[] = [];
   for (const [pub, reg] of registers) {
+    // A departure supersedes the registration it ends. Without this a
+    // deregistered provider stayed in every other node's list forever: the
+    // registry deleted its own record, `setDiscovered` replaced the whole
+    // discovered set — and the next poll put it straight back, because nothing
+    // in the discovery path had ever looked at `storage-deregister`.
+    // Found by Lucian, 2026-08-16, running TESTPLAN T8 step 4.
+    const dr = deregisters.get(pub);
+    if (dr && dr.index > reg.index) continue;
     const capacityGB = reg.storage?.capacityGB ?? 0;
     if (capacityGB <= 0) continue;                 // deregistered or malformed
     const hb = heartbeats.get(pub);

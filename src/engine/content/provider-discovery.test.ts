@@ -227,3 +227,80 @@ describe('selectDiscoveryBlocks (what an archive serves)', () => {
     expect(selectDiscoveryBlocks([signed(a, 'storage-register', 1, DAY, { capacityGB: 0 })], 10)).toEqual([]);
   });
 });
+
+// ── Departures ───────────────────────────────────────────────────────────────
+
+describe('deregistration must reach every node', () => {
+  const T0 = 1_000 * 24 * 60 * 60 * 1000;
+
+  it('a departed provider is not served in the discovery page', () => {
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 1_000, {});
+    const page = selectDiscoveryBlocks([reg, dr], 20, T0 + 2_000);
+    expect(page.some(b => b.type === 'storage-register')).toBe(false);
+  });
+
+  it('but the departure ITSELF is served — a union of relays needs a tombstone', () => {
+    // Omitting the provider is not enough. A client asks several relays and
+    // takes the union, so one relay that missed the deregister and still serves
+    // the register would resurrect it. One relay carrying the departure settles
+    // it, because the fold compares chain indexes.
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 1_000, {});
+    const page = selectDiscoveryBlocks([reg, dr], 20, T0 + 2_000);
+    expect(page.filter(b => b.type === 'storage-deregister')).toHaveLength(1);
+  });
+
+  it('the fold drops a provider whose newest block is a departure', () => {
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const hb = signed(k, 'storage-heartbeat', 2, T0 + 100, { storedBytes: GB_BYTES });
+    const dr = signed(k, 'storage-deregister', 3, T0 + 200, {});
+    expect(foldProviderBlocks([reg, hb])).toHaveLength(1);       // still serving
+    expect(foldProviderBlocks([reg, hb, dr])).toHaveLength(0);   // gone
+  });
+
+  it('survives the union: one relay\'s stale register plus another\'s departure', () => {
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 1_000, {});
+    // Deliberately reversed — arrival order must not decide this, chain index must.
+    expect(foldProviderBlocks([dr, reg])).toHaveLength(0);
+  });
+
+  it('a provider that LEFT and came back is serving again', () => {
+    const k = generateKeyPair();
+    const reg1 = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 100, {});
+    const reg2 = signed(k, 'storage-register', 3, T0 + 200, { capacityGB: 5, deviceId: 'd' });
+    const folded = foldProviderBlocks([reg1, dr, reg2]);
+    expect(folded).toHaveLength(1);
+    expect(folded[0]!.capacityGB).toBe(5);       // the CURRENT declaration
+  });
+
+  it('stops serving an ancient departure — the lease has lapsed by every measure', () => {
+    // Bounded like a file tombstone: past 2x MAX_OFFLINE the provider cannot be
+    // selected for custody anyway, and its stale register has long since sunk
+    // below the freshness ranking. Unbounded departures would grow forever.
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 1_000, {});
+    const long = T0 + 1_000 + 2 * MAX_OFFLINE_MS + 1;
+    expect(selectDiscoveryBlocks([reg, dr], 20, long)).toHaveLength(0);
+  });
+
+  it('a departure does not consume a slot from the provider limit', () => {
+    const live = Array.from({ length: 3 }, (_, i) => {
+      const k = generateKeyPair();
+      return signed(k, 'storage-register', 1, T0 + i, { capacityGB: 10, deviceId: `d${i}` });
+    });
+    const k = generateKeyPair();
+    const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'gone' });
+    const dr = signed(k, 'storage-deregister', 2, T0 + 1_000, {});
+    const page = selectDiscoveryBlocks([...live, reg, dr], 3, T0 + 2_000);
+    expect(page.filter(b => b.type === 'storage-register')).toHaveLength(3);
+    expect(page.filter(b => b.type === 'storage-deregister')).toHaveLength(1);
+  });
+});

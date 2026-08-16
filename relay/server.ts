@@ -905,7 +905,7 @@ async function main() {
           if (!String(row.type || '').startsWith('storage-')) continue;
           try { blocks.push(decodeBlock(hexToBytes(row.blockHex))); } catch { /* skip bad row */ }
         }
-        const selected = selectDiscoveryBlocks(blocks, limit);
+        const selected = selectDiscoveryBlocks(blocks, limit, Date.now());
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify({
           blocks: selected.map(b => bytesToHex(encodeBlock(b))),
