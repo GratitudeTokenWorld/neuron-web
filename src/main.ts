@@ -4100,14 +4100,28 @@ function refreshStorage() {
       const lastSeen = p.lastHeartbeat > 0
         ? `<div style="font-size:10px;color:var(--text-muted)">seen ${fmtAgo(Date.now() - p.lastHeartbeat)}</div>`
         : '';
+      // Bytes held and country come out of the provider's OWN signed heartbeat,
+      // exactly like the declared capacity beside them — so they are knowable
+      // about a stranger and were simply not being shown. What stays "—" is what
+      // genuinely cannot be known without holding the chain (uptime history,
+      // score, earnings) or without having fetched from them (latency, spot
+      // check). The row looked emptier than the evidence warranted.
+      const usedBytes = p.lastActualStoredBytes;
+      const used = usedBytes > 0
+        ? `<div style="font-size:10px;color:var(--text-muted)" title="reported by the provider in its latest signed heartbeat">${
+            fmtBytes(usedBytes)} used</div>`
+        : (p.lastHeartbeat > 0
+          ? '<div style="font-size:10px;color:var(--text-muted)">empty</div>'
+          : '');
       const leaseLive = node.ledger.isProviderLive(p.pub);
       const latency = measuredPerf && p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : noProbe;
       const spotCheck = measuredPerf ? `${Math.round(p.spotCheckPassRate * 100)}%` : noProbe;
       const scoreColor = p.score >= 0.8 ? 'var(--success)' : p.score >= 0.4 ? 'var(--warning)' : 'var(--danger)';
       return `<tr${isMine ? ' style="background:rgba(34,211,238,0.04);"' : ''}>
         <td>${copyBtn(p.pub)}${isMine ? ' <span style="color:var(--accent);font-size:11px;">(you)</span>' : ''}${
+          p.countryCode ? ` <span style="color:var(--text-muted);font-size:11px;" title="self-reported in the provider's signed heartbeat">${escHtml(p.countryCode)}</span>` : ''}${
           leaseLive ? '' : ' <span style="color:var(--warning);font-size:11px;" title="lease lapsed — not counted toward redundancy until it heartbeats again">(lapsed)</span>'}</td>
-        <td>${p.capacityGB.toLocaleString()} GB</td>
+        <td>${p.capacityGB.toLocaleString()} GB${used}</td>
         <td>${uptime}${lastSeen}</td>
         <td>${latency}</td>
         <td>${spotCheck}</td>
