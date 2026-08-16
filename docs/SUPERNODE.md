@@ -51,6 +51,7 @@ tier answer queries without becoming an authority.
 | `GET /token?id=&network=` | an NFT's mint proof (**G2**): the MINTER's open + head + `nft-mint` blocks with audit paths | `verifyMintProof` — token id match, mint inclusion on a verified-human chain |
 | `GET /block?hash=&network=` | one archived block, for explorer search | content hash + account signature; display-only, never applied to the ledger |
 | `GET /providers?network=&limit=` | storage providers this archive knows: each one's latest `storage-register` + `storage-heartbeat`, hex-encoded. Bounded (default 20, cap 50) | each block verified client-side (`foldProviderBlocks`) — the relay serves the PROVIDER's own signatures, so it can choose what to show but cannot invent, inflate or forge. Ask several relays for the union |
+| `GET /files?network=[&cid=][&owner=][&limit=]` | file records this archive holds, plus `total` (**this archive's** count, never a network total). Bounded (default 50, cap 200). Closed the last `O(N)` in storage: clients used to ingest a global `files` topic and persist a record for every file on the network | each record verified client-side (`foldFileRecords`), which REBUILDS the signed payload from the record's own fields — so a relay cannot invent a file, inflate a size, or attribute one to the wrong account. Withdrawals are served as tombstones (`removed: true`), because absence cannot tell a holder a file was withdrawn |
 | `POST /face-verify/challenge` \| `/verify` | personhood attestation (attester role) | attestation signature + quorum on the open block |
 | `POST /keyblob` \| `GET /keyblob?username=\|pub=&network=` | targeted key-blob store/fetch (replaced the global `keyblobs` gossip topic 2026-08-15 — an O(N) broadcast and harvesting surface) | blob opens only with face+PIN+share (v3); `linkedAnchor` re-checked against the on-chain record at recovery. Per-IP limited |
 | `POST /recovery-share` | store this relay's **Shamir 2-of-n share** of the account's v3 secret, bound to the owner's `nid` | signed `recovery-share:{accountId}:{network}:{x}:{share}:{ts}` by the account's engine key (the x-coordinate is inside the signature so it cannot be stripped/renumbered); newest signed `ts` wins |
@@ -125,6 +126,7 @@ the node's identity and breaks the baked bootstrap address).
 | `.relay-recovery-shares.json` | **v3 recovery shares** — this relay's Shamir 2-of-n share of each account's third key factor, nid-bound, with server-side backoff state. Written `0600`; **never** logged or served except via the face-gated release. One share alone reveals nothing about the secret | affected accounts can never complete a fresh-device recovery again once fewer than 2 relays hold a share (devices with the secret cached still work). Check the OTHER relays' copies before wiping this file |
 | `.relay-usernames.json` | username→accountId registry (uniqueness; first-attested wins) | username uniqueness resets — duplicates could be attested |
 | `.relay-accounts.json` | account-record archive (G1 directory tier): engine-verified records served via `/resolve` | re-fills from owners' 20 s publish ticks; until then clients can't resolve usernames this relay alone knew |
+| `.relay-files.json` | file-record archive: uploader-signed records served via `/files`. Verified on ingest (WebCrypto ECDSA over a payload rebuilt from the record's fields), so a forged record cannot evict a real one. Capped at 200k records, oldest dropped **with a log line** | re-fills from owners' periodic re-announcements; until then the Storage tab's file count reads low on this relay |
 | `.relay-operators.json` | the first 3 accountIds attested — the only accounts allowed to wipe this relay | anyone could re-claim an operator slot; **kept across wipes** |
 
 ---
@@ -416,7 +418,7 @@ Net effect: a reset landing on any one relay propagates to all of them within
   pm2 stop neuron-relay
   cd .relay-data
   rm -f .relay-engine-blocks.json .relay-keyblobs.json .relay-usernames.json \
-        .relay-accounts.json .relay-operators.json \
+        .relay-accounts.json .relay-files.json .relay-operators.json \
         .relay-recovery-shares.json                         # operators re-elect
   # ^ shares go with the accounts they unlock: a wipe destroys the chains, so
   #   keeping orphaned third factors around would only be attack surface.

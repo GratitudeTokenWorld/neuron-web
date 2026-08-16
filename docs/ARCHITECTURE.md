@@ -33,7 +33,7 @@ The single acceptance criterion everything below serves:
 
 > **Implementation status (this repo IS the reference implementation).** This
 > document is the design; `neuron-web/src` is its realization. Phases 0–4 plus the
-> end-to-end capstone are built and tested (`npm test` — 270 passing, typechecked),
+> end-to-end capstone are built and tested (`npm test` — 458 passing, typechecked),
 > and **all 7 verification invariants below are demonstrated by tests** (including
 > #7, archival, and #4/#6 by dedicated adversarial tests). What remains is purely
 > transport/integration that a simulation cannot prove — live libp2p+Kademlia, a
@@ -408,17 +408,33 @@ server-mode + content routing, deterministic relay federation/directory.
 
 ## Subsystem 4 — Content & media storage
 
-**Current limits:** global gossiped file index replicated to every node
-([libp2p-network.ts:236,1479](src/network/libp2p-network.ts#L236)); 100MB uploads
-crash on IDB quota ([smoke-store.ts store/cache paths]); `REDUNDANCY_TARGET=10`
-push model; DHT unused for content. The provider **economy** is no longer a
-limit — see *What of this is implemented* below.
+**Current limits:** 100MB uploads crash on IDB quota ([smoke-store.ts
+store/cache paths]); DHT unused for content. The provider **economy**, the
+**custody/repair** loop and the **file index** are no longer limits — see *What
+of this is implemented* below and *The file index* further down. (The global
+gossiped file index that used to head this list was replicated to every node —
+`O(total files)`; it was closed 2026-08-15 the way G1 and G3 were, by holding
+your own and asking about everyone else's.)
 
 **Target design**
-- **DHT provider records replace the global index.** On store, call
-  `contentRouting.provide(cid)`; on fetch, `findProviders(cid)` then pull. The
-  `files` gossip topic becomes shard/interest-scoped (announce only to followers
-  / shard), not global.
+- **Nobody holds the global file index.** *(Shipped 2026-08-15, by verified
+  archive query rather than by DHT — see the note below.)* A node keeps records
+  for the files it OWNS, which is bounded by its own behaviour; anything else is
+  asked for on demand (`GET /files`, `src/engine/content/file-index.ts`) and
+  verified against the UPLOADER's own signature, with the payload rebuilt from
+  the record's fields so an inflated size cannot ride a valid one. Announcements
+  still gossip — that is how archives learn them — but no client keeps another
+  account's.
+
+  **Why not the DHT, which this document originally specified.** `kadDHT` in
+  this build is client-mode only and unused for content, so "use the DHT" is a
+  transport project before it is an index one; meanwhile the
+  verified-archive-query path is built, deployed and probe-tested, and is what
+  G1 and G3 both settled on for the same shape of problem. The DHT remains the
+  better long-term answer for *provider* records (who holds these bytes) —
+  `contentRouting.provide` / `findProviders`, with `engine/content/dht.ts`
+  already modelling it. This item was about *file* records (what these bytes
+  are), which is the half a bounded query answers well.
 - **Keep the content-addressed CDN.** CIDs, 8MB chunking, OPFS/IDB tiering,
   manifests, Range requests, and HTTP-over-WebRTC
   ([smoke-store.ts](src/network/smoke-store.ts)) are a solid decentralized CDN —
@@ -499,13 +515,59 @@ re-homed, and cannot park stale copies to farm storage rewards.
 
 #### What of this is implemented (2026-08-15)
 
+**Both halves, as of 2026-08-15.**
+
 The **on-chain half** — the lease and the evidence that prices it. Four engine
 block types on the provider's own account chain (`storage-register`,
 `-deregister`, `-heartbeat`, `-reward`; payload in `block.storage`), with the
 registry, lease liveness and reward arithmetic in the pure
-`src/engine/content/provider-ledger.ts`. The **repair half** (consequences 1's
-rejoin-discard, 2's publish handoff, 3's verified-live replica counting) is not
-built yet — see CLAUDE.md → *Where to pick up*.
+`src/engine/content/provider-ledger.ts`.
+
+The **repair half** is `src/engine/content/custody.ts` — pure policy, called by
+`src/network/storage-manager.ts`, which is covered by no test at all (hence the
+split). Each of the three consequences above, in order:
+
+1. **Rejoin discard** is `planRejoin`. Past `MAX_OFFLINE_MS` a returning node
+   discards every foreign byte and refills from declared capacity; inside the
+   lease it keeps everything, so a reboot costs no re-transfer. It replaced an
+   auto-deregister on a private 24 h rule, which was the wrong verb twice over:
+   the lease already stops a silent node counting, and deregistering left the
+   actual problem — a disk full of content the network re-homed hours ago —
+   entirely in place.
+2. **Publish handoff** is `MIN_REPLICAS` + `awaitHandoff`/`isHandedOff`/
+   `stagingCids`. A publish is incomplete until two LIVE leases confirm; until
+   then the CID is *staging* and is persisted, so closing the tab no longer
+   destroys it. (The pre-existing in-memory `pendingCids` note did not survive a
+   reload, which is precisely the failure the handoff exists to prevent.)
+3. **Verified-live counting** is `liveHolders` + `planRepair`, and it is now the
+   only count that may satisfy a target anywhere in the storage path. Lapsed
+   holders are *dropped*, not merely uncounted, or the holder set grows without
+   bound as the fleet churns.
+
+Repair is triggered by USE (a failed read calls `repairOnReadFailure`) and by
+consecutive spot-check failures — `FAILURES_BEFORE_EVICTION` = 2, because one
+failed WebRTC dial through a flaky relay is not evidence of loss and evicting on
+it made every relay hiccup start a repair round against holders that were fine.
+
+**Measured, not asserted** (`src/engine/sim/repair.ts`, which drives the shipping
+`planRepair`/`planRejoin` rather than a model of them). Holding churn, fleet and
+lease fixed and varying only the repair budget, at ~7.9 replica-assignments lost
+per hour:
+
+| repair budget | churn/h | repaired/h | min live | final mean | objects lost | durable |
+|---|---|---|---|---|---|---|
+| 1/h | 1.48 | 0.98 | 0 | 1.10 | 39/40 | no |
+| 4/h | 4.26 | 3.93 | 0 | 4.15 | 12/40 | no |
+| 8/h | 7.37 | 7.28 | 2 | 8.50 | 0 | no |
+| 16/h | 7.83 | 7.83 | 6 | 10.00 | 0 | **yes** |
+| 200/h | 7.92 | 7.92 | 10 | 10.00 | 0 | **yes** |
+
+Read the first row carefully, because it is the whole reason durability is
+stated as a flow: `churn=1.48` against `repair=0.98` looks like a near-miss, and
+39 of 40 objects were destroyed. **A collapsed network loses very little per
+tick** — there is nothing left to lose — so the rate ratio reads healthy at the
+bottom of the death spiral. Only the stock says which steady state you are in,
+which is why `durable` is defined on final replica count and not on the ratio.
 
 - **The heartbeat IS the lease renewal.** `MAX_OFFLINE_MS` = 3 heartbeat
   intervals = 12h: two missed renewals of slack, so a reboot or a flaky hour
@@ -630,11 +692,26 @@ different costs:
    fall as observed population rises, with jitter — the same reasoning as the
    heartbeat's `±5 min` jitter, applied to queries.
 
-**Not yet implemented.** Points 2, 3 and 5 are design constraints on the repair
-loop and the publish handoff, which is where they should land — see CLAUDE.md →
-*Where to pick up*. The current 10-minute provider poll is fine for a two-relay
-dev network and is exactly the kind of fixed cadence point 5 says must not
-survive contact with scale.
+**Implemented 2026-08-15**, in the repair loop and the publish handoff as
+predicted:
+
+- *Point 2* — `replicaTarget(reads)` raises a CID's ASSIGNED holders
+  logarithmically with observed demand (a hundred reads buys one more holder, a
+  thousand buys three), capped at `MAX_REPLICA_TARGET`. The target travels in the
+  `CacheRequest` rather than being read from a local constant, because demand is
+  observed by the OWNER and every other node sees a different slice of it —
+  receivers clamp it, since it is a number an attacker writes. Opportunistic
+  caches still absorb most of a spike for free and are still never counted.
+- *Point 3* — `repairOnReadFailure`: a read is the cheapest liveness check there
+  is, because it was going to happen anyway. A successful one counts as demand; a
+  failed one says every source we knew is unreachable, and re-places the content
+  immediately. Nothing polls a holder to find this out.
+- *Point 5* — `pollIntervalMs(base, population)`: `T = base × √(P/ref)`, clamped,
+  ±20 % jitter. Aggregate load on the answering tier grows as `√P` instead of `P`,
+  and freshness degrades as `√P` instead of the interval growing linearly. It
+  returns `base` below `refPopulation`, so a two-relay dev network pays nothing
+  for a scale it does not have. Applied to the provider poll and the spot-check
+  sweep — the two fixed cadences this section warned about.
 
 ### Storage backends are pluggable and OPERATOR-CONFIGURED (decided 2026-08-10)
 
@@ -793,7 +870,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 0 — Foundations | **done** | `src/engine/core` — accumulator, light-verify, identity/nullifier, attestations, partition |
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
-| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10, parity done 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine) and a filesystem adapter (`src/storage`), `ContentStore` composes a backend with `release()`/`open()` for lease cleanup. Provider economy on-chain: four `storage-*` engine block types, `src/engine/content/provider-ledger.ts` (registry + **lease liveness** + reward evidence, 31 tests), reward minting guarded by balance conservation *and* an on-chain evidence ceiling (`src/ledger/storage-ledger.test.ts`, 16 tests), provider **discovery** by verified archive query (`provider-discovery.ts` + `GET /providers`, 17 tests), `storage-manager.ts` off the legacy `DAGLedger`. Still to do: repair loop, publish handoff, file index → DHT |
+| 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10; parity 2026-08-15; repair, handoff, file index and S3 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine), a filesystem adapter and an **opt-in S3-compatible** one (`src/storage`, zero-dependency SigV4 pinned to AWS's published vectors). Provider economy on-chain: four `storage-*` engine block types, `provider-ledger.ts` (registry + **lease liveness** + reward evidence), reward minting guarded by balance conservation *and* an on-chain evidence ceiling, provider **discovery** by verified archive query (`GET /providers`). Custody policy in `content/custody.ts` — live-only replica counting, lapsed-holder repair, rejoin discard, population-scaled jittered cadences, demand-scaled serving capacity. Publish **handoff** (`awaitHandoff`/`stagingCids`, staging persisted). File index off the global topic → `GET /files` + `file-index.ts`. Repair-vs-churn **measured** in `sim/repair.ts`. Remaining: none of the Phase-3 list — see *Where this stands* |
 | 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 41/41 |
@@ -823,14 +900,19 @@ mechanism:
 | Transfer routed to a destroyed account | stale pre-reset record survived locally and outranked the live one | generation filter at the cache boundary + relay-first username resolution + newest-registration ranking |
 | "Reset testnet" did nothing to the network | operator gate read only the same-origin relay | epoch/operator aggregation across relays + relay generation follower |
 
-Next, in order — **Phase 3 continues** (its backend seam and provider-economy
-parity have both landed; see the phase table above and CLAUDE.md → *Where to
-pick up* for the full ordered list): the repair loop on top of the lease,
-publish handoff, file index → DHT, and measuring repair-vs-churn in
-`sim/archival.ts`. Then **Phase 4**. The migration seam (~123 app-layer type
-errors; see CLAUDE.md) can be paid down alongside, per caller, as each one is
-moved off the `DAGLedger` compatibility surface — `storage-manager.ts` was
-moved this way and took the count from 182 to 123.
+Next — **Phase 3's build list is complete as of 2026-08-15**: backend seam,
+provider economy, provider discovery, lease + repair, publish handoff, file index
+off the global topic, repair-vs-churn measured, and an opt-in S3 adapter. What it
+is NOT yet is *verified on the live network*: the repair loop, the handoff and
+`GET /files` are covered by unit tests and a local relay run, and the manual
+matrix rows for them (TESTPLAN T9, T10) are written and unrun. **T10 needs a
+relay deploy** — `GET /files` does not exist on the cloud boxes yet. TESTPLAN T8
+step 5 (the reward) still waits on a decision about the day boundary.
+
+Then **Phase 4**. The migration seam (~123 app-layer type errors; see CLAUDE.md)
+can be paid down alongside, per caller, as each one is moved off the `DAGLedger`
+compatibility surface — `storage-manager.ts` was moved this way and took the
+count from 182 to 123.
 
 ---
 
@@ -851,8 +933,10 @@ Each phase is independently benchmarkable; do not advance until its invariant ho
   committees; pluggable attestation quorum; global dedup via commitments.
   *Validate:* fork resolution stays shard-local; same identity cannot mint a 2nd
   account across many attesters.
-- **Phase 3 — Storage CDN + tiered nodes.** DHT provider records; interest-scoped
-  file announcements; quota-guarded chunked media; super-node archival pinning +
+- **Phase 3 — Storage CDN + tiered nodes.** Provider + file discovery that no
+  node holds globally (shipped as verified archive queries, `GET /providers` and
+  `GET /files`; DHT provider records remain the long-term form — see Subsystem 4);
+  interest-scoped file announcements; quota-guarded chunked media; super-node archival pinning +
   GC; **replica leases + rejoin cleanup**. *Validate:* 100MB+ media works; file
   discovery `O(log N)`; index size independent of total files; and the flow
   property — under continuous churn, every CID keeps `REDUNDANCY_TARGET`

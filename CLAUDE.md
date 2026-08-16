@@ -40,7 +40,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **358 tests / 64 files passing**, `npm run build` clean.
+Current baseline: **458 tests / 69 files passing**, `npm run build` clean.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -92,39 +92,59 @@ inherited:
   clock once** for the claim and the timestamp — twice across midnight builds a
   block that fails its own validation.
 
-**What remains, in this order** — the decisions in *Storage custody rules*
-below constrain all of it:
+**Phase 3's build list is DONE as of 2026-08-15** — all six remaining items
+shipped this session. What is NOT done is verifying them on the live network.
 
-1. **Lease + repair** on top of heartbeat: rejoin discard + refill from declared
-   capacity, and counting only *verified-live* replicas toward
-   `REDUNDANCY_TARGET`. The lease half exists (`isLive`, `MAX_OFFLINE_MS`); the
-   repair half does not, and `StorageManager.deregisterStaleLocalProviders`
-   still uses its own 24h rule rather than the lease.
+- **Lease + repair** → `src/engine/content/custody.ts` (pure, 30 tests), called
+  by `storage-manager.ts`. `liveHolders`/`planRepair` make live leases the only
+  count that may satisfy a target; lapsed holders are *dropped*, not merely
+  uncounted, or the set grows without bound as the fleet churns. `planRejoin`
+  discards everything foreign past `MAX_OFFLINE_MS` and keeps everything inside
+  it (a reboot costs no re-transfer). Repair fires on USE
+  (`repairOnReadFailure` — a read is the cheapest liveness check there is,
+  because it was going to happen anyway) and on **two consecutive** spot-check
+  failures: one flaky WebRTC dial is not evidence, and evicting on it made every
+  relay hiccup start a repair round against holders that were fine.
+  `deregisterStaleLocalProviders` is GONE — `reclaimLapsedLeases` replaces it,
+  because the lease already stops a silent node counting and deregistering left
+  the real problem (a disk of re-homed bytes) entirely in place.
+- **Publish handoff** → `MIN_REPLICAS` + `awaitHandoff`/`isHandedOff`/
+  `stagingCids`. Staging is **persisted**, so closing the tab no longer destroys
+  content the network has not taken custody of yet. (The old in-memory
+  `pendingCids` note did not survive a reload — precisely the failure the
+  handoff exists to prevent.)
+- **File index** → off the global topic. Clients keep own-file records only and
+  ask `GET /files` (`engine/content/file-index.ts`, `node.lookupFiles`);
+  `pruneForeignFileIndex()` is the one-time IDB migration, and it has to run
+  after keys are registered because "ours" is undecidable before that. **Done by
+  verified archive query, not DHT** — same call G1 and G3 made; rationale in
+  ARCHITECTURE.md → Subsystem 4. DHT stays the long-term form for *provider*
+  records.
+- **Repair vs churn** → `src/engine/sim/repair.ts` + tests, driving the SHIPPING
+  `planRepair`/`planRejoin` rather than a model of them. Break-even table in
+  ARCHITECTURE.md. Read its first row: `churn=1.48` vs `repair=0.98` looks like a
+  near-miss and 39/40 objects were destroyed — **a collapsed network loses very
+  little per tick**, so the rate ratio reads healthy at the bottom of the death
+  spiral. Judge the stock, never the ratio.
+- **S3 adapter** → `src/storage/s3-backend.ts` + `sigv4.ts`, zero dependencies.
+  The signer is pinned to AWS's own published vectors, because a signer tested
+  against itself passes while signing garbage. `s3BackendFromEnv` returns
+  `undefined` with no config and there is no default endpoint, bucket or
+  discovery anywhere in the tree — that is the load-bearing test in the file.
+- **TESTPLAN**: T8 unchanged (step 5 still blocked on the day-boundary
+  decision); **T9** (handoff + repair) and **T10** (file index) are new and unrun.
 
-   Build it under ARCHITECTURE.md → *Fan-IN* (decided 2026-08-15): repair on
-   **use/failure** rather than by continuously watching holders, let popularity
-   add serving capacity (caches serve bandwidth, only leased holders count for
-   durability), and make poll cadences population-scaled + jittered. **Do not**
-   subscribe to a provider's shard to watch its heartbeats — that was the
-   obvious design and it fails: a shard is a partition of accounts, so following
-   one account costs `O(N / numShards)` (~2.4M accounts at 10B). Network-wide
-   uptime history is deliberately abandoned; score providers you use from your
-   OWN spot-checks/receipts, and everyone else on a neutral prior.
-2. **Publish handoff:** a publish is incomplete until minimum replicas confirm;
-   until then the uploader's copy is staging and must be retried, or closing
-   the tab destroys the content. `checkPublishFeasibility` is real now (it
-   counts live leases with free space) but only *warns*.
-3. **File index → DHT provider records** — the remaining `O(N)` violation in
-   storage (a global gossiped file index today). Note **provider** discovery is
-   already done (`GET /providers`, below); this item is now only the FILE index.
-4. **Measure repair-rate vs churn** in `src/engine/sim/archival.ts`: it models
-   assignment and churn but NOT lease expiry/repair, so "durability is a flow"
-   is currently asserted, not measured.
-5. **S3 client adapter** — opt-in, operator-configured, never a default.
-6. **TESTPLAN T8 (storage)** — the parity work is testable end-to-end now
-   (register → heartbeat → reward → deregister across two devices).
+**Pick up here:**
 
-`storage-manager.ts` (1379 lines) has more callers than the ledger did —
+1. **Deploy the relays, then run T10.** `GET /files` exists only locally. It was
+   verified on isolated ports (`PORT=9190 RELAY_DATA_DIR=.relay-verify`) — route
+   answers, relay stable well past the 60 s timer — and the relay's WebCrypto
+   verifier was checked against real `signData` output (honest record passes;
+   inflated size, wrong key both rejected). No cloud box has any of it.
+2. **Run T9.** Steps 1–4 are one sitting; step 5 needs a >12 h absence.
+3. Then **Phase 4**, paying down the migration seam per caller.
+
+`storage-manager.ts` (~1500 lines) has more callers than the ledger did —
 enumerate them before changing what it broadcasts (see the free-rider trap
 below).
 
@@ -222,9 +242,9 @@ src/
   core/            legacy app core carried from neuronchain (dag-ledger, vote,
                    face-store, face-verify, pin-crypto, snapshot, tab-lock, …)
   network/         libp2p-network, node.ts (the node orchestrator), smoke-store CDN,
-                   storage-manager, account-resolver (G1/G2 archive queries:
-                   /resolve, /pending-sends, /head-proof, /token, /block — every
-                   response verified client-side)
+                   storage-manager, account-resolver (archive queries: /resolve,
+                   /pending-sends, /head-proof, /token, /block, /providers,
+                   /files — every response verified client-side)
   ledger/          EngineLedger — the app↔engine bridge, and where the integration
                    tests live (fraud-safety, committee-finality, multi-attester,
                    nft, counterparty-claim, …)
@@ -235,14 +255,20 @@ src/
     node/          partial replication, delta sync, archival tiering, snapshots
     consensus/     VRF (RFC 9381), sortition, committees, weight, slashing, fraud
     content/       CIDs, chunking, provider DHT, replication, block backends,
-                   provider-ledger (storage registry + custody LEASE + rewards)
+                   provider-ledger (storage registry + custody LEASE + rewards),
+                   custody (repair policy: live-only counting, rejoin discard,
+                   demand-scaled targets, jittered cadences), file-index (the
+                   own-files-only index + `GET /files` folding)
     economy/       capped reward inflation
     net/           relay federation (rendezvous hashing)
     sim/           scale-invariant harness: scenario (interest routing),
-                   directory (G1), counterparty (G2), archival, projection (10B)
-  storage/         Node-side block backends behind the engine's `BlockBackend`
-                   (filesystem today; an S3 client adapter is opt-in and
-                   OPERATOR-CONFIGURED — never a default). Own tsconfig, in
+                   directory (G1), counterparty (G2), archival, repair
+                   (durability-as-a-flow, measured), projection (10B)
+  storage/         Node-side block backends behind the engine's `BlockBackend`:
+                   filesystem (the default and the CI target) plus an
+                   S3-compatible client that is opt-in and OPERATOR-CONFIGURED —
+                   never a default, no endpoint to discover (`sigv4.ts` signs it,
+                   zero deps, pinned to AWS vectors). Own tsconfig, in
                    `npm run typecheck`.
 relay/             relay / super-node: server.ts (PORT 9090 ws, +1 tcp, +2 HTTP
                    API — see docs/SUPERNODE.md), vite-plugin.ts (dev auto-spawn),
@@ -460,7 +486,7 @@ Check this list before any deploy that is not a dev server.
 
   It fronts the **whole relay HTTP API**, not just attestation: the archive
   queries (`/resolve`, `/pending-sends`, `/head-proof`, `/token`, `/block`,
-  `/providers`) hit the same wall, so on the tunnel a phone was falling back to
+  `/providers`, `/files`) hit the same wall, so on the tunnel a phone was falling back to
   the single same-origin dev relay and silently losing every other archive — no
   cross-shard provider discovery, no counterparty proofs, no directory lookups
   beyond one node's view. `node.relayResolveBases()` adds the proxied bases;

@@ -341,6 +341,69 @@ Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
    pay only for bytes actually held). **Not testable in one sitting** — see the
    open question in the handoff before writing this step.
 
+## T9 — Publish handoff and repair (NOT YET RUN)
+
+Lease + repair and the publish handoff landed 2026-08-15. Everything below is
+observable in the console; the policy itself is unit-tested
+(`src/engine/content/custody.test.ts`, `src/engine/sim/repair.test.ts`), so what
+this checks is the WIRING — which is the half no test covers.
+
+Two devices, A (uploader) and B (registered storage provider, serving).
+
+1. **Handoff completes.** On A, upload a small file to the Storage tab.
+   **Pass:** `[StorageManager] Cache request published…`, then B logs
+   `[StorageManager] Cached …`, and A logs
+   `Handoff complete for <cid>… (N live holders) — safe to close`.
+   The count is **live** holders — B must have a current lease for it to rise.
+2. **Staging is durable.** Stop B (or upload while no provider is live). **Pass:**
+   A logs `… is STAGING on this device only` and the CID is still retried after a
+   **page reload** — the record is persisted, not in memory. Start B: the retry
+   loop hands it over and the handoff-complete line appears without a re-upload.
+   (Before this, closing the tab right after an upload destroyed the content.)
+3. **Repair on read failure.** With the file replicated, stop B, then open the
+   file on A. **Pass:** the read fails once and A logs
+   `Read failed for <cid>… — repairing now (N live holder(s))` and immediately
+   re-replicates rather than waiting for a timer. Nothing should be polling B in
+   the meantime — repair is triggered by USE, not by watching.
+4. **One flaky fetch is not data loss.** Watch a spot-check round while B is
+   briefly unreachable (e.g. its relay reconnects). **Pass:** no eviction on the
+   first failure; only a second consecutive failure logs
+   `Evicting <pub>… after 2 consecutive failures`. A single failure followed by a
+   success must leave the holder set unchanged.
+5. **Rejoin past the lease discards.** Stop B for **more than 12 h**
+   (`MAX_OFFLINE_MS`), then start it. **Pass:** B logs
+   `Rejoin <pub>…: lease lapsed …h ago … discarding N CID(s)`, its stored bytes
+   drop to ~0, and its free space on both devices' Storage tabs rises to the
+   full declared capacity. Restarting B inside 12 h instead must log
+   `lease live — keeping all N CID(s), no re-transfer needed` and delete nothing.
+6. **Lapsed holders stop counting.** While B's lease is lapsed, watch A's
+   re-replication line. **Pass:** it reads `at 0/10 live (1 confirmed ever)` —
+   the count that drives repair is live leases, and a holder that once confirmed
+   is explicitly not one.
+
+## T10 — File index is no longer global (NOT YET RUN)
+
+The last `O(N)` in storage closed 2026-08-15: clients used to ingest and persist
+a record for every file on the network. **Needs a relay deploy** — `GET /files`
+is new.
+
+1. **Archives answer.** `curl "http://80.97.27.224:9092/files?network=testnet"`
+   **Pass:** `{"records":[…],"total":N}` on both relays; `total` is that
+   archive's own count, not a network figure.
+2. **A client holds only its own.** On device B (which owns no files), open the
+   Storage tab and check `node.storage.getFileIndex().size` in the console.
+   **Pass:** 0, while device A's upload is visible in `/files` on the relays.
+   Before this change B would have held A's record.
+3. **The migration runs once.** On a device that ran an older build, watch the
+   startup log. **Pass:** `Dropped N foreign file record(s) — the index is
+   own-files-only now`, once, and 0 on the next start (the IDB store is the
+   thing that had to be emptied; filtering live gossip alone would have left it).
+4. **The stat is honest.** Storage tab → the chip reads **Files (archived)** and
+   shows `—` until an archive answers, never `0`.
+5. **Withdrawal propagates.** Delete a file on A. **Pass:** `/files?cid=<cid>`
+   on both relays returns the record with `"removed":true` (a tombstone, not an
+   absence — a holder has to be able to *learn* the file was withdrawn).
+
 ## Result log
 
 | # | Test | Result | Notes |
@@ -354,6 +417,8 @@ Storage runs on the engine as of 2026-08-15. Two devices, each with an account.
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
 | T8 | Storage provider lifecycle | ☐ | **Steps 1–4 not yet run.** Register/discover/interval/deregister were all exercised ad-hoc during development on 2026-08-15 (both devices saw each other, rate correctly 0) but not as a recorded pass. Step 5 (reward) needs a day boundary — decide the approach first |
+| T9 | Publish handoff + repair | ☐ | **Not yet run.** Written 2026-08-15 alongside the lease/repair work. Steps 1–4 are one sitting; step 5 needs a >12 h absence (`MAX_OFFLINE_MS`), so plan it overnight |
+| T10 | File index is no longer global | ☐ | **Not yet run, and BLOCKED on a relay deploy** — `GET /files` does not exist on the cloud boxes yet |
 | — | Mobile capture (part of T1) | ☑ | 2026-08-15: account created on a phone through the tunnel. Required three fixes — the capture guide was letterboxed on a portrait feed, close-eyes was unpassable below ~8 fps, and the attesters were unreachable over `https`. Face flows had never been run on a phone before |
 
 **Automated pre-check.** Before the manual matrix, run the live probe — it
