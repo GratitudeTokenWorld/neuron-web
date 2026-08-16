@@ -323,16 +323,26 @@ untestable in one session. `STORAGE_TIMING=fast` divides every storage duration
 by 120 — 2-minute heartbeat, 12-minute reward epoch, 6-minute lease — leaving
 every ratio identical, so the rules exercised are the rules that ship.
 
-```sh
+```powershell
 # 1. WIPE FIRST. epochDay = floor(ts / REWARD_EPOCH_MS), so an existing chain's
 #    epoch numbering is meaningless under the other profile.
 #    (Relay side: docs/SUPERNODE.md → Resets. Client side: clear site data.)
 # 2. Restart the dev server. BOTH devices load from it, so both get the profile.
-STORAGE_TIMING=fast npm run dev
+$env:STORAGE_TIMING = 'fast'; npm run dev
+
+# `VAR=x cmd` is bash-only and sets NOTHING in PowerShell. In Git Bash use:
+#   STORAGE_TIMING=fast npm run dev
+# `$env:` persists for the window: Remove-Item Env:STORAGE_TIMING to undo.
+# 3. Restart the tunnel too if a phone is testing — `npm run tunnel` mints a NEW
+#    trycloudflare hostname each start, and a phone left on the old URL fails
+#    every same-origin archive query with ERR_NAME_NOT_RESOLVED.
+npm run tunnel
 ```
 
-**Confirm before testing:** the Storage tab shows a ⚠ `Timing fast (2m beat)`
-chip on *both* devices. If one is missing it, that device is on production
+**Confirm before testing, two ways:** the app log shows
+`⚠ Storage timing: FAST (2min beat / 12min epoch / 6min lease)` at startup — on
+the phone too, so no DevTools needed — and the Storage tab shows a ⚠
+`Timing fast (2m beat)` chip. Both must appear on *both* devices. If one is missing it, that device is on production
 timing and will reject the other's reward blocks mid-chain — the two will look
 like they are on different networks, because in the way that matters they are.
 

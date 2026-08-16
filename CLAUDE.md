@@ -34,9 +34,14 @@ Cloud provisioning: [docs/CLOUD.md](docs/CLOUD.md).
 
 ```sh
 npm run dev          # Vite dev server + auto-spawned relay
-STORAGE_TIMING=fast npm run dev   # ⚠ dev only: 2-min heartbeat / 12-min epoch /
-                                  # 6-min lease, so storage is testable in a
-                                  # sitting. Wipe first; restart for BOTH devices
+# ⚠ dev only: 2-min heartbeat / 12-min epoch / 6-min lease, so the storage
+# lease/repair/reward cycle is testable in a sitting. Wipe first (epoch
+# numbering changes); restart for BOTH devices. PowerShell is the primary shell
+# here, and `VAR=x cmd` is bash-only — it silently sets nothing in PowerShell:
+#   PowerShell:  $env:STORAGE_TIMING = 'fast'; npm run dev
+#   Git Bash:    STORAGE_TIMING=fast npm run dev
+# `$env:` persists for that window — `Remove-Item Env:STORAGE_TIMING` to undo.
+# The app logs the active profile on startup, so it is never a guess.
 npm run relay        # standalone relay (tsx relay/server.ts) — production entry
 npm run build        # → dist/ (static bundle)
 npm test             # vitest, all of src/**/*.test.ts

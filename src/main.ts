@@ -16,7 +16,9 @@ import { devRelayBaseFor } from './network/dev-relay-proxy';
 import { sign as engineSignRecord } from './engine/core/keys';
 import { relayHttpBase } from './network/account-resolver';
 import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
-import { storageTiming } from './engine/content/provider-ledger';
+import {
+  storageTiming, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS, MAX_OFFLINE_MS,
+} from './engine/content/provider-ledger';
 import type { TypedAttestation } from './engine/core/attestation';
 import { encodeBlock, decodeBlock } from './engine/core/block';
 import { bytesToHex, hexToBytes } from './engine/core/hash';
@@ -1977,6 +1979,22 @@ async function startNode() {
   if (nodeStarting || node.net.running) return;
   nodeStarting = true;
   try {
+    // Say which storage clock is in force, unconditionally and in the in-app log
+    // so it is readable on a phone without DevTools. A compressed profile is a
+    // CONSENSUS input — two devices on different profiles reject each other's
+    // reward blocks mid-chain — and the failure is otherwise silent, so "did the
+    // env var take?" must never be a question you have to go hunting to answer.
+    {
+      const t = storageTiming();
+      const mins = (ms: number) => `${Math.round(ms / 60_000)}min`;
+      const detail = `${mins(HEARTBEAT_INTERVAL_MS)} beat / ${mins(REWARD_EPOCH_MS)} epoch / ${mins(MAX_OFFLINE_MS)} lease`;
+      if (t.name === 'normal') {
+        addLog(`Storage timing: production (${detail})`, 'info');
+      } else {
+        addLog(`⚠ Storage timing: ${t.name.toUpperCase()} (${detail}) — dev only, must match on every device`, 'warn');
+        console.warn(`[Storage] timing profile = ${t.name} — ${detail}`);
+      }
+    }
     await node.start();
     registerLocalKeys();
     // Backfill file index for any library entries never announced (e.g. private files uploaded
