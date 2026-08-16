@@ -985,7 +985,26 @@ Each phase is independently benchmarkable; do not advance until its invariant ho
   *verified-live* replicas, a node returning after `MAX_OFFLINE` drops its
   foreign bytes and refills to declared capacity, and per-node storage stays
   bounded by that declared capacity rather than by everything it ever held.
-- **Phase 4 — Scale hardening.** Relay federation/directory; incentive payouts to
+- **Phase 4 — Scale hardening.** Relay federation/directory — including
+  **archive backfill between relays**, which does not exist today: the
+  peer-relay poll syncs only the reset *generation*, so a relay that was down
+  when a block was gossiped never learns it. That is general (sends, mints,
+  account records, storage departures — anything from the outage window), not a
+  storage problem, and it is bounded rather than dangerous: every archive answer
+  is client-verified, clients take the UNION across relays, and a client's next
+  full publish re-seeds whatever a relay missed.
+
+  **Build it demand-driven, never as a rejoin sync.** A relay that syncs its
+  whole archive on restart is `O(archive)` — the invariant violated on the
+  answering side, which is the mistake this document exists to stop. Instead, a
+  relay asked for something it does not hold (`/resolve` miss, `/head-proof`
+  miss) asks its PEERS at that moment: `O(actual queries)`. It reuses
+  `engine-delta-req`, which relays already serve but never make, and every block
+  is hash+signature checked on ingest so a lying peer cannot inject anything.
+  Same "verify and repair on use, not by watching" shape as Subsystem 4's repair
+  loop (ARCHITECTURE.md → Fan-IN, principle 3).
+
+  Also: incentive payouts to
   super-nodes/relays — paid for **proven, current custody only**, so an offline
   node earns nothing for bytes the network has re-homed and stale parked copies
   cannot farm rewards (Subsystem 4); adaptive limits/compression; security
