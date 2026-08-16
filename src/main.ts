@@ -3922,16 +3922,27 @@ function refreshStorage() {
     // Populate my stats row
     const p = node.ledger.storageProviders.get(servingAccount.pub);
     if (p) {
-      const uptimePct = node.storage.getUptimePct(p.pub);
-      const uptime = uptimePct === undefined ? '—' : `${uptimePct}%`;
+      const uptimeFraction = node.ledger.providerUptime(p);
+      const uptime = uptimeFraction === undefined ? '—' : `${Math.round(uptimeFraction * 100)}%`;
       const due = node.ledger.expectedHeartbeats(p);
+      // Derived FROM the percentage, never counted independently. The raw count
+      // is taken over a window half an interval wider than one epoch (that slack
+      // is what stops a perfect provider flickering to 83% — see
+      // countHeartbeatsLast24h), so printing it against `due` produced "7/6
+      // heartbeats due", which is impossible on its face. Reported by Lucian,
+      // 2026-08-16, minutes after the fix that caused it.
+      //
+      // Restating the same measurement in renewal terms cannot contradict it.
+      // The unrounded evidence stays in the tooltip for debugging.
+      const shown = uptimeFraction === undefined ? 0 : Math.round(uptimeFraction * due);
       const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
       const lastReward = p.lastRewardEpoch > 0
         ? `${Math.round((Date.now() - p.lastRewardEpoch * 24 * 60 * 60 * 1000) / 3_600_000)}h ago`
         : 'Never';
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB</td>
-        <td>${uptime} (${p.heartbeatsLast24h}/${due} heartbeats due)</td>
+        <td title="${p.heartbeatsLast24h} renewal block(s) in the counting window (one epoch + half an interval of slack)">${
+          uptime}${uptimeFraction === undefined ? '' : ` (${shown}/${due} renewals)`}</td>
         <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
         <td>${formatUNIT(p.earningRate)}</td>
