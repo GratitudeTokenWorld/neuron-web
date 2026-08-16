@@ -27,11 +27,16 @@
  * answer for *provider* records (who holds these bytes); this module is about
  * *file* records (what these bytes are), which is the half a query answers well.
  *
- * Everything here is pure. Signature verification is INJECTED rather than
- * imported: these records are signed with the app's WebCrypto P-256 keys, not
- * the engine's `@noble` ones, and an engine module may not reach into the app
- * layer. It also means the relay and the browser can verify with whatever each
- * has, against one shared definition of what the payload is.
+ * Everything here is pure, and signature verification is INJECTED rather than
+ * imported so the relay and the browser can each verify with what they have,
+ * against one shared definition of what the payload is.
+ *
+ * Records are signed with the account's ENGINE key and verified against its
+ * engine id — the same `026…` compressed-hex identity the ledger uses. They were
+ * briefly signed with the app's WebCrypto JWK key while `uploaderPub` on the
+ * wire was already engine hex, which no verifier could reconcile: every
+ * announcement was dropped and the index stayed empty (2026-08-16). The payload
+ * definitions below are unchanged by that; only the key format was ever wrong.
  */
 
 import { MAX_OFFLINE_MS } from './provider-ledger.js';

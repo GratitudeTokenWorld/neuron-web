@@ -24,7 +24,8 @@ import type { StorageProviderState as StorageProvider } from '../engine/content/
 import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
 import { AccountBlock } from '../core/dag-block';
-import { KeyPair, signData, verifySignature } from '../core/crypto';
+import { KeyPair } from '../core/crypto';
+import { sign as engineSign, verify as engineVerify } from '../engine/core/keys';
 import { getDeviceId, getCountryCode } from './node';
 import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
 // Timing comes from the engine, never from `core/dag-block`'s legacy copies of
@@ -245,7 +246,7 @@ export class StorageManager extends EventEmitter {
           const providerSmokeAddr = await this.store.getSmokeHostname();
           const ts = Date.now();
           const receiptPayload = `receipt:${cid}:${myProviderPub}:${myProviderPub}:0:true:${ts}`;
-          const sig = await signData(receiptPayload, keys);
+          const sig = this.signMsg(receiptPayload, keys);
           const receipt: StorageReceipt = {
             providerPub: myProviderPub, requesterPub: myProviderPub,
             cid, latencyMs: 0, success: true, timestamp: ts, signature: sig,
@@ -417,6 +418,40 @@ export class StorageManager extends EventEmitter {
     this.receipts.clear();
     this.fileIndex.clear();
     this.signals.clear();
+  }
+
+  // ── Message signing ───────────────────────────────────────────────────────
+  //
+  // Storage gossip is signed with the ENGINE key, verified against the account's
+  // engine id — the `026ed9e5…` compressed-hex pub that is the account's actual
+  // identity everywhere else in the system.
+  //
+  // It used to use the app's `signData`/`verifySignature`, whose verifier
+  // imports the pub as a base64 JWK. Once accounts moved onto the engine, every
+  // `uploaderPub`/`ownerPub`/`providerPub` on the wire became engine hex, and
+  // `atob(hex)` cannot yield a JWK — so EVERY signed storage message failed
+  // verification, silently, in a `catch` that returned "invalid signature".
+  //
+  // What that actually broke: providers rejected every CacheRequest, so no
+  // content was ever distributed to anyone; relays rejected every file
+  // announcement, so the file index stayed empty; and nodes rejected every
+  // receipt, so latency and spot-check never left "—". Found 2026-08-16 while
+  // Lucian was asking why a 101 MB upload never reached the second device.
+  //
+  // The signature itself was always fine: the app and engine keys are the same
+  // P-256 scalar and signatures interoperate in both directions
+  // (`key-bridge.test.ts`). Only the key FORMAT the verifier was handed was
+  // wrong, which is why nothing threw — it just never matched.
+
+  /** Sign a storage-gossip payload with the engine key derived from an app keypair. */
+  private signMsg(payload: string, keys: KeyPair): string {
+    return engineSign(payload, engineKeysFromAppPrivate(keys.priv).priv);
+  }
+
+  /** Verify a storage-gossip payload against an account's engine id. */
+  private verifyMsg(signature: unknown, payload: string, enginePub: string): boolean {
+    if (typeof signature !== 'string' || !signature) return false;
+    return engineVerify(signature, payload, enginePub);
   }
 
   // ── Custody: who counts, and what to do about it ──────────────────────────
@@ -627,7 +662,7 @@ export class StorageManager extends EventEmitter {
     const provider = this.ledger.storageProviders.get(pub);
     if (provider) provider.lastActualStoredBytes = actualBytes;
     const ts = Date.now();
-    const sig = await signData(`stats:${pub}:${actualBytes}:${ts}`, keys);
+    const sig = this.signMsg(`stats:${pub}:${actualBytes}:${ts}`, keys);
     this.net.publishStorageReceipt({
       cid: pub, providerPub: pub, requesterPub: pub,
       latencyMs: 0, success: true, timestamp: ts, signature: sig,
@@ -880,7 +915,7 @@ export class StorageManager extends EventEmitter {
       tracked.lastDistributed = now;
       const ts = Date.now();
       const payload = `cache:${cid}:${tracked.ownerPub}:${ts}`;
-      const sig = await signData(payload, keys);
+      const sig = this.signMsg(payload, keys);
       const uploaderSmokeAddr = await this.store.getSmokeHostname();
       // Include ALL registered provider smoke addresses, not just confirmed ones.
       // This lets providers pull from any peer that already cached the content even
@@ -953,7 +988,7 @@ export class StorageManager extends EventEmitter {
 
     const ts = Date.now();
     const payload = `cache:${cid}:${uploaderPub}:${ts}`;
-    const signature = await signData(payload, keys);
+    const signature = this.signMsg(payload, keys);
 
     const uploaderSmokeAddr = await this.store.getSmokeHostname();
     console.log(`[StorageManager] distributeContent: uploaderSmokeAddr=${uploaderSmokeAddr ?? '(none)'} publishing CacheRequest to ${providers.length} providers: ${providers.map(p => p.pub.slice(0, 12)).join(', ')}`);
@@ -1090,14 +1125,8 @@ export class StorageManager extends EventEmitter {
 
     // Verify the uploader's signature
     const payload = `cache:${req.cid}:${req.uploaderPub}:${req.timestamp}`;
-    try {
-      const verified = await verifySignature(req.signature, req.uploaderPub);
-      if (verified !== payload) {
-        console.warn(`[StorageManager] Rejected cache request - invalid signature`);
-        return;
-      }
-    } catch {
-      console.warn(`[StorageManager] Rejected cache request - signature verification failed`);
+    if (!this.verifyMsg(req.signature, payload, req.uploaderPub)) {
+      console.warn('[StorageManager] Rejected cache request - invalid signature');
       return;
     }
 
@@ -1169,7 +1198,7 @@ export class StorageManager extends EventEmitter {
         if (keys) {
           const providerSmokeAddr = await this.store.getSmokeHostname();
           const receiptPayload = `receipt:${req.cid}:${myProviderPub}:${myProviderPub}:${latencyMs}:true:${Date.now()}`;
-          const sig = await signData(receiptPayload, keys);
+          const sig = this.signMsg(receiptPayload, keys);
           const receipt: StorageReceipt = {
             providerPub: myProviderPub,
             requesterPub: myProviderPub,
@@ -1199,14 +1228,8 @@ export class StorageManager extends EventEmitter {
     if (!Array.isArray(req.cids) || !req.ownerPub || !req.signature) return;
 
     const payload = `delete:${req.cids.join(',')}:${req.ownerPub}:${req.timestamp}`;
-    try {
-      const verified = await verifySignature(req.signature, req.ownerPub);
-      if (verified !== payload) {
-        console.warn('[StorageManager] Rejected delete request - invalid signature');
-        return;
-      }
-    } catch {
-      console.warn('[StorageManager] Rejected delete request - signature verification failed');
+    if (!this.verifyMsg(req.signature, payload, req.ownerPub)) {
+      console.warn('[StorageManager] Rejected delete request - invalid signature');
       return;
     }
 
@@ -1253,7 +1276,7 @@ export class StorageManager extends EventEmitter {
   ): Promise<{ providers: string[]; error?: string }> {
     const ts = Date.now();
     const payload = `replace:${oldCid}:${newCid}:${ownerPub}:${ts}`;
-    const signature = await signData(payload, keys);
+    const signature = this.signMsg(payload, keys);
     const uploaderSmokeAddr = await this.store.getSmokeHostname();
 
     const request: ReplaceRequest = {
@@ -1293,14 +1316,8 @@ export class StorageManager extends EventEmitter {
     if (!req.oldCid || !req.newCid || !req.ownerPub || !req.signature) return;
 
     const payload = `replace:${req.oldCid}:${req.newCid}:${req.ownerPub}:${req.timestamp}`;
-    try {
-      const verified = await verifySignature(req.signature, req.ownerPub);
-      if (verified !== payload) {
-        console.warn('[StorageManager] Rejected replace request - invalid signature');
-        return;
-      }
-    } catch {
-      console.warn('[StorageManager] Rejected replace request - signature verification failed');
+    if (!this.verifyMsg(req.signature, payload, req.ownerPub)) {
+      console.warn('[StorageManager] Rejected replace request - invalid signature');
       return;
     }
 
@@ -1340,7 +1357,7 @@ export class StorageManager extends EventEmitter {
           const providerSmokeAddr = await this.store.getSmokeHostname();
           const ts = Date.now();
           const receiptPayload = `receipt:${req.newCid}:${myProviderPub}:${myProviderPub}:0:true:${ts}`;
-          const sig = await signData(receiptPayload, keys);
+          const sig = this.signMsg(receiptPayload, keys);
           const receipt: StorageReceipt = {
             providerPub: myProviderPub, requesterPub: myProviderPub,
             cid: req.newCid, latencyMs: 0, success: true,
@@ -1421,8 +1438,7 @@ export class StorageManager extends EventEmitter {
         const payload = isStatsReceipt
           ? `stats:${receipt.providerPub}:${receipt.actualStoredBytes}:${receipt.timestamp}`
           : `receipt:${receipt.cid}:${receipt.providerPub}:${receipt.requesterPub}:${receipt.latencyMs}:${receipt.success}:${receipt.timestamp}`;
-        const verified = await verifySignature(receipt.signature, receipt.providerPub);
-        const valid = verified === payload;
+        const valid = this.verifyMsg(receipt.signature, payload, receipt.providerPub);
         if (valid) p.lastActualStoredBytes = receipt.actualStoredBytes;
         else console.warn(`[StorageManager] Rejected storage stats update from ${receipt.providerPub.slice(0, 12)}… — invalid signature`);
       }
@@ -1561,7 +1577,7 @@ export class StorageManager extends EventEmitter {
 
         const ts = Date.now();
         const payload = `receipt:${cid}:${pub}:${myPub}:${latencyMs}:${success}:${ts}`;
-        const sig = await signData(payload, myKeys!);
+        const sig = this.signMsg(payload, myKeys!);
         const receipt: StorageReceipt = {
           providerPub: pub,
           requesterPub: myPub,
@@ -1639,7 +1655,7 @@ export class StorageManager extends EventEmitter {
   async announceFile(cid: string, sizeBytes: number, mimeType: string | undefined, uploaderPub: string, keys: KeyPair): Promise<void> {
     const timestamp = Date.now();
     const payload = `file:${cid}:${sizeBytes}:${uploaderPub}:${timestamp}`;
-    const signature = await signData(payload, keys);
+    const signature = this.signMsg(payload, keys);
     const record: FileIndexRecord = { cid, sizeBytes, mimeType, timestamp, uploaderPub };
     this.fileIndex.set(cid, record);
     await this.net.saveFileIndexRecord(record);
@@ -1652,7 +1668,7 @@ export class StorageManager extends EventEmitter {
   async removeFileAnnouncement(cid: string, ownerPub: string, keys: KeyPair): Promise<void> {
     const timestamp = Date.now();
     const payload = `file-remove:${cid}:${ownerPub}:${timestamp}`;
-    const signature = await signData(payload, keys);
+    const signature = this.signMsg(payload, keys);
     this.fileIndex.delete(cid);
     await this.net.deleteFileIndexRecord(cid);
     this.trackedCids.delete(cid);
@@ -1671,7 +1687,7 @@ export class StorageManager extends EventEmitter {
       const keys = this.localKeys.get(rec.uploaderPub);
       if (!keys) continue;
       const payload = `file:${rec.cid}:${rec.sizeBytes}:${rec.uploaderPub}:${rec.timestamp}`;
-      const signature = await signData(payload, keys);
+      const signature = this.signMsg(payload, keys);
       this.net.publishFileAnnouncement({ ...rec, signature });
     }
   }

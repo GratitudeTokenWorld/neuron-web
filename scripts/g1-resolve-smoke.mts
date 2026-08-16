@@ -29,7 +29,7 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { multiaddr } from '@multiformats/multiaddr';
 import { applyGossipsubCompat } from '../src/network/gossipsub-compat.js';
-import { generateKeyPair, sign } from '../src/engine/core/keys.js';
+import { generateKeyPair, sign, verify as engineVerifySig } from '../src/engine/core/keys.js';
 import { encodeBlock } from '../src/engine/core/block.js';
 import { bytesToHex } from '../src/engine/core/hash.js';
 import { buildSenderChain } from '../src/engine/sim/counterparty.js';
@@ -293,19 +293,22 @@ check(
 {
   const { fileAnnouncePayload, fileRemovePayload, foldFileRecords } = await import('../src/engine/content/file-index.js');
   const { fetchFileRecords } = await import('../src/network/account-resolver.js');
-  const { generateKeyPair: appKeyPair, signData, verifySignature } = await import('../src/core/crypto.js');
   const bases = RELAYS.map((r) => r.http);
-  const verify = async (payload: string, pk: string, sig: string) => {
-    try { return (await verifySignature(sig, pk)) === payload; } catch { return false; }
+  // Signed with the ENGINE key against the engine id, exactly as a real client
+  // does. The probe previously used the app's JWK signer, which is what let the
+  // whole /files path pass here while failing for every actual upload: the probe
+  // was the only participant whose pub matched its signer.
+  const verify = (payload: string, pk: string, sig: string) => {
+    try { return engineVerifySig(sig, payload, pk); } catch { return false; }
   };
   const filesTopic = 'neuronchain/v1/testnet/files';
   pubsub.subscribe(filesTopic);
 
   // File records are signed with the APP's WebCrypto key, not the engine's.
-  const appKeys = await appKeyPair();
+  const fileKeys = generateKeyPair();
   const cid = 'f' + hashHex(utf8ToBytes(`smoke-file-${username}`)).slice(1);
-  const meta = { cid, sizeBytes: 4096, mimeType: 'image/png', timestamp: Date.now(), uploaderPub: appKeys.pub };
-  const announce = { ...meta, signature: await signData(fileAnnouncePayload(meta), appKeys) };
+  const meta = { cid, sizeBytes: 4096, mimeType: 'image/png', timestamp: Date.now(), uploaderPub: fileKeys.pub };
+  const announce = { ...meta, signature: sign(fileAnnouncePayload(meta), fileKeys.priv) };
 
   // An INFLATED record: the signature is honest, the size is not. A verifier
   // that trusted the signed envelope's own string, instead of rebuilding the
@@ -351,8 +354,8 @@ check(
   // A withdrawal must be served as a TOMBSTONE, not as an absence: a node that
   // already holds the file has to be able to LEARN it was withdrawn.
   const tombTs = Date.now() + 1;
-  const tomb = { cid, sizeBytes: 0, timestamp: tombTs, uploaderPub: appKeys.pub, removed: true,
-    signature: await signData(fileRemovePayload(cid, appKeys.pub, tombTs), appKeys) };
+  const tomb = { cid, sizeBytes: 0, timestamp: tombTs, uploaderPub: fileKeys.pub, removed: true,
+    signature: sign(fileRemovePayload(cid, fileKeys.pub, tombTs), fileKeys.priv) };
   await pubFile(tomb);
   await sleep(4000);
   const after = await fetchFileRecords(bases, 'testnet', { cid, limit: 50 });

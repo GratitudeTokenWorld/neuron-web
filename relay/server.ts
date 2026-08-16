@@ -524,26 +524,17 @@ async function saveFiles() {
 setInterval(() => { saveFiles().catch(() => {}); }, 5_000);
 
 /**
- * Verify the app-layer (WebCrypto JWK) signature on a file record.
- * The relay's other archives verify with the engine's @noble keys; file
- * announcements are signed by the app key, so this is the WebCrypto path.
+ * Verify a file record's signature against the uploader's ENGINE id.
+ *
+ * These used to be app-layer (WebCrypto JWK) signatures, verified by importing
+ * `uploaderPub` as a base64 JWK. Once accounts moved onto the engine every
+ * `uploaderPub` on the wire became compressed hex, `atob(hex)` cannot yield a
+ * JWK, and so every file announcement failed verification here and was dropped
+ * — silently, which is why the index simply stayed empty. Same scalar, same
+ * curve, wrong key format. Found 2026-08-16.
  */
-async function verifyAppSignature(signature, pub, payload) {
-  try {
-    const { d, s: sig } = JSON.parse(String(signature));
-    if (d !== payload) return false;
-    const jwk = JSON.parse(atob(String(pub)));
-    delete jwk.d; delete jwk.key_ops;
-    const key = await globalThis.crypto.subtle.importKey(
-      'jwk', { ...jwk, key_ops: ['verify'] },
-      { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
-    );
-    return await globalThis.crypto.subtle.verify(
-      { name: 'ECDSA', hash: 'SHA-256' }, key,
-      Uint8Array.from(atob(sig), c => c.charCodeAt(0)),
-      new TextEncoder().encode(payload),
-    );
-  } catch { return false; }
+function verifyFileSignature(signature, pub, payload) {
+  try { return engineVerify(String(signature), payload, String(pub)); } catch { return false; }
 }
 
 /** Archive a file announcement seen on the files topic (verified, newest wins). */
@@ -553,7 +544,7 @@ async function archiveFileRecord(rec, network) {
   const existing = fileStore.get(key);
   // Newest wins, and a stale re-announcement can never revive a withdrawal.
   if (existing && Number(existing.timestamp) >= Number(rec.timestamp)) return;
-  if (!(await verifyAppSignature(rec.signature, rec.uploaderPub, payloadFor(rec)))) return;
+  if (!verifyFileSignature(rec.signature, rec.uploaderPub, payloadFor(rec))) return;
   // A tombstone is stored, not deleted: a client that already holds the file has
   // to be able to LEARN it was withdrawn, and an absent row cannot say that.
   fileStore.set(key, { ...rec, network });
