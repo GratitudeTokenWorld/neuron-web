@@ -226,11 +226,11 @@ export class StorageManager extends EventEmitter {
     // This is the critical path for mobile uploaders behind strict NAT: outbound WebRTC
     // (mobile→desktop) succeeds, so the push delivers the block; the pull model fails.
     this.store.setBlockPushHandler((cid, uploaderPub) => {
-      const localDeviceId = getDeviceId();
-      const myProviderPub = Array.from(this.localKeys.keys()).find(pub => {
-        const p = this.ledger.storageProviders.get(pub);
-        return p && p.capacityGB > 0 && (!p.deviceId || p.deviceId === localDeviceId);
-      });
+      // Same fail-closed rule as every other write path: accepting a pushed
+      // block makes this device a holder and publishes a receipt saying so, and
+      // a device that is not the registered one must not claim custody.
+      const myProviderPub = Array.from(this.localKeys.keys())
+        .find(pub => this.servesFromThisDevice(pub));
       if (!myProviderPub) return;
       const keys = this.localKeys.get(myProviderPub);
       if (!keys || !this.net.running) return;
@@ -510,13 +510,12 @@ export class StorageManager extends EventEmitter {
    */
   async reclaimLapsedLeases(): Promise<void> {
     if (!this.store.isStarted()) return;
-    const localDeviceId = getDeviceId();
     const now = Date.now();
 
     for (const [pub, keys] of this.localKeys) {
       const provider = this.ledger.storageProviders.get(pub);
       if (!provider || provider.capacityGB === 0) continue;
-      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+      if (!this.servesFromThisDevice(pub)) continue;   // fails closed — see servesFromThisDevice
 
       // The lease runs from the last renewal, or from registration if it has
       // never renewed — the same clock `ProviderLedger.isLive` reads.
@@ -564,13 +563,12 @@ export class StorageManager extends EventEmitter {
 
   private scheduleNextHeartbeat(): void {
     if (!this.started) return;
-    const localDeviceId = getDeviceId();
     let minDueIn = HEARTBEAT_INTERVAL_MS;
 
     for (const [pub] of this.localKeys) {
       const provider = this.ledger.storageProviders.get(pub);
       if (!provider || provider.capacityGB === 0) continue;
-      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+      if (!this.servesFromThisDevice(pub)) continue;   // fails closed — see servesFromThisDevice
       if (provider.lastHeartbeat === 0) {
         minDueIn = 0; // first-ever heartbeat — fire promptly
       } else {
@@ -636,11 +634,10 @@ export class StorageManager extends EventEmitter {
   }
 
   private async broadcastHeartbeatsForAll(): Promise<void> {
-    const localDeviceId = getDeviceId();
     for (const [pub, keys] of this.localKeys) {
       const provider = this.ledger.storageProviders.get(pub);
       if (!provider || provider.capacityGB === 0) continue;
-      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+      if (!this.servesFromThisDevice(pub)) continue;   // fails closed — see servesFromThisDevice
       await this.broadcastHeartbeat(pub, keys);
     }
   }
@@ -1145,10 +1142,7 @@ export class StorageManager extends EventEmitter {
 
     // Only the device that registered should serve - prevents both devices from
     // responding when the same account is loaded on two machines.
-    const localDeviceId = getDeviceId();
-    if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) {
-      return;
-    }
+    if (!this.servesFromThisDevice(myProviderPub)) return;   // fails closed
 
     // Verify the uploader's signature
     const payload = `cache:${req.cid}:${req.uploaderPub}:${req.timestamp}`;
@@ -1770,9 +1764,31 @@ export class StorageManager extends EventEmitter {
    */
   registeredOnAnotherDevice(pub: string): boolean {
     const provider = this.ledger.storageProviders.get(pub);
-    const localDeviceId = getDeviceId();
-    return !!provider && provider.capacityGB > 0
-      && !!provider.deviceId && !!localDeviceId && provider.deviceId !== localDeviceId;
+    return !!provider && provider.capacityGB > 0 && !this.servesFromThisDevice(pub);
+  }
+
+  /**
+   * May THIS device write storage blocks for this account? Fails CLOSED.
+   *
+   * The guard used to be "skip if the ids differ", which is false when the
+   * registration carries no deviceId at all — so an empty id meant EVERY device
+   * holding the account heartbeated, and two unattended writers on one chain
+   * fork it. Bob's chain forked at indexes 17 and 18 exactly this way on
+   * 2026-08-16; the relays published the evidence and the account froze
+   * permanently, which is what fraud proofs are supposed to do and is not
+   * recoverable.
+   *
+   * So the question is no longer "is this someone else's?" but "is this
+   * provably mine?" — and recovering an account onto a new device now hands you
+   * a registration that stays INERT until you press Serve, which rebinds the id.
+   * Raised by Lucian: recovery gives you a registration you never asked for, so
+   * defaulting to serving is defaulting to a race.
+   */
+  private servesFromThisDevice(pub: string): boolean {
+    const provider = this.ledger.storageProviders.get(pub);
+    if (!provider) return false;
+    const local = getDeviceId();
+    return !!local && !!provider.deviceId && provider.deviceId === local;
   }
 
   /**

@@ -3963,9 +3963,12 @@ function refreshStorage() {
       const div = document.createElement('div');
       div.setAttribute('data-other-device', '1');
       div.style.cssText = 'background:rgba(245,158,11,.1);border:1px solid var(--warning);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;';
-      div.innerHTML = '⚠ <strong>Registered on another device.</strong> Storage custody is per-device, '
-        + 'so this browser will not heartbeat, earn or cache for this account. '
-        + 'Set a capacity and Serve here to take over custody.';
+      div.innerHTML = '⚠ <strong>Not serving from this device.</strong> Storage custody is per-device, '
+        + 'so this browser will not heartbeat, earn or cache for this account — '
+        + 'recovering an account does not make it serve here. '
+        + '<strong>Stop serving on the other device first</strong>, then set a capacity and Serve '
+        + 'to take over: two devices writing to one chain forks it, and a forked account is '
+        + 'frozen permanently.';
       note.prepend(div);
     }
   } else if (servingAccount) {
