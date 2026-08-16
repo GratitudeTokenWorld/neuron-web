@@ -1,8 +1,10 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { EngineLedger, CHALLENGE_WINDOW_MS, REQUIRED_ATTESTERS, type LedgerAccount } from '../ledger/engine-ledger';
 import { Libp2pNetwork, bakedBootstrapAddrs } from './libp2p-network';
-import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof, fetchProviders } from './account-resolver';
+import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPendingSends, fetchBlockByHash, fetchHeadProof, fetchMintProof, fetchProviders, fetchFileRecords } from './account-resolver';
 import { foldProviderBlocks } from '../engine/content/provider-discovery';
+import { pollIntervalMs } from '../engine/content/custody';
+import { foldFileRecords, type FileRecord } from '../engine/content/file-index';
 import { allDevRelayBases } from './dev-relay-proxy';
 import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
@@ -43,7 +45,7 @@ const COUNTRY_CODE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // re-check weekly
  * (≤50 records, a few KB), so polling this often is cheap; relays can add
  * caching/ETags if it ever stops being.
  */
-const PROVIDER_DISCOVERY_INTERVAL_MS = 10 * 60 * 1000;
+const PROVIDER_DISCOVERY_BASE_MS = 10 * 60 * 1000;
 
 /** Early retry delays while the relay connections are still coming up. */
 const PROVIDER_DISCOVERY_RETRIES_MS = [15_000, 30_000, 60_000];
@@ -108,7 +110,7 @@ export class NeuronNode extends EventEmitter {
   private resyncDebounce: ReturnType<typeof setTimeout> | null = null;
   private publishDebounce: ReturnType<typeof setTimeout> | null = null;
   private pendingInboundTimer: ReturnType<typeof setInterval> | null = null;
-  private providerDiscoveryTimer: ReturnType<typeof setInterval> | null = null;
+  private providerDiscoveryTimer: ReturnType<typeof setTimeout> | null = null;
   /** P2/C3: blocks waiting for their parent to arrive, keyed by previousHash. Entries older than 5 min are evicted. */
   private pendingBlocks: Map<string, { blocks: AccountBlock[]; addedAt: number }> = new Map();
   /** Phase 1: engine blocks waiting for their parent, keyed by previousHash (same TTL/eviction). */
@@ -781,10 +783,7 @@ export class NeuronNode extends EventEmitter {
     // connection setup, and a single miss used to mean an empty provider list
     // for the whole session.
     setTimeout(() => { void this.discoverProvidersWithRetry(); }, 8000);
-    this.providerDiscoveryTimer = setInterval(
-      () => { void this.refreshStorageProviders(); },
-      PROVIDER_DISCOVERY_INTERVAL_MS,
-    );
+    this.scheduleProviderDiscovery();
     // Slice 4c: bootstrap — pull our own accounts' chains from holders (the
     // super-node archive serves them), so a fresh/recovered device restores its
     // balance without waiting for a periodic re-broadcast. Delayed so relay/peer
@@ -944,7 +943,7 @@ export class NeuronNode extends EventEmitter {
     if (this.publishInterval) { clearInterval(this.publishInterval); this.publishInterval = null; }
     if (this.relayLivenessInterval) { clearInterval(this.relayLivenessInterval); this.relayLivenessInterval = null; }
     if (this.pendingInboundTimer) { clearInterval(this.pendingInboundTimer); this.pendingInboundTimer = null; }
-    if (this.providerDiscoveryTimer) { clearInterval(this.providerDiscoveryTimer); this.providerDiscoveryTimer = null; }
+    if (this.providerDiscoveryTimer) { clearTimeout(this.providerDiscoveryTimer); this.providerDiscoveryTimer = null; }
     if (this.resyncDebounce) { clearTimeout(this.resyncDebounce); this.resyncDebounce = null; }
     if (this.publishDebounce) { clearTimeout(this.publishDebounce); this.publishDebounce = null; }
     this.storage.stop();
@@ -1074,6 +1073,54 @@ export class NeuronNode extends EventEmitter {
     } catch {
       return 0;   // offline or no archive reachable — keep whatever we had
     }
+  }
+
+  /**
+   * Look up file records from the relay archives and verify them locally.
+   *
+   * The read half of closing the last `O(N)` in storage: a node holds records
+   * for its own files only, so anything about anyone else's is asked for here.
+   * `foldFileRecords` rebuilds each payload from the record's own fields before
+   * checking the uploader's signature, so a relay can choose what to show but
+   * cannot invent a file, inflate a size, or attribute one to the wrong account.
+   *
+   * Returns the verified records plus what each archive reported holding —
+   * per-archive, because no node knows a network total and summing overlapping
+   * archives would invent one.
+   */
+  async lookupFiles(query: { cid?: string; owner?: string; limit?: number } = {}):
+    Promise<{ records: FileRecord[]; archiveTotals: number[] }> {
+    try {
+      const { records, archiveTotals } = await fetchFileRecords(
+        this.relayResolveBases(), this.ledger.network, query,
+      );
+      const verified = await foldFileRecords(records, async (payload, pub, signature) => {
+        try { return (await verifySignature(signature, pub)) === payload; } catch { return false; }
+      });
+      return { records: [...verified.values()], archiveTotals };
+    } catch {
+      return { records: [], archiveTotals: [] };   // offline or no archive reachable
+    }
+  }
+
+  /**
+   * Re-arm the provider poll at a population-scaled, jittered cadence.
+   *
+   * A fixed interval is fine for a two-relay dev network and is exactly the
+   * shape that must not survive contact with scale: `P` clients on one timer hit
+   * the archives at `P/T`, so the work an archive must ANSWER grows with the
+   * network even though nothing it HOLDS does — the scale invariant violated
+   * from the fan-in side (ARCHITECTURE.md → Fan-IN, principle 5). Population is
+   * estimated from the providers we already know of, which is the only figure
+   * available locally and is the right order of magnitude.
+   */
+  private scheduleProviderDiscovery(): void {
+    const population = this.ledger.getStorageProviders().length;
+    this.providerDiscoveryTimer = setTimeout(() => {
+      void this.refreshStorageProviders().finally(() => {
+        if (this.net.running) this.scheduleProviderDiscovery();
+      });
+    }, pollIntervalMs(PROVIDER_DISCOVERY_BASE_MS, population));
   }
 
   /**

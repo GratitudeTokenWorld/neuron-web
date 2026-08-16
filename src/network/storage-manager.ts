@@ -22,18 +22,24 @@ import { EngineLedger } from '../ledger/engine-ledger';
 import type { StorageProviderState as StorageProvider } from '../engine/content/provider-ledger';
 import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
-import { AccountBlock, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY, REWARD_EPOCH_MS } from '../core/dag-block';
+import { AccountBlock, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY } from '../core/dag-block';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
 import { getDeviceId, getCountryCode } from './node';
 import { engineKeysFromAppPrivate } from '../ledger/key-bridge';
 import { claimableEpochDay } from '../engine/content/provider-ledger';
+import {
+  REDUNDANCY_TARGET, MAX_REPLICA_TARGET, MIN_REPLICAS,
+  CustodySignals, planRepair, planRejoin, pollIntervalMs, liveHolders,
+} from '../engine/content/custody';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 const HEARTBEAT_JITTER_MS = 5 * 60 * 1000;          // ±5 min jitter so nodes don't all fire at once
 const REWARD_CHECK_INTERVAL_MS = 30 * 60 * 1000;    // check every 30 min whether today's reward is due
-const SPOT_CHECK_INTERVAL_MS   = 60 * 60 * 1000;    // run spot checks every hour
+const SPOT_CHECK_BASE_MS = 60 * 60 * 1000;          // hourly at dev scale; stretched by pollIntervalMs
 const RECEIPT_WINDOW_MS = 24 * 60 * 60 * 1000;      // keep receipts for 24h rolling window
-const REDUNDANCY_TARGET = 10;                        // target copies per file
+
+// REDUNDANCY_TARGET, MIN_REPLICAS and the repair rules live in
+// engine/content/custody.ts — pure, and covered by tests, which this file is not.
 
 export interface StorageReceipt {
   [key: string]: unknown;
@@ -62,8 +68,23 @@ export interface CacheRequest {
   cid: string;
   /** Additional CIDs that must also be cached (e.g. contentCid inside a meta envelope) */
   additionalCids?: string[];
-  /** Number of providers already confirmed for this CID — providers reject the request if this is already at REDUNDANCY_TARGET */
+  /**
+   * Holders with a LIVE lease that this CID already has. Providers reject the
+   * request once it reaches `redundancyTarget`. Live, not merely confirmed:
+   * a count that includes lapsed holders reports an object as replicated while
+   * the first honest failure would take it below the threshold.
+   */
   confirmedProviderCount?: number;
+  /**
+   * Assigned holders this CID is aiming for — `REDUNDANCY_TARGET`, plus a
+   * sub-linear surplus if the owner is seeing real demand (custody.ts →
+   * `replicaTarget`). Carried in the request rather than read from a local
+   * constant because demand is observed by the OWNER; every other node sees a
+   * different slice of it and would compute a different target for the same
+   * object. Receivers clamp it to MAX_REPLICA_TARGET — it is a number an
+   * attacker writes.
+   */
+  redundancyTarget?: number;
   /** Smoke addresses of providers that already confirmed holding this CID — new providers use these as fallback fetch sources if the uploader is unavailable */
   confirmedProviderSmokeAddrs?: string[];
   /** Public keys of providers selected to cache this CID */
@@ -110,7 +131,7 @@ export class StorageManager extends EventEmitter {
 
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private rewardInterval: ReturnType<typeof setInterval> | null = null;
-  private spotCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private spotCheckTimer: ReturnType<typeof setTimeout> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private statsRefreshInterval: ReturnType<typeof setInterval> | null = null;
   private reannounceInterval: ReturnType<typeof setInterval> | null = null;
@@ -131,10 +152,28 @@ export class StorageManager extends EventEmitter {
   /** How many re-replication cycles each CID has been stuck at the same confirmed count */
   private cidStuckCount: Map<string, number> = new Map();
 
+  /**
+   * Demand and per-holder failure evidence — the input to use-driven repair
+   * (custody.ts). Deliberately in-memory: these are this node's own observations
+   * of its own usage, which is what makes them unbiasable and bounded.
+   */
+  private readonly signals = new CustodySignals();
+
   /** Primary CIDs currently being cached — prevents concurrent duplicate downloads */
   private cachingInProgress = new Set<string>();
 
-  /** Network-wide file index — built from gossip announcements and persisted in IDB */
+  /**
+   * File records for the files this node OWNS. Not a network index.
+   *
+   * It used to be one: every node subscribed to a global `files` topic, ingested
+   * every announcement on the network and persisted the lot to IndexedDB —
+   * `O(total files)` per node, the same violation as G1's `accounts` topic and
+   * G3's `keyblobs` topic, and the last one left in storage. Announcements still
+   * gossip (that is how archives learn them), but a client no longer *keeps*
+   * other people's: it holds its own, which is bounded by its own behaviour, and
+   * ASKS the archives for anything else (`GET /files`, verified client-side —
+   * `node.lookupFiles`). See engine/content/file-index.ts.
+   */
   private fileIndex: Map<string, FileIndexRecord> = new Map();
 
   private started = false;
@@ -240,9 +279,14 @@ export class StorageManager extends EventEmitter {
     const persistedIndex = await this.net.loadFileIndex();
     for (const rec of persistedIndex) this.fileIndex.set(rec.cid, rec);
 
-    // Watch for file announcements from any node on the network
+    // File announcements are still published — that is how the archives learn
+    // them — but a client only KEEPS records for its own files. Ingesting every
+    // other account's was `O(total files)` per node; a withdrawal of somebody
+    // else's file is likewise not this node's business to remember. Anything
+    // beyond our own is asked for on demand (`node.lookupFiles`).
     this.net.watchFileAnnouncements((ann) => {
       const a = ann as unknown as FileIndexRecord & { removed?: boolean };
+      if (!this.localKeys.has(a.uploaderPub)) return;
       if (a.removed) {
         this.fileIndex.delete(a.cid);
         this.net.deleteFileIndexRecord(a.cid);
@@ -315,8 +359,9 @@ export class StorageManager extends EventEmitter {
     // Also check immediately on start (catches missed day-boundary events)
     setTimeout(() => this.issueRewardsIfEligible(), 5_000);
 
-    // Run spot checks hourly
-    this.spotCheckInterval = setInterval(() => this.runSpotChecks(), SPOT_CHECK_INTERVAL_MS);
+    // Spot checks reschedule themselves at a population-scaled, jittered cadence
+    // rather than on a fixed timer — see scheduleNextSpotCheck.
+    this.scheduleNextSpotCheck();
 
     // Refresh heartbeat counts and scores every 30 min so uptime % stays live as the
     // 24h rolling window moves, without waiting for a new heartbeat block to arrive.
@@ -337,7 +382,7 @@ export class StorageManager extends EventEmitter {
     this.started = false;
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (this.rewardInterval) { clearInterval(this.rewardInterval); this.rewardInterval = null; }
-    if (this.spotCheckInterval) { clearInterval(this.spotCheckInterval); this.spotCheckInterval = null; }
+    if (this.spotCheckTimer) { clearTimeout(this.spotCheckTimer); this.spotCheckTimer = null; }
     if (this.statsRefreshInterval) { clearInterval(this.statsRefreshInterval); this.statsRefreshInterval = null; }
     if (this.reannounceInterval) { clearInterval(this.reannounceInterval); this.reannounceInterval = null; }
     if (this.retryInterval) { clearInterval(this.retryInterval); this.retryInterval = null; }
@@ -352,6 +397,113 @@ export class StorageManager extends EventEmitter {
     this.cidStuckCount.clear();
     this.receipts.clear();
     this.fileIndex.clear();
+    this.signals.clear();
+  }
+
+  // ── Custody: who counts, and what to do about it ──────────────────────────
+
+  /**
+   * Holders of a CID whose custody lease is live.
+   *
+   * The ONLY count allowed to satisfy a redundancy target. `confirmedProviders`
+   * accumulates everyone who ever confirmed holding the CID, and a provider that
+   * stopped renewing its lease half a day ago is still in there — counting it
+   * reports the object as replicated while the network has already re-homed its
+   * share, so the first real failure drops below the threshold that was supposedly
+   * met. See ARCHITECTURE.md → "Only verified-live replicas count toward the target".
+   */
+  private liveHolderCount(confirmed: Iterable<string>, now = Date.now()): number {
+    return liveHolders(confirmed, pub => this.ledger.isProviderLive(pub, now)).length;
+  }
+
+  /**
+   * Repair driven by a failed read, not by a watcher.
+   *
+   * Continuous monitoring of every holder costs `O(watchers × watched)`;
+   * noticing at the moment a fetch fails costs `O(actual use)` and finds exactly
+   * the failures a reader cares about (ARCHITECTURE.md → Fan-IN, principle 3).
+   *
+   * Two different nodes can be here. The OWNER holds the bytes and can re-place
+   * them, so it clears the backoff and re-replicates immediately. A reader holds
+   * nothing and cannot repair anything — what it can do is stop routing to a
+   * source that just failed it, which is the other half of verifying on use.
+   */
+  private repairOnReadFailure(cid: string): void {
+    this.cidToSmokeAddrs.delete(cid);        // every known source failed; re-learn them
+
+    const tracked = this.trackedCids.get(cid);
+    if (!tracked || !this.localKeys.has(tracked.ownerPub)) return;
+
+    this.cidStuckCount.delete(cid);          // a real failure outranks any backoff
+    tracked.lastDistributed = 0;
+    console.warn(`[StorageManager] Read failed for ${cid.slice(0, 16)}… — repairing now `
+      + `(${this.liveHolderCount(tracked.confirmedProviders)} live holder(s))`);
+    setTimeout(() => this.retryUnconfirmedDistributions(), 1_000);
+  }
+
+  /**
+   * Reclaim a local provider whose lease lapsed while it was away.
+   *
+   * Replaces an auto-deregister on a private 24h rule. Deregistering was the
+   * wrong verb twice over: the lease already stops a silent node from counting
+   * (nothing has to notice it left), and it left the actual problem in place —
+   * a disk full of content the network re-homed hours ago, which consumes the
+   * capacity being re-advertised for CURRENT assignments and inflates apparent
+   * redundancy with copies nobody is counting on. So the node keeps its
+   * registration and throws out the bytes, then refills from declared capacity
+   * as the network assigns to it. Inside the lease a restart costs no
+   * re-transfer at all. Policy + tests: custody.ts → planRejoin.
+   */
+  async reclaimLapsedLeases(): Promise<void> {
+    if (!this.store.isStarted()) return;
+    const localDeviceId = getDeviceId();
+    const now = Date.now();
+
+    for (const [pub, keys] of this.localKeys) {
+      const provider = this.ledger.storageProviders.get(pub);
+      if (!provider || provider.capacityGB === 0) continue;
+      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+
+      // The lease runs from the last renewal, or from registration if it has
+      // never renewed — the same clock `ProviderLedger.isLive` reads.
+      const since = provider.lastHeartbeat > 0 ? provider.lastHeartbeat : provider.registeredAt;
+      const plan = planRejoin({ offlineMs: now - since, held: await this.store.listCached() });
+      if (plan.discard.length === 0) continue;
+
+      console.log(`[StorageManager] Rejoin ${pub.slice(0, 12)}…: ${plan.reason}`);
+      // `listCached()` is foreign content only — a node's own uploads live under
+      // /blocks/ without a /cached/ marker — so this never touches the CIDs this
+      // node is the owner and distributor of.
+      for (const cid of plan.discard) {
+        await this.store.deleteBlock(cid).catch(() => {});
+        this.signals.forget(cid);
+      }
+      // Free space changed; peers price selection on it, so say so now rather
+      // than at the next 4h heartbeat.
+      await this.broadcastStorageStats(pub, keys).catch(() => {});
+      this.emit('storage:providers-updated');
+    }
+  }
+
+  /**
+   * Reschedule the spot-check sweep at a cadence that scales with the provider
+   * population, jittered.
+   *
+   * A fixed timer is fine on a two-relay dev network and is exactly the shape
+   * that must not survive contact with scale: every client on the same 60-minute
+   * interval synchronises into a thundering herd against the same providers, and
+   * the load a popular provider must ANSWER grows with the network even though
+   * nothing it HOLDS does. See custody.ts → pollIntervalMs.
+   */
+  private scheduleNextSpotCheck(): void {
+    if (!this.started) return;
+    const population = this.ledger.getStorageProviders().length;
+    const delay = pollIntervalMs(SPOT_CHECK_BASE_MS, population);
+    this.spotCheckTimer = setTimeout(() => {
+      this.runSpotChecks()
+        .catch(() => {})
+        .finally(() => this.scheduleNextSpotCheck());
+    }, delay);
   }
 
   // ── Heartbeats ────────────────────────────────────────────────────────────
@@ -416,28 +568,6 @@ export class StorageManager extends EventEmitter {
     if (!this.started) return;
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
     this.scheduleNextHeartbeat();
-  }
-
-  /**
-   * If a local storage provider has been offline for more than 24h, deregister it.
-   * Called on startup after keys are loaded so the node cleans up its own stale registration
-   * rather than appearing active to the network.
-   */
-  async deregisterStaleLocalProviders(): Promise<void> {
-    const localDeviceId = getDeviceId();
-    for (const [pub, keys] of this.localKeys) {
-      const provider = this.ledger.storageProviders.get(pub);
-      if (!provider || provider.capacityGB === 0) continue;
-      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
-      if (provider.lastHeartbeat === 0) continue; // never heartbeated — still in grace period
-      if (Date.now() - provider.lastHeartbeat < REWARD_EPOCH_MS) continue;
-      const result = await this.ledger.createStorageDeregister(pub, engineKeysFromAppPrivate(keys.priv));
-      if (result.block) {
-        await this.submitBlock(result.block);
-        console.log(`[StorageManager] Auto-deregistered ${pub.slice(0, 12)}… (offline >24h)`);
-        this.emit('storage:providers-updated');
-      }
-    }
   }
 
   private async broadcastHeartbeatsForAll(): Promise<void> {
@@ -601,15 +731,19 @@ export class StorageManager extends EventEmitter {
     const localDeviceId = getDeviceId();
     const allProviders = this.ledger.getStorageProviders();
     const now = Date.now();
-    // Right after start we haven't received a full heartbeat cycle of gossip yet, so a
-    // provider loaded from IDB can look stale (old lastHeartbeat) while actually being
-    // online. Skip the staleness filter during a one-heartbeat-interval warmup so we don't
-    // wrongly exclude live providers; once a cycle has passed, online peers have fresh
-    // heartbeats and genuinely-offline ones are correctly dropped.
+    // Selection is a CUSTODY question — these providers are being asked to take
+    // responsibility for a replica — so the filter is the LEASE, not a private
+    // 24h staleness rule. A node that stopped renewing is not somewhere content
+    // can live, whatever capacity it once declared.
+    //
+    // Right after start we haven't received a full heartbeat cycle of gossip yet,
+    // so a provider loaded from IDB can look lapsed while actually being online.
+    // Skip the filter during a one-interval warmup rather than wrongly excluding
+    // live providers; discovery (GET /providers) usually refreshes this sooner.
     const inWarmup = this.startedAt > 0 && now - this.startedAt < HEARTBEAT_INTERVAL_MS;
     const candidates = allProviders.filter(p => {
       if (p.deviceId && p.deviceId === localDeviceId) return false;
-      if (!inWarmup && p.lastHeartbeat > 0 && now - p.lastHeartbeat > REWARD_EPOCH_MS) return false;
+      if (!inWarmup && !this.ledger.isProviderLive(p.pub, now)) return false;
       return true;
     });
 
@@ -686,9 +820,13 @@ export class StorageManager extends EventEmitter {
     if (this.selectProviders(1).length === 0) return;
     const now = Date.now();
     for (const [cid, tracked] of this.trackedCids) {
-      const confirmed = tracked.confirmedProviders.size;
-      // Already at or above target — nothing to do.
-      if (confirmed >= REDUNDANCY_TARGET) continue;
+      // Durability is measured on LIVE leases only. `confirmedProviders` never
+      // shrinks by itself, so counting it would keep reporting a full replica set
+      // long after the holders in it stopped renewing — and the object would sit
+      // one honest failure away from loss while looking healthy.
+      const target = Math.min(this.signals.targetFor(cid), MAX_REPLICA_TARGET);
+      const live = this.liveHolderCount(tracked.confirmedProviders, now);
+      if (live >= target) continue;
 
       // Exponential backoff: each cycle without new confirmations doubles the wait,
       // capping at 5 min. This prevents flooding providers that consistently fail.
@@ -699,13 +837,27 @@ export class StorageManager extends EventEmitter {
       const keys = this.localKeys.get(tracked.ownerPub);
       if (!keys) continue;
 
-      // Under-replicated — top up with providers that haven't confirmed yet.
-      const additional = this.selectProviders(REDUNDANCY_TARGET).filter(
-        p => !tracked.confirmedProviders.has(p.pub),
-      );
+      // `planRepair` decides both halves: which holders' leases have lapsed (drop
+      // them, or the set grows without bound as the fleet churns) and how many of
+      // the offered candidates the shortfall actually needs. Selection runs ONCE —
+      // it is randomised (weighted by capacity × score, spread by country), so a
+      // second call would return a different set and the plan would name providers
+      // that are no longer on offer.
+      const offered = this.selectProviders(target);
+      const plan = planRepair({
+        holders: tracked.confirmedProviders,
+        isLive: pub => this.ledger.isProviderLive(pub, now),
+        candidates: offered.map(p => p.pub),
+        target,
+      });
+      for (const gone of plan.drop) tracked.confirmedProviders.delete(gone);
+      if (plan.drop.length > 0) {
+        console.log(`[StorageManager] Lease lapsed for ${plan.drop.length} holder(s) of ${cid.slice(0, 16)}… — re-homing`);
+      }
+      const chosen = new Set(plan.add);
+      const additional = offered.filter(p => chosen.has(p.pub));
       if (additional.length === 0) continue;
 
-      const prevConfirmed = confirmed;
       tracked.lastDistributed = now;
       const ts = Date.now();
       const payload = `cache:${cid}:${tracked.ownerPub}:${ts}`;
@@ -723,26 +875,32 @@ export class StorageManager extends EventEmitter {
         uploaderSmokeAddr,
         timestamp: ts,
         signature: sig,
-        confirmedProviderCount: confirmed,
+        confirmedProviderCount: live,
+        redundancyTarget: target,
         confirmedProviderSmokeAddrs: fallbackAddrs.length > 0 ? fallbackAddrs : undefined,
       });
       // Push blocks directly — critical when pull model fails due to NAT
       this.pushBlocksToProviders(cid, tracked.additionalCids, additional, tracked.ownerPub).catch(() => {});
-      console.log(`[StorageManager] Re-replication: ${cid.slice(0, 16)}... at ${confirmed}/${REDUNDANCY_TARGET} → adding ${additional.length} providers (${fallbackAddrs.length} fallback addr(s), wait was ${(minWaitMs / 1000).toFixed(0)}s)`);
+      console.log(`[StorageManager] Re-replication: ${cid.slice(0, 16)}... at ${live}/${target} live `
+        + `(${tracked.confirmedProviders.size} confirmed ever) → adding ${additional.length} providers `
+        + `(${fallbackAddrs.length} fallback addr(s), wait was ${(minWaitMs / 1000).toFixed(0)}s)`);
 
-      // Increment stuck counter if no new confirmations since last retry
-      if (confirmed === prevConfirmed) {
-        this.cidStuckCount.set(cid, stuckCount + 1);
-      } else {
-        this.cidStuckCount.delete(cid);
-      }
+      // Grow the backoff on every cycle that ends here. A cycle only ends here
+      // when the CID is still short of its target, and `handleReceipt` clears the
+      // counter the moment a new holder confirms — so the wait stretches exactly
+      // while nothing is working, and snaps back as soon as something does.
+      this.cidStuckCount.set(cid, stuckCount + 1);
     }
   }
 
   /**
-   * Distribute stored CIDs to up to REDUNDANCY_TARGET providers.
+   * Distribute stored CIDs to up to `replicaTarget` providers.
    * `cid` is the primary (meta) CID; `additionalCids` are bundled in the same cache
    * request so providers cache both the envelope and the content block together.
+   *
+   * Returning does NOT mean the content is safe — see `awaitHandoff`. Until
+   * `MIN_REPLICAS` live leases confirm, the uploader's copy is the only one and
+   * this CID is *staging*.
    */
   async distributeContent(
     cid: string,
@@ -753,18 +911,24 @@ export class StorageManager extends EventEmitter {
     console.log(`[StorageManager] distributeContent: cid=${cid.slice(0, 20)}… additionalCids=${additionalCids.length} uploader=${uploaderPub.slice(0, 12)}…`);
 
     const existing = this.trackedCids.get(cid);
-    const alreadyConfirmed = existing?.confirmedProviders.size ?? 0;
+    const target = Math.min(this.signals.targetFor(cid), MAX_REPLICA_TARGET);
+    const alreadyLive = existing ? this.liveHolderCount(existing.confirmedProviders) : 0;
 
-    // Already fully replicated — nothing to do.
-    if (alreadyConfirmed >= REDUNDANCY_TARGET) {
-      console.log(`[StorageManager] distributeContent: ${cid.slice(0, 16)}... already at ${alreadyConfirmed}/${REDUNDANCY_TARGET} — skipping`);
+    // Already fully replicated — nothing to do. Live leases, not confirmations
+    // ever received: the second is a memory, only the first is custody.
+    if (alreadyLive >= target) {
+      console.log(`[StorageManager] distributeContent: ${cid.slice(0, 16)}... already at ${alreadyLive}/${target} live — skipping`);
       return { providers: Array.from(existing!.confirmedProviders) };
     }
 
-    const providers = this.selectProviders(REDUNDANCY_TARGET);
+    const providers = this.selectProviders(target);
     if (providers.length === 0) {
-      console.warn(`[StorageManager] distributeContent: no remote providers — storing locally only`);
+      // Staging, not failure. The bytes exist only here, so the CID must be
+      // recorded durably and retried — a purely in-memory note is destroyed by
+      // the tab close that this whole handoff exists to survive.
+      console.warn(`[StorageManager] distributeContent: no live providers — ${cid.slice(0, 16)}… is STAGING on this device only`);
       this.pendingCids.set(cid, { ownerPub: uploaderPub, additionalCids });
+      this.stage(cid, uploaderPub, additionalCids);
       return { providers: [], error: 'No storage providers available - content stored locally only' };
     }
 
@@ -784,7 +948,8 @@ export class StorageManager extends EventEmitter {
       uploaderSmokeAddr,
       timestamp: ts,
       signature,
-      confirmedProviderCount: alreadyConfirmed,
+      confirmedProviderCount: alreadyLive,
+      redundancyTarget: target,
       confirmedProviderSmokeAddrs: confirmedSmokeAddrs.length > 0 ? confirmedSmokeAddrs : undefined,
     };
 
@@ -806,12 +971,82 @@ export class StorageManager extends EventEmitter {
     return { providers: providers.map(p => p.pub) };
   }
 
+  // ── Publish handoff ───────────────────────────────────────────────────────
+  //
+  // A publish is not complete when the upload finishes. It is complete when the
+  // network confirms `MIN_REPLICAS` LIVE holders. Until then the uploader's copy
+  // is the only one in existence, so the content is *staging*: it must be
+  // recorded durably and retried, or closing the tab right after an upload
+  // destroys it. After the handoff the author's device may vanish permanently
+  // with no loss — which is the entire point of the arrangement, and the reason
+  // authorship grants no custody exemption (ARCHITECTURE.md → Subsystem 4).
+
+  /** Record a CID as staging: owned, held only here, and needing retry across restarts. */
+  private stage(cid: string, ownerPub: string, additionalCids: string[]): void {
+    const entry = this.trackedCids.get(cid)
+      ?? { ownerPub, confirmedProviders: new Set<string>(), additionalCids, lastDistributed: 0 };
+    this.trackedCids.set(cid, entry);
+    this.net.saveTrackedCid({
+      cid, ownerPub, additionalCids,
+      confirmedProviders: Array.from(entry.confirmedProviders),
+      lastDistributed: entry.lastDistributed,
+    });
+    this.emit('storage:staging', { cid, live: this.liveHolderCount(entry.confirmedProviders) });
+  }
+
+  /**
+   * Has the network taken custody of this CID? True once `MIN_REPLICAS` holders
+   * with a LIVE lease have confirmed it.
+   *
+   * `MIN_REPLICAS` rather than `REDUNDANCY_TARGET`: the target is where repair
+   * steadies out, this is the point at which losing the uploader stops being
+   * fatal. Waiting for the full target before releasing the uploader would block
+   * on a fleet that may simply not be that large yet.
+   */
+  isHandedOff(cid: string): boolean {
+    const tracked = this.trackedCids.get(cid);
+    if (!tracked) return false;
+    return this.liveHolderCount(tracked.confirmedProviders) >= MIN_REPLICAS;
+  }
+
+  /** CIDs this node owns that the network has not taken custody of yet. */
+  stagingCids(): string[] {
+    return [...this.trackedCids.keys()].filter(cid => !this.isHandedOff(cid));
+  }
+
+  /**
+   * Resolve once the network has taken custody, or on timeout.
+   *
+   * Callers must treat `handedOff: false` as "the content still lives only on
+   * this device" — not as an error. The retry loop keeps working either way; the
+   * distinction only decides whether it is safe to tell the user they can leave.
+   */
+  async awaitHandoff(cid: string, timeoutMs = 60_000): Promise<{ handedOff: boolean; live: number }> {
+    const deadline = Date.now() + timeoutMs;
+    const live = () => this.liveHolderCount(this.trackedCids.get(cid)?.confirmedProviders ?? []);
+    while (Date.now() < deadline) {
+      const n = live();
+      if (n >= MIN_REPLICAS) {
+        this.emit('storage:handoff-complete', { cid, live: n });
+        return { handedOff: true, live: n };
+      }
+      await new Promise(r => setTimeout(r, 1_000));
+    }
+    return { handedOff: false, live: live() };
+  }
+
   // ── Pin request handling (provider side) ─────────────────────────────────
 
   private async handleCacheRequest(req: CacheRequest): Promise<void> {
-    // Reject if the uploader reports the file is already fully replicated.
-    if (typeof req.confirmedProviderCount === 'number' && req.confirmedProviderCount >= REDUNDANCY_TARGET) {
-      console.log(`[StorageManager] handleCacheRequest: ${req.cid.slice(0, 20)}… already at ${req.confirmedProviderCount} providers — ignoring`);
+    // Reject if the uploader reports the file already has its full set of live
+    // holders. The target travels with the request because demand is observed by
+    // the owner (custody.ts → replicaTarget); it is clamped here because it is a
+    // number an attacker writes, and an unbounded one would conscript capacity.
+    const askedTarget = typeof req.redundancyTarget === 'number' && Number.isFinite(req.redundancyTarget)
+      ? Math.min(Math.max(1, Math.floor(req.redundancyTarget)), MAX_REPLICA_TARGET)
+      : REDUNDANCY_TARGET;
+    if (typeof req.confirmedProviderCount === 'number' && req.confirmedProviderCount >= askedTarget) {
+      console.log(`[StorageManager] handleCacheRequest: ${req.cid.slice(0, 20)}… already at ${req.confirmedProviderCount}/${askedTarget} live holders — ignoring`);
       return;
     }
 
@@ -972,6 +1207,7 @@ export class StorageManager extends EventEmitter {
       const primaryCid = req.cids[0];
       this.trackedCids.delete(primaryCid);
       this.net.deleteTrackedCid(primaryCid);
+      this.signals.forget(primaryCid);
       this.fileIndex.delete(primaryCid);
       this.net.deleteFileIndexRecord(primaryCid);
       this.emit('file:index-updated');
@@ -1016,6 +1252,7 @@ export class StorageManager extends EventEmitter {
     // Remove old tracked CID tracking so retries don't re-distribute it
     this.trackedCids.delete(oldCid);
     this.net.deleteTrackedCid(oldCid);
+    this.signals.forget(oldCid);
     // Transfer known smoke addresses for the old CID to the new one
     const oldAddrs = this.cidToSmokeAddrs.get(oldCid);
     if (oldAddrs) {
@@ -1106,6 +1343,7 @@ export class StorageManager extends EventEmitter {
     if (oldTracked && oldTracked.ownerPub === req.ownerPub) {
       this.trackedCids.delete(req.oldCid);
       this.net.deleteTrackedCid(req.oldCid);
+      this.signals.forget(req.oldCid);
       this.fileIndex.delete(req.oldCid);
       this.net.deleteFileIndexRecord(req.oldCid);
       this.emit('file:index-updated');
@@ -1121,12 +1359,21 @@ export class StorageManager extends EventEmitter {
       const tracked = this.trackedCids.get(receipt.cid);
       if (tracked) {
         const prevSize = tracked.confirmedProviders.size;
+        const wasHandedOff = this.isHandedOff(receipt.cid);
         tracked.confirmedProviders.add(receipt.providerPub);
+        this.signals.recordSuccess(receipt.cid, receipt.providerPub);
         this.cidStuckCount.delete(receipt.cid); // new confirmation — reset backoff
-        console.log(`[StorageManager] handleReceipt: confirmed providers for ${receipt.cid.slice(0, 20)}… = ${tracked.confirmedProviders.size}`);
+        const live = this.liveHolderCount(tracked.confirmedProviders);
+        console.log(`[StorageManager] handleReceipt: ${receipt.cid.slice(0, 20)}… now ${live} live holder(s) of ${tracked.confirmedProviders.size} confirmed`);
+        // The moment the network takes custody: from here the uploader's device
+        // may disappear without losing the content.
+        if (!wasHandedOff && live >= MIN_REPLICAS) {
+          console.log(`[StorageManager] Handoff complete for ${receipt.cid.slice(0, 16)}… (${live} live holders) — safe to close`);
+          this.emit('storage:handoff-complete', { cid: receipt.cid, live });
+        }
         // If still under-replicated, reset lastDistributed so the next retry interval
         // fires quickly instead of waiting a full 30s cycle from the original send time.
-        if (tracked.confirmedProviders.size < REDUNDANCY_TARGET) {
+        if (live < Math.min(this.signals.targetFor(receipt.cid), MAX_REPLICA_TARGET)) {
           tracked.lastDistributed = Date.now() - 20_000; // eligible again in ~5-10s
         }
         // Persist updated confirmed providers
@@ -1221,7 +1468,7 @@ export class StorageManager extends EventEmitter {
       // For under-replicated CIDs, also probe unconfirmed providers — this discovers
       // providers that cached the content but whose receipts never reached us (e.g.
       // the uploader's relay was down when the receipt was published).
-      const unconfirmedEntries = tracked.confirmedProviders.size < REDUNDANCY_TARGET
+      const unconfirmedEntries = this.liveHolderCount(tracked.confirmedProviders) < REDUNDANCY_TARGET
         ? this.ledger.getStorageProviders()
             .filter(p => p.smokeAddr && !tracked.confirmedProviders.has(p.pub) &&
               (!p.deviceId || p.deviceId !== localDeviceId))
@@ -1251,13 +1498,19 @@ export class StorageManager extends EventEmitter {
           // serving tampered or corrupted data. No local copy needed for verification.
           const integrous = await this.store.verifyBlockIntegrity(cid, fetchedBytes);
           if (!integrous) {
+            // Not a flaky link — the provider answered, and what it served does not
+            // hash to the CID. That is proof, so it costs the assignment at once
+            // rather than after a streak.
             console.warn(`[StorageManager] CID integrity failure from ${pub.slice(0, 12)}… - block is tampered`);
             tracked.confirmedProviders.delete(pub);
+            this.cidStuckCount.delete(cid);
+            tracked.lastDistributed = 0;
             // fall through to receipt with success=false and latencyMs=9999
           } else {
             latencyMs = Date.now() - start;
             success = true;
             responseRank = ++rankCounter; // atomic: only one microtask runs at a time
+            this.signals.recordSuccess(cid, pub);
             if (!wasConfirmed(pub)) {
               console.log(`[StorageManager] Spot-check discovered unconfirmed provider ${pub.slice(0, 12)}… has ${cid.slice(0, 16)}…`);
             }
@@ -1265,12 +1518,23 @@ export class StorageManager extends EventEmitter {
         } catch {
           // Only evict from confirmedProviders if we previously confirmed this provider.
           // For unconfirmed candidates a 404/timeout is expected and should not trigger re-replication.
+          //
+          // And not on the FIRST failure. A WebRTC dial through a flaky relay fails
+          // for reasons that have nothing to do with whether the bytes are there;
+          // evicting on one made every relay hiccup look like data loss and started
+          // a re-replication round against holders that were fine. `CustodySignals`
+          // counts CONSECUTIVE failures per (cid, provider) — a success anywhere in
+          // between clears the streak.
           if (wasConfirmed(pub)) {
-            tracked.confirmedProviders.delete(pub);
-            // Reset backoff so the next re-replication interval fires quickly rather
-            // than waiting up to 5 minutes from a previous failed-upload backoff.
-            this.cidStuckCount.delete(cid);
-            tracked.lastDistributed = 0;
+            const streak = this.signals.recordFailure(cid, pub);
+            if (this.signals.shouldEvict(cid, pub)) {
+              console.warn(`[StorageManager] Evicting ${pub.slice(0, 12)}… from ${cid.slice(0, 16)}… after ${streak} consecutive failures`);
+              tracked.confirmedProviders.delete(pub);
+              // Reset backoff so the next re-replication interval fires quickly rather
+              // than waiting up to 5 minutes from a previous failed-upload backoff.
+              this.cidStuckCount.delete(cid);
+              tracked.lastDistributed = 0;
+            }
           }
         }
 
@@ -1319,8 +1583,38 @@ export class StorageManager extends EventEmitter {
     return this.trackedCids;
   }
 
+  /**
+   * File records for files this node OWNS — not a view of the network.
+   * For anything else, ask the archives (`node.lookupFiles`).
+   */
   getFileIndex(): Map<string, FileIndexRecord> {
     return this.fileIndex;
+  }
+
+  /**
+   * Drop file records belonging to other accounts, in memory and in IDB.
+   *
+   * The one-time migration off the global index: a device that ran an older
+   * build has an IndexedDB store holding a record for every file it ever saw
+   * announced, and `start()` loads it back — so filtering the live gossip alone
+   * would leave the `O(N)` set sitting on disk forever, growing again on any
+   * downgrade. Called after keys are registered, because "ours" is undecidable
+   * before that: `start()` runs with `localKeys` still empty, and pruning then
+   * would delete the node's own records.
+   */
+  async pruneForeignFileIndex(): Promise<void> {
+    if (this.localKeys.size === 0) return;
+    let dropped = 0;
+    for (const [cid, rec] of [...this.fileIndex]) {
+      if (this.localKeys.has(rec.uploaderPub)) continue;
+      this.fileIndex.delete(cid);
+      await this.net.deleteFileIndexRecord(cid);
+      dropped++;
+    }
+    if (dropped > 0) {
+      console.log(`[StorageManager] Dropped ${dropped} foreign file record(s) — the index is own-files-only now`);
+      this.emit('file:index-updated');
+    }
   }
 
   async announceFile(cid: string, sizeBytes: number, mimeType: string | undefined, uploaderPub: string, keys: KeyPair): Promise<void> {
@@ -1345,6 +1639,7 @@ export class StorageManager extends EventEmitter {
     this.trackedCids.delete(cid);
     this.net.deleteTrackedCid(cid);
     this.cidToSmokeAddrs.delete(cid);
+    this.signals.forget(cid);
     this.net.publishFileAnnouncement({ cid, uploaderPub: ownerPub, sizeBytes: 0, timestamp, removed: true, signature });
     this.emit('file:index-updated');
     this.broadcastStorageStats(ownerPub, keys).catch(() => {});
@@ -1371,9 +1666,22 @@ export class StorageManager extends EventEmitter {
    * Retrieve a block, routing to known providers for this CID first.
    * Wraps SmokeStore.retrieve() with per-CID peer hints so retrieval doesn't
    * broadcast to all peerFallbacks when we know exactly who holds the data.
+   *
+   * This is also where repair is triggered. A read is the cheapest liveness
+   * check there is — it was going to happen anyway — so a successful one counts
+   * as demand (which may raise the replica target) and a failed one says every
+   * source we knew is unreachable, which is the signal to re-place the content
+   * now rather than at whatever a watcher's next poll would have been.
    */
   async retrieve(cid: string, timeoutMs?: number): Promise<Uint8Array> {
-    return this.store.retrieve(cid, timeoutMs, this.getCidSmokeAddrs(cid));
+    try {
+      const data = await this.store.retrieve(cid, timeoutMs, this.getCidSmokeAddrs(cid));
+      this.signals.recordRead(cid);
+      return data;
+    } catch (err) {
+      this.repairOnReadFailure(cid);
+      throw err;
+    }
   }
 
   /** Check whether a local account is registered as a storage provider */
