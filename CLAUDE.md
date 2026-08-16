@@ -456,11 +456,17 @@ Super-nodes run on **cloudify.ro (Acvile)**, an OpenStack platform, region
 (gitignored — see Secrets above; `open stack app credentials.txt` is the same
 credential, also gitignored).
 
-```sh
+```powershell
 powershell -File scripts/os-setup.ps1     # one-time: .openstack-venv + python-openstackclient
-./scripts/os.sh flavor list               # any openstack command, credentials pre-loaded
-./scripts/os.sh server list
+.\scripts\os.ps1 flavor list              # any openstack command, credentials pre-loaded
+.\scripts\os.ps1 server list
 ```
+
+**Use `os.ps1` from PowerShell, `os.sh` from Git Bash — the wrong one fails
+SILENTLY.** PowerShell has no handler for a `.sh` file, so `./scripts/os.sh …`
+runs nothing and prints nothing; `bash scripts/os.sh …` resolves to WSL's bash,
+which has no distro here. Three security-group rules were silently not created
+that way (2026-08-16). If an openstack command prints no table, it did not run.
 
 **Status 2026-08-08: cloudify compute provisioning is DOWN platform-wide** —
 server builds fail from their own panel too (user-reproduced), so don't debug our
