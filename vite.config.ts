@@ -74,6 +74,20 @@ export default defineConfig(({ command }) => {
       '/keyblob': {
         target: 'http://localhost:9092',
       },
+      // The rest of the archive API against the same-origin dev relay. These
+      // were missing, so `relayResolveBases()`'s same-origin base ('') hit the
+      // Vite dev server instead of the relay and got index.html back with a 200
+      // — `res.json()` then threw and the base failed silently inside
+      // `Promise.allSettled`. The local relay's archive was therefore invisible
+      // for provider discovery, file lookups and every G2 proof, on BOTH the
+      // desktop and the phone. `/resolve` was proxied; nothing else was, and
+      // `/files` inherited the gap when it landed.
+      '/providers': { target: 'http://localhost:9092' },
+      '/files': { target: 'http://localhost:9092' },
+      '/pending-sends': { target: 'http://localhost:9092' },
+      '/head-proof': { target: 'http://localhost:9092' },
+      '/token': { target: 'http://localhost:9092' },
+      '/block': { target: 'http://localhost:9092' },
       // ⚠ DEV ONLY, REMOVE BEFORE PRODUCTION — same-origin routes to the raw-IP
       // dev super-nodes so the HTTPS tunnel (the only way to reach a camera on a
       // phone) can attest against more than one relay. Empty in every build.

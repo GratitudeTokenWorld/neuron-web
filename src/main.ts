@@ -1487,7 +1487,10 @@ function refreshRelays() {
       const ago = Math.floor((Date.now() - r.lastSeen) / 1000);
       const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago / 60)}m ago` : `${Math.floor(ago / 3600)}h ago`;
       return `<tr>
-        <td style="padding:4px 8px;"><span style="color:${live ? 'var(--success)' : 'var(--danger)'}">&#9679;</span> ${live ? 'Live' : 'Offline'}</td>
+        <td style="padding:4px 8px;" title="${live
+          ? 'direct libp2p connection open'
+          : 'no direct libp2p connection. Over the HTTPS tunnel a phone CANNOT dial a raw-IP ws:// relay (mixed content), so only the same-origin dev relay is ever Live there — the others are still reached over HTTP and still carry your traffic via relay-to-relay federation.'}"><span style="color:${
+          live ? 'var(--success)' : 'var(--warning)'}">&#9679;</span> ${live ? 'Live' : 'No P2P link'}</td>
         <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim);" title="${escHtml(r.addr)}">${escHtml(trunc(r.addr, 40))}</td>
         <td style="padding:4px 8px;">${agoStr}</td>
         <td style="padding:4px 8px;">${r.failCount}</td>
