@@ -466,7 +466,7 @@ is new.
 covers everything about the archive API that does *not* need a face:
 
 ```sh
-npx tsx scripts/g1-resolve-smoke.mts    # 41 checks; expect ALL CHECKS PASSED
+npx tsx scripts/g1-resolve-smoke.mts    # 55 checks; expect ALL CHECKS PASSED
 ```
 
 It publishes a signed account record and a real signed sender chain to relay-1

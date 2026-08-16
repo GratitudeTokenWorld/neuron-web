@@ -216,7 +216,7 @@ relay-verified action sequence under server-side backoff.
 
 TESTPLAN T1–T7 green; T1, T5 and T5.3 re-verified on v3 (2026-08-15) with all
 four T5 sub-checks including photo-refusal and lockout-survives-a-wipe. Run the
-live probe `npx tsx scripts/g1-resolve-smoke.mts` (41 checks) after every relay
+live probe `npx tsx scripts/g1-resolve-smoke.mts` (55 checks) after every relay
 deploy.
 
 Lessons from these rounds worth carrying into Phase 3:

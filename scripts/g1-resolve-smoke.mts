@@ -13,6 +13,11 @@
  *   3. GET /resolve serves it, and the client-side verifier accepts it
  *   4. a FORGED record (bad signature, higher _version) must NOT evict it
  *
+ * Also covers /pending-sends, /head-proof, /token, the v3 key-blob and
+ * recovery-share gates, and (2026-08-16) /files — the file index that replaced
+ * the global `files` topic, including the inflated-size and wrong-CID records
+ * its client-side fold must reject.
+ *
  * Leaves one throwaway `g1smoke…` record in the relays' account archive —
  * dev-mode data, wiped with the next reset.
  */
@@ -277,6 +282,87 @@ check(
       check(photo.status !== 200, `${r.name} refuses a motionless (photo) trajectory proof (got ${photo.status})`);
     }
   }
+}
+
+// ── File index (2026-08-16): GET /files replaced the global `files` topic ────
+// The last O(N) in storage. Announcements still gossip — that is how archives
+// learn them — but no client keeps another account's, so this endpoint is the
+// only way a node sees a file it does not own. relay/ is typechecked by nothing
+// and tested by nothing, so this is the only automated coverage its ingest path
+// (verify → newest-wins → tombstone) has.
+{
+  const { fileAnnouncePayload, fileRemovePayload, foldFileRecords } = await import('../src/engine/content/file-index.js');
+  const { fetchFileRecords } = await import('../src/network/account-resolver.js');
+  const { generateKeyPair: appKeyPair, signData, verifySignature } = await import('../src/core/crypto.js');
+  const bases = RELAYS.map((r) => r.http);
+  const verify = async (payload: string, pk: string, sig: string) => {
+    try { return (await verifySignature(sig, pk)) === payload; } catch { return false; }
+  };
+  const filesTopic = 'neuronchain/v1/testnet/files';
+  pubsub.subscribe(filesTopic);
+
+  // File records are signed with the APP's WebCrypto key, not the engine's.
+  const appKeys = await appKeyPair();
+  const cid = 'f' + hashHex(utf8ToBytes(`smoke-file-${username}`)).slice(1);
+  const meta = { cid, sizeBytes: 4096, mimeType: 'image/png', timestamp: Date.now(), uploaderPub: appKeys.pub };
+  const announce = { ...meta, signature: await signData(fileAnnouncePayload(meta), appKeys) };
+
+  // An INFLATED record: the signature is honest, the size is not. A verifier
+  // that trusted the signed envelope's own string, instead of rebuilding the
+  // payload from the record's fields, would accept this.
+  const inflated = { ...announce, cid: cid.slice(0, -1) + '0', sizeBytes: 1_073_741_824 };
+  // And one whose signature belongs to a different CID entirely.
+  const forgedFile = { ...meta, cid: cid.slice(0, -2) + 'ab', signature: announce.signature };
+
+  const pubFile = (r: unknown) => pubsub.publish(filesTopic, new TextEncoder().encode(JSON.stringify(r)));
+  await pubFile(announce); await pubFile(inflated); await pubFile(forgedFile);
+  console.log('published a signed file record (+ an inflated and a forged one)');
+  await sleep(4000);
+
+  for (const r of RELAYS) {
+    const res = await fetch(`${r.http}/files?network=testnet&cid=${encodeURIComponent(cid)}`);
+    const body = await res.json() as { records?: unknown[]; total?: number };
+    check(res.ok && Array.isArray(body.records) && body.records.length === 1,
+      `${r.name} serves the signed file record via /files?cid=`);
+    check(typeof body.total === 'number',
+      `${r.name} reports its own archive total (never a network figure)`);
+  }
+
+  // The two bad records must die at the RELAY, not merely at the client. Both
+  // checks below would pass either way if we only tested the fold, so ask the
+  // archive for them directly — this is the only automated coverage the relay's
+  // own verifier has.
+  for (const r of RELAYS) {
+    for (const [label, badCid] of [['inflated size', inflated.cid], ['wrong-CID signature', forgedFile.cid]] as const) {
+      const res = await fetch(`${r.http}/files?network=testnet&cid=${encodeURIComponent(badCid)}`);
+      const body = await res.json() as { records?: unknown[] };
+      check((body.records ?? []).length === 0,
+        `${r.name} refuses to ARCHIVE a record with a ${label}`);
+    }
+  }
+
+  const { records } = await fetchFileRecords(bases, 'testnet', { limit: 50 });
+  const folded = await foldFileRecords(records, verify);
+  check(folded.has(cid), 'the honest file record survives client-side verification');
+  check(!folded.has(inflated.cid),
+    'an INFLATED size is rejected — the payload is rebuilt from the record, not trusted');
+  check(!folded.has(forgedFile.cid), 'a record carrying another CID\'s signature is rejected');
+
+  // A withdrawal must be served as a TOMBSTONE, not as an absence: a node that
+  // already holds the file has to be able to LEARN it was withdrawn.
+  const tombTs = Date.now() + 1;
+  const tomb = { cid, sizeBytes: 0, timestamp: tombTs, uploaderPub: appKeys.pub, removed: true,
+    signature: await signData(fileRemovePayload(cid, appKeys.pub, tombTs), appKeys) };
+  await pubFile(tomb);
+  await sleep(4000);
+  const after = await fetchFileRecords(bases, 'testnet', { cid, limit: 50 });
+  check(after.records.some((r) => r.cid === cid && r.removed === true),
+    'a withdrawal is served as a tombstone, not as an absent row');
+  check(!(await foldFileRecords(after.records, verify)).has(cid),
+    'and the fold drops the withdrawn file rather than listing it');
+
+  const unknownCid = await fetchFileRecords(bases, 'testnet', { cid: 'ab'.repeat(32) });
+  check(unknownCid.records.length === 0, 'an unknown cid yields no file records');
 }
 
 await node.stop();
