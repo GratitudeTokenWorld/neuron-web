@@ -580,3 +580,87 @@ describe('uptimeFraction — one definition, not three', () => {
     expect(p.score).toBeCloseTo(l.uptimeFraction(p, at)!, 10);
   });
 });
+
+describe('uptime does not oscillate for a provider that never misses', () => {
+  /**
+   * Driven at an actual CADENCE, not from hand-placed timestamps — the variable
+   * no other test here varies, and the one the bug lived in. A real timer fires
+   * at `interval + jitter` (one-sided late, never early), so six intervals span
+   * slightly MORE than one epoch; a counting window exactly one epoch wide
+   * therefore loses the oldest renewal seconds before its replacement lands, and
+   * a flawless provider reads 5/6. Measured at 6.3% of samples before the fix.
+   */
+  function runCadence(jitterFrac: number, epochs: number, sampleMs: number) {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'd' }), t0);
+    const p = l.providers.get(PUB)!;
+
+    let a = 12345 >>> 0;
+    const rnd = () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 4294967296; };
+
+    const end = t0 + epochs * REWARD_EPOCH_MS;
+    let next = t0;
+    const seen: number[] = [];
+    for (let now = t0; now < end; now += sampleMs) {
+      while (next <= now) {
+        l.apply(blk('storage-heartbeat', next, {}), next);
+        next += HEARTBEAT_INTERVAL_MS + rnd() * HEARTBEAT_INTERVAL_MS * jitterFrac;
+      }
+      // Only judge once a full epoch of history exists.
+      if (now - t0 < REWARD_EPOCH_MS) continue;
+      p.heartbeatsLast24h = l.countHeartbeatsLast24h(PUB, now);
+      seen.push(l.uptimeFraction(p, now)!);
+    }
+    return seen;
+  }
+
+  it('reads 100% at every sample, at the shipped jitter', () => {
+    const seen = runCadence(1 / 48, 6, 5_000);
+    expect(seen.length).toBeGreaterThan(100);
+    expect(Math.min(...seen)).toBe(1);
+  });
+
+  it('holds with a wide margin over the jitter that ships', () => {
+    // Shipped jitter is 1/48 of an interval (~2%). The slack tolerates a mean
+    // lateness of half an interval spread over six of them — 8.3% each — so
+    // there is roughly a 4x margin. Pinned so shrinking the slack or growing the
+    // jitter cannot quietly re-open the oscillation.
+    expect(Math.min(...runCadence(4 / 48, 6, 5_000))).toBe(1);
+  });
+
+  it('DOES degrade under sustained gross lateness — that is signal, not noise', () => {
+    // A provider renewing 20% slower than the protocol asks really is renewing
+    // less often, and its lease really is closer to lapsing. The slack absorbs
+    // jitter; it is not meant to absorb a provider that cannot keep the cadence.
+    expect(Math.min(...runCadence(10 / 48, 6, 5_000))).toBeLessThan(1);
+  });
+
+  it('still FALLS when a renewal is genuinely missed', () => {
+    // The slack must not be so generous that it hides a real gap — a missed
+    // renewal leaves a hole of two full intervals, far wider than the slack.
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'd' }), t0);
+    const p = l.providers.get(PUB)!;
+    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
+      if (i === 3) continue;                       // one renewal never happens
+      const ts = t0 + i * HEARTBEAT_INTERVAL_MS;
+      l.apply(blk('storage-heartbeat', ts, {}), ts);
+    }
+    const at = t0 + (MAX_HEARTBEATS_PER_EPOCH - 1) * HEARTBEAT_INTERVAL_MS;
+    p.heartbeatsLast24h = l.countHeartbeatsLast24h(PUB, at);
+    expect(l.uptimeFraction(p, at)!).toBeLessThan(1);
+  });
+
+  it('reads 0 for a provider that stopped renewing entirely', () => {
+    const l = new ProviderLedger();
+    const t0 = 1_000 * REWARD_EPOCH_MS;
+    l.apply(blk('storage-register', t0, { capacityGB: 10, deviceId: 'd' }), t0);
+    l.apply(blk('storage-heartbeat', t0, {}), t0);
+    const p = l.providers.get(PUB)!;
+    const later = t0 + 5 * REWARD_EPOCH_MS;
+    p.heartbeatsLast24h = l.countHeartbeatsLast24h(PUB, later);
+    expect(l.uptimeFraction(p, later)).toBe(0);
+  });
+});

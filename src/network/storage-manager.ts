@@ -45,7 +45,14 @@ import type { Block as EngineBlock } from '../engine/core/block';
 // constant. Under the `fast` dev profile a reward epoch is 12 minutes, and a
 // 30-minute reward poll would simply never fire inside one — the compressed
 // profile would look broken while behaving correctly.
-const jitterMs = () => HEARTBEAT_INTERVAL_MS / 48;            // ±5 min at production timing
+// Jitter is one-sided LATE on purpose — never early. An early renewal risks
+// being refused by `countsAsRenewal` and burning a chain block for nothing, so
+// the timer overshoots rather than undershoots. The cost is that six intervals
+// span slightly more than one epoch, which is why the uptime counting window
+// carries a half-interval of slack (see countHeartbeatsLast24h). The old
+// comment here claimed "±" while the code was `Math.random() * J`; the code was
+// right and the comment was not.
+const jitterMs = () => HEARTBEAT_INTERVAL_MS / 48;            // up to +5 min at production timing
 const rewardCheckMs = () => Math.max(5_000, REWARD_EPOCH_MS / 48);   // 30 min at production timing
 const spotCheckBaseMs = () => Math.max(10_000, REWARD_EPOCH_MS / 24); // 1 h at production timing
 const receiptWindowMs = () => REWARD_EPOCH_MS;                // one epoch of rolling receipts

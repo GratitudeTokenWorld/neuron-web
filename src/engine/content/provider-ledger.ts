@@ -661,11 +661,31 @@ export class ProviderLedger {
     return capacity;
   }
 
-  /** Counted heartbeats in the 24h window ending at `refTime`. */
+  /**
+   * Counted renewals in the trailing window ending at `refTime`.
+   *
+   * The window is one epoch **plus half a heartbeat interval**, and that slack is
+   * the whole point. The count is divided by `MAX_HEARTBEATS_PER_EPOCH`, so the
+   * two only agree if a perfect provider reliably has that many renewals inside
+   * the window — and it does not: a real timer fires at `interval + jitter`
+   * (never early, see `scheduleNextHeartbeat`), so six intervals span slightly
+   * MORE than one epoch. The oldest renewal therefore ages out of a
+   * one-epoch-wide window a few seconds before its replacement arrives, and a
+   * flawless provider reads 5/6 during the gap.
+   *
+   * Measured before the fix, on the compressed dev profile: a provider that
+   * never missed a beat displayed 83% for 6.3% of the time, and its score fell
+   * with it. Found by Lucian, 2026-08-16, who noticed the number oscillating.
+   *
+   * Half an interval is deliberately less than a whole one: it absorbs
+   * accumulated jitter (six intervals of it is a couple of percent) while a
+   * genuinely MISSED renewal leaves a gap of two full intervals, which the
+   * window still cannot hide.
+   */
   countHeartbeatsLast24h(pub: string, refTime: number): number {
     const times = this.heartbeatTimes.get(pub);
     if (!times) return 0;
-    const cutoff = refTime - REWARD_EPOCH_MS;
+    const cutoff = refTime - REWARD_EPOCH_MS - HEARTBEAT_INTERVAL_MS / 2;
     return times.filter(t => t >= cutoff).length;
   }
 
@@ -688,7 +708,7 @@ export class ProviderLedger {
    * capacity) — declared-but-empty capacity earns nothing.
    */
   /**
-   * Heartbeats this provider could have sent inside the trailing epoch window.
+   * Heartbeats this provider could have sent inside the counting window.
    *
    * Bounded by how long it has been registered: a node registered one interval
    * ago can only ever have sent one, so measuring it against a full epoch's

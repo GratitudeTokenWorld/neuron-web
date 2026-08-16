@@ -652,6 +652,26 @@ history, by the Fan-IN decision immediately below. What it can honestly show
 about a discovered provider is the freshness of its latest signed heartbeat, and
 now does.
 
+A second round of the same fault, found the next day by watching the number
+move: a provider that never missed a renewal **oscillated between 100% and 83%**.
+Both halves of the fraction were right and dividing one by the other was not.
+The numerator counted renewals in a trailing window exactly one epoch wide; the
+denominator was `epoch ÷ interval`. But a real timer fires at
+`interval + jitter` — one-sided LATE, deliberately, because an early renewal
+risks being refused as too-early and burning a chain block for nothing — so six
+intervals span slightly MORE than one epoch. The oldest renewal aged out of the
+window a few seconds before its replacement landed. Measured on the compressed
+dev profile: 83% for 6.3% of samples.
+
+The counting window now carries **half a heartbeat interval** of slack. Half,
+not a whole one: a whole interval would also absorb a genuinely MISSED renewal
+(a gap of two intervals) and hide the thing the metric exists to show. Pinned by
+a test driven at an actual cadence rather than from hand-placed timestamps —
+the variable no earlier test varied, and the one the bug lived in, exactly as
+`eye-hold.ts` had to be tested at a frame RATE. Sustained lateness beyond the
+slack still degrades the reading, which is signal: a provider renewing 20%
+slower than the protocol asks is closer to losing its lease.
+
 ### Fan-IN: the invariant read from the other direction (decided 2026-08-15)
 
 The scale invariant is usually stated as a bound on what one node must *hold*.
