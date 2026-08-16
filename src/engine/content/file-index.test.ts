@@ -7,8 +7,12 @@ import {
   isWellFormedFileRecord,
   selectFileRecords,
   foldFileRecords,
+  countLiveFiles,
+  tombstoneExpired,
+  TOMBSTONE_RETAIN_MS,
   type FileRecord,
 } from './file-index.js';
+import { MAX_OFFLINE_MS } from './provider-ledger.js';
 
 /**
  * A stand-in signer: the "signature" is the payload the signer actually signed,
@@ -99,10 +103,13 @@ describe('selectFileRecords', () => {
     expect(out[0]!.timestamp).toBe(9);
   });
 
-  it('still serves tombstones — silence cannot tell a holder a file was withdrawn', () => {
-    const out = selectFileRecords([rec({ cid: 'a', timestamp: 1 }), rec({ cid: 'a', timestamp: 2, removed: true })]);
-    expect(out).toHaveLength(1);
-    expect(out[0]!.removed).toBe(true);
+  it('a withdrawal supersedes the announcement it withdraws', () => {
+    // Not both rows with the client left to pick: newest per CID wins, and the
+    // withdrawal is newest. Whether it is then SERVED depends on the query —
+    // see the browse-vs-lookup rule below.
+    const rows = [rec({ cid: 'a', timestamp: 1 }), rec({ cid: 'a', timestamp: 2, removed: true })];
+    expect(selectFileRecords(rows)).toHaveLength(0);              // browse: hidden
+    expect(selectFileRecords(rows, { cid: 'a' })[0]!.removed).toBe(true);   // lookup: told
   });
 
   it('bounds the answer — an unbounded one is the firehose over HTTP', () => {
@@ -184,5 +191,82 @@ describe('foldFileRecords', () => {
   it('works with an async verifier (WebCrypto is async)', async () => {
     const idx = await foldFileRecords([rec({ cid: 'a' })], async (p, k, s) => verify(p, k, s));
     expect(idx.size).toBe(1);
+  });
+});
+
+// ── Tombstones are not files ─────────────────────────────────────────────────
+
+describe('countLiveFiles', () => {
+  it('does not count withdrawals', () => {
+    // The bug: the Storage tab reported "4 files archived" on a network with
+    // none — all four rows were withdrawals left by the smoke probe.
+    const withdrawn = [
+      rec({ cid: 'a', timestamp: 1 }), rec({ cid: 'a', timestamp: 2, removed: true }),
+      rec({ cid: 'b', timestamp: 1 }), rec({ cid: 'b', timestamp: 2, removed: true }),
+    ];
+    expect(withdrawn).toHaveLength(4);
+    expect(countLiveFiles(withdrawn)).toBe(0);
+  });
+
+  it('counts a file once however many times it was re-announced', () => {
+    expect(countLiveFiles([
+      rec({ cid: 'a', timestamp: 1 }), rec({ cid: 'a', timestamp: 5 }), rec({ cid: 'a', timestamp: 9 }),
+    ])).toBe(1);
+  });
+
+  it('counts a file that was withdrawn and then re-published', () => {
+    expect(countLiveFiles([
+      rec({ cid: 'a', timestamp: 1 }),
+      rec({ cid: 'a', timestamp: 2, removed: true }),
+      rec({ cid: 'a', timestamp: 3 }),
+    ])).toBe(1);
+  });
+
+  it('ignores malformed rows', () => {
+    expect(countLiveFiles([rec({ cid: 'a' }), { cid: '' } as unknown as FileRecord])).toBe(1);
+  });
+});
+
+describe('tombstone retention', () => {
+  it('outlives the custody lease, so a returning holder can still be told', () => {
+    // A node absent longer than MAX_OFFLINE discards everything on rejoin, so it
+    // never needs to hear about individual deletions — the window only has to
+    // cover holders whose lease is still alive.
+    expect(TOMBSTONE_RETAIN_MS).toBeGreaterThan(MAX_OFFLINE_MS);
+  });
+
+  it('expires a withdrawal only after the window', () => {
+    const t = rec({ cid: 'a', timestamp: 1_000, removed: true });
+    expect(tombstoneExpired(t, 1_000 + TOMBSTONE_RETAIN_MS)).toBe(false);
+    expect(tombstoneExpired(t, 1_000 + TOMBSTONE_RETAIN_MS + 1)).toBe(true);
+  });
+
+  it('never expires a live announcement — this prunes deletions only', () => {
+    const live = rec({ cid: 'a', timestamp: 1_000 });
+    expect(tombstoneExpired(live, 1_000 + TOMBSTONE_RETAIN_MS * 100)).toBe(false);
+  });
+});
+
+describe('selectFileRecords — tombstones in a browse vs a lookup', () => {
+  const mixed = [
+    rec({ cid: 'live', timestamp: 1 }),
+    rec({ cid: 'gone', timestamp: 9, removed: true }),
+  ];
+
+  it('hides withdrawals from a browse', () => {
+    // The page is newest-first and deletions are by definition the newest thing
+    // that happened, so on a busy network every page would be tombstones and no
+    // live file would ever appear.
+    expect(selectFileRecords(mixed).map(r => r.cid)).toEqual(['live']);
+  });
+
+  it('still serves one when it is asked for BY CID', () => {
+    const out = selectFileRecords(mixed, { cid: 'gone' });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.removed).toBe(true);
+  });
+
+  it('a browse by owner also hides withdrawals', () => {
+    expect(selectFileRecords(mixed, { owner: 'alice' }).map(r => r.cid)).toEqual(['live']);
   });
 });

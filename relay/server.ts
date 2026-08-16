@@ -50,7 +50,7 @@ import { bytesToHex, hexToBytes } from '../src/engine/core/hash.js';
 import { decodeBlock, encodeBlock, verifyBlock } from '../src/engine/core/block.js';
 import { selectDiscoveryBlocks } from '../src/engine/content/provider-discovery.js';
 import {
-  selectFileRecords, isWellFormedFileRecord, payloadFor,
+  selectFileRecords, isWellFormedFileRecord, payloadFor, countLiveFiles, tombstoneExpired,
 } from '../src/engine/content/file-index.js';
 import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
@@ -558,6 +558,18 @@ async function archiveFileRecord(rec, network) {
   // to be able to LEARN it was withdrawn, and an absent row cannot say that.
   fileStore.set(key, { ...rec, network });
   filesDirty = true;
+  // Retire withdrawals nobody can still need. A tombstone exists so a node
+  // HOLDING the file learns it was withdrawn, and a node absent longer than its
+  // custody lease discards every foreign byte on rejoin regardless — so it only
+  // has to outlive the lease. Without this the archive grows by one permanent
+  // row per deletion, forever.
+  const cutNow = Date.now();
+  let expired = 0;
+  for (const [k, v] of fileStore) {
+    if (v.network === network && tombstoneExpired(v, cutNow)) { fileStore.delete(k); expired++; }
+  }
+  if (expired > 0) console.log(`[Archive] Retired ${expired} expired tombstone(s)`);
+
   if (fileStore.size > MAX_FILE_RECORDS) {
     const excess = fileStore.size - MAX_FILE_RECORDS;
     const oldest = [...fileStore.entries()]
@@ -931,7 +943,11 @@ async function main() {
           limit: Number(q.get('limit')) || undefined,
         });
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(JSON.stringify({ records, total: scoped.length }));
+        // LIVE files, not rows. A withdrawal is retained as a tombstone so a
+        // holder can learn about it, but a withdrawn file is not a file —
+        // counting rows reported "4 files archived" on a network with none,
+        // all four being probe withdrawals. Found by Lucian, 2026-08-16.
+        res.end(JSON.stringify({ records, total: countLiveFiles(scoped) }));
 
       } else if (req.url?.startsWith('/resolve?')) {
         // G1 on-demand directory lookup: GET /resolve?username=<u>|pub=<p>&network=<n>

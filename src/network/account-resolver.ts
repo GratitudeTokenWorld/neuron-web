@@ -273,10 +273,12 @@ export async function fetchProviders(
  * cannot serve an inflated size under a valid signature. Asking every relay and
  * taking the union means one relay cannot hide a file either.
  *
- * `archiveTotals` is per-relay ON PURPOSE. No node knows how many files exist on
- * the network, and summing the relays would double-count everything they both
- * hold while still missing whatever neither does. The caller gets the raw
- * per-archive figures and must present them as what an archive can see.
+ * `archiveTotals` is per-relay ON PURPOSE, and counts LIVE files — a withdrawn
+ * file is retained as a tombstone so a holder can learn about it, but it is not
+ * a file. No node knows how many files exist on the network, and summing the
+ * relays would double-count everything they both hold while still missing
+ * whatever neither does. The caller gets the raw per-archive figures and must
+ * present them as what an archive can see.
  */
 export async function fetchFileRecords(
   bases: readonly string[],

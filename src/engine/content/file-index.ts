@@ -34,6 +34,8 @@
  * has, against one shared definition of what the payload is.
  */
 
+import { MAX_OFFLINE_MS } from './provider-ledger.js';
+
 /** A file announcement — the uploader's own signed claim about its own content. */
 export interface FileRecord {
   cid: string;
@@ -56,6 +58,26 @@ export interface FileRecord {
  */
 export const FILE_QUERY_LIMIT_DEFAULT = 50;
 export const FILE_QUERY_LIMIT_MAX = 200;
+
+/**
+ * How long a withdrawal is retained after the file is gone.
+ *
+ * Derived, not picked. A tombstone exists so a node still HOLDING the file
+ * learns it was withdrawn — and a node absent for longer than its custody lease
+ * discards every foreign byte on rejoin anyway (custody.ts → `planRejoin`), so
+ * it never needs to be told about individual deletions. Tombstones therefore
+ * only have to outlive the lease; twice `MAX_OFFLINE_MS` is that with margin.
+ *
+ * Without a bound the archive grows by one permanent row per deletion, forever —
+ * `O(total deletions)`, which is the same shape as the violation this module
+ * exists to remove, arriving by the back door.
+ */
+export const TOMBSTONE_RETAIN_MS = 2 * MAX_OFFLINE_MS;
+
+/** Is this withdrawal old enough that no live holder could still need it? */
+export function tombstoneExpired(r: FileRecord, now: number): boolean {
+  return !!r.removed && now - r.timestamp > TOMBSTONE_RETAIN_MS;
+}
 
 /** The exact string a file announcement signs. Shared so signer and verifier cannot drift. */
 export function fileAnnouncePayload(r: Pick<FileRecord, 'cid' | 'sizeBytes' | 'uploaderPub' | 'timestamp'>): string {
@@ -100,6 +122,26 @@ export interface FileQuery {
 }
 
 /**
+ * Live files among these records — tombstones excluded.
+ *
+ * What "how many files are there?" means. A withdrawn file is not a file, and
+ * counting rows instead of files reported four files on a network that had none
+ * (all four were my own probe's withdrawals — found by Lucian, 2026-08-16). The
+ * archive keeps the tombstone deliberately; it just is not a file.
+ */
+export function countLiveFiles(records: Iterable<FileRecord>): number {
+  const newest = new Map<string, FileRecord>();
+  for (const r of records) {
+    if (!isWellFormedFileRecord(r)) continue;
+    const prev = newest.get(r.cid);
+    if (!prev || r.timestamp > prev.timestamp) newest.set(r.cid, r);
+  }
+  let live = 0;
+  for (const r of newest.values()) if (!r.removed) live++;
+  return live;
+}
+
+/**
  * What an archive serves for a query, bounded and newest-first.
  *
  * Per CID only the newest record survives, so a withdrawal supersedes the
@@ -110,6 +152,13 @@ export interface FileQuery {
  * A query with neither `cid` nor `owner` is answered as a bounded sample, not as
  * "everything": the caller wanting a network-wide count gets `total` from the
  * endpoint rather than by paging the archive to exhaustion.
+ *
+ * **Tombstones are served only when asked for by `cid`.** A holder checking one
+ * file must be able to learn it was withdrawn — silence cannot say that. But a
+ * BROWSE must not spend its page budget on deletions, and this page is
+ * newest-first while deletions are by definition the newest thing that happened:
+ * on a busy network every page would be tombstones and no live file would ever
+ * appear.
  */
 export function selectFileRecords(records: Iterable<FileRecord>, query: FileQuery = {}): FileRecord[] {
   const limit = Math.min(
@@ -126,7 +175,8 @@ export function selectFileRecords(records: Iterable<FileRecord>, query: FileQuer
     if (!prev || r.timestamp > prev.timestamp) newest.set(r.cid, r);
   }
 
-  return [...newest.values()]
+  const page = [...newest.values()].filter(r => !r.removed || !!query.cid);
+  return page
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, limit);
 }
