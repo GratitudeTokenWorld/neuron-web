@@ -5,7 +5,7 @@ import { resolveAccountFromRelays, relayHttpBase, looksLikeAccountPub, fetchPend
 import { foldProviderBlocks } from '../engine/content/provider-discovery';
 import { pollIntervalMs } from '../engine/content/custody';
 import { signStorageMsg, verifyStorageMsg } from './storage-signing';
-import { foldFileRecords, type FileRecord } from '../engine/content/file-index';
+import { foldFileRecords, verifiedWithdrawals, type FileRecord } from '../engine/content/file-index';
 import { allDevRelayBases } from './dev-relay-proxy';
 import { SmokeStore, GossipSubAdapter, setTurnCredentialBases } from './smoke-store';
 import { StorageManager } from './storage-manager';
@@ -1116,6 +1116,59 @@ export class NeuronNode extends EventEmitter {
   }
 
   /**
+   * Drop content whose owner has withdrawn it.
+   *
+   * A delete is one fire-and-forget gossip message. A provider that was offline
+   * when it went out — or that rejected it, as happened on 2026-08-16 when the
+   * signer and verifier disagreed — keeps the bytes FOREVER: nothing re-sends
+   * the delete, the lease only lapses on silence rather than on withdrawal, and
+   * once the owner has removed its own library record nothing can retract the
+   * copy at all. The bytes then occupy declared capacity and inflate the
+   * `storedBytes` the provider's reward is metered on.
+   *
+   * So deletion converges instead of depending on one packet: the archives keep
+   * a signed TOMBSTONE for `TOMBSTONE_RETAIN_MS`, and a holder asks for recent
+   * withdrawals and cleans up. Bounded by DELETIONS in that window, not by CIDs
+   * held, so it is one small request however much this node stores.
+   *
+   * Every tombstone is verified before anything is deleted — this drives
+   * destruction on a holder, so an unverified one would let anyone with a relay
+   * make providers destroy content they are paid to keep.
+   */
+  async sweepWithdrawnContent(): Promise<number> {
+    if (!this.store.isStarted()) return 0;
+    let held: Set<string>;
+    try { held = new Set(await this.store.listCached()); } catch { return 0; }
+    if (held.size === 0) return 0;
+
+    let records: FileRecord[];
+    try {
+      ({ records } = await fetchFileRecords(
+        this.relayResolveBases(), this.ledger.network, { withdrawn: true, limit: 200 },
+        undefined, undefined, (base, ok) => this.reportRelayBase(base, ok),
+      ));
+    } catch { return 0; }                       // no archive reachable — try next poll
+    if (records.length === 0) return 0;
+
+    const withdrawn = await verifiedWithdrawals(records, (payload, pub, signature) =>
+      verifyStorageMsg(signature, payload, pub));
+
+    let dropped = 0;
+    for (const cid of withdrawn) {
+      if (!held.has(cid)) continue;
+      // Cascades to the chunks through the cache-group index saved when caching.
+      await this.store.deleteBlock(cid).catch(() => {});
+      dropped++;
+    }
+    if (dropped > 0) {
+      console.log(`[Node] Dropped ${dropped} withdrawn CID(s) the owner deleted while we were not listening`);
+      this.storage.broadcastStorageStatsForLocalProviders().catch(() => {});
+      this.emit('storage:providers-updated');
+    }
+    return dropped;
+  }
+
+  /**
    * Re-arm the provider poll at a population-scaled, jittered cadence.
    *
    * A fixed interval is fine for a two-relay dev network and is exactly the
@@ -1129,9 +1182,13 @@ export class NeuronNode extends EventEmitter {
   private scheduleProviderDiscovery(): void {
     const population = this.ledger.getStorageProviders().length;
     this.providerDiscoveryTimer = setTimeout(() => {
-      void this.refreshStorageProviders().finally(() => {
-        if (this.net.running) this.scheduleProviderDiscovery();
-      });
+      void this.refreshStorageProviders()
+        // Piggybacked on the poll that already exists rather than adding a
+        // cadence: both are archive queries and both are bounded by the same
+        // reasoning (ARCHITECTURE.md -> Fan-IN, principle 5).
+        .then(() => this.sweepWithdrawnContent())
+        .catch(() => 0)
+        .finally(() => { if (this.net.running) this.scheduleProviderDiscovery(); });
     }, pollIntervalMs(PROVIDER_DISCOVERY_BASE_MS, population));
   }
 

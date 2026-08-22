@@ -972,6 +972,11 @@ async function main() {
         const records = selectFileRecords(scoped, {
           cid: q.get('cid') || undefined,
           owner: q.get('owner') || undefined,
+          // `withdrawn=1` serves ONLY tombstones — how a provider learns that
+          // content it holds was deleted. Bounded by the retention window
+          // rather than by a cursor: tombstones expire, so this is recent
+          // withdrawals, never a history.
+          withdrawn: q.get('withdrawn') === '1' || undefined,
           limit: Number(q.get('limit')) || undefined,
         });
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });

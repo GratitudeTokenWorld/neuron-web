@@ -283,7 +283,7 @@ export async function fetchProviders(
 export async function fetchFileRecords(
   bases: readonly string[],
   network: string,
-  query: { cid?: string; owner?: string; limit?: number } = {},
+  query: { cid?: string; owner?: string; withdrawn?: boolean; limit?: number } = {},
   fetchFn: typeof fetch = (...args) => fetch(...args),
   timeoutMs = 5_000,
   onBaseResult?: BaseResultReporter,
@@ -291,6 +291,7 @@ export async function fetchFileRecords(
   const params = new URLSearchParams({ network });
   if (query.cid) params.set('cid', query.cid);
   if (query.owner) params.set('owner', query.owner);
+  if (query.withdrawn) params.set('withdrawn', '1');
   if (query.limit !== undefined) params.set('limit', String(query.limit));
 
   const results = await Promise.allSettled(

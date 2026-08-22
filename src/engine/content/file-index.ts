@@ -123,6 +123,20 @@ export interface FileQuery {
   cid?: string;
   /** Everything a given account published. */
   owner?: string;
+  /**
+   * Return ONLY withdrawals. This is how a provider learns that content it
+   * holds was deleted: a delete request is one fire-and-forget gossip message,
+   * so a provider that was offline — or that rejected it — keeps the bytes
+   * forever, and once the owner has removed its own record nothing can ever
+   * retract them.
+   *
+   * Bounded without needing a cursor: tombstones only exist inside
+   * `TOMBSTONE_RETAIN_MS`, so this is the set of RECENT withdrawals, not a
+   * history. That makes the sweep `O(recent deletions)` rather than
+   * `O(CIDs held)`, which is what lets a provider ask about everything it holds
+   * in a single request.
+   */
+  withdrawn?: boolean;
   limit?: number;
 }
 
@@ -180,10 +194,37 @@ export function selectFileRecords(records: Iterable<FileRecord>, query: FileQuer
     if (!prev || r.timestamp > prev.timestamp) newest.set(r.cid, r);
   }
 
-  const page = [...newest.values()].filter(r => !r.removed || !!query.cid);
+  const page = query.withdrawn
+    ? [...newest.values()].filter(r => !!r.removed)
+    : [...newest.values()].filter(r => !r.removed || !!query.cid);
   return page
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, limit);
+}
+
+/**
+ * CIDs whose newest VERIFIED record is a withdrawal.
+ *
+ * Separate from `foldFileRecords`, which drops tombstones on its way to "what
+ * exists" — a provider needs the opposite question, "what did the owner take
+ * back". Verification is not optional here: this set drives DELETION on the
+ * holder, so an unverified tombstone would let anyone with a relay make
+ * providers destroy content they were paid to keep.
+ */
+export async function verifiedWithdrawals(
+  records: Iterable<FileRecord>,
+  verify: (payload: string, pub: string, signature: string) => Promise<boolean> | boolean,
+): Promise<Set<string>> {
+  const newest = new Map<string, FileRecord>();
+  for (const r of records) {
+    if (!isWellFormedFileRecord(r)) continue;
+    if (!(await verify(payloadFor(r), r.uploaderPub, r.signature))) continue;
+    const prev = newest.get(r.cid);
+    if (!prev || r.timestamp > prev.timestamp) newest.set(r.cid, r);
+  }
+  const out = new Set<string>();
+  for (const [cid, r] of newest) if (r.removed) out.add(cid);
+  return out;
 }
 
 /**

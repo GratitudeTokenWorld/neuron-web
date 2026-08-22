@@ -2043,6 +2043,9 @@ async function startNode() {
     // from IDB — filtering the live gossip alone would leave the O(N) set on
     // disk. Runs here because "ours" is only decidable once keys are registered.
     await node.storage.pruneForeignFileIndex();
+    // And drop anything whose owner withdrew it while this device was away —
+    // the delete gossip is not replayed, so without this the bytes stay forever.
+    void node.sweepWithdrawnContent().catch(() => {});
     for (const acc of localAccounts) {
       if (node.ledger.getAccountHead(acc.pub)) continue;
       const stored = (acc as AccountWithKeys & { openBlock?: AccountBlock }).openBlock;

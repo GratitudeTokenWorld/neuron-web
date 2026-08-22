@@ -8,6 +8,7 @@ import {
   selectFileRecords,
   foldFileRecords,
   countLiveFiles,
+  verifiedWithdrawals,
   tombstoneExpired,
   TOMBSTONE_RETAIN_MS,
   type FileRecord,
@@ -22,6 +23,7 @@ import { MAX_OFFLINE_MS } from './provider-ledger.js';
  */
 const sign = (pub: string, payload: string) => `${pub}|${payload}`;
 const verify = (payload: string, pub: string, signature: string) => signature === sign(pub, payload);
+const foldWithdrawn = (rs: FileRecord[]) => verifiedWithdrawals(rs, verify);
 
 function rec(over: Partial<FileRecord> = {}): FileRecord {
   const base = {
@@ -268,5 +270,79 @@ describe('selectFileRecords — tombstones in a browse vs a lookup', () => {
 
   it('a browse by owner also hides withdrawals', () => {
     expect(selectFileRecords(mixed, { owner: 'alice' }).map(r => r.cid)).toEqual(['live']);
+  });
+});
+
+// ── Withdrawal sweep: how a holder learns content was deleted ────────────────
+
+describe('withdrawn queries', () => {
+  const mixed = [
+    rec({ cid: 'live1', timestamp: 1 }),
+    rec({ cid: 'live2', timestamp: 2 }),
+    rec({ cid: 'gone1', timestamp: 3, removed: true }),
+    rec({ cid: 'gone2', timestamp: 4, removed: true }),
+  ];
+
+  it('returns only tombstones', () => {
+    expect(selectFileRecords(mixed, { withdrawn: true }).map(r => r.cid).sort())
+      .toEqual(['gone1', 'gone2']);
+  });
+
+  it('is the exact complement of a browse', () => {
+    const browse = selectFileRecords(mixed).map(r => r.cid).sort();
+    const gone = selectFileRecords(mixed, { withdrawn: true }).map(r => r.cid).sort();
+    expect(browse).toEqual(['live1', 'live2']);
+    expect(browse.filter(c => gone.includes(c))).toEqual([]);
+  });
+
+  it('a file re-published after withdrawal is not withdrawn', () => {
+    expect(selectFileRecords([
+      rec({ cid: 'a', timestamp: 1, removed: true }),
+      rec({ cid: 'a', timestamp: 2 }),
+    ], { withdrawn: true })).toHaveLength(0);
+  });
+
+  it('is still bounded', () => {
+    const many = Array.from({ length: 500 }, (_, i) => rec({ cid: `c${i}`, timestamp: i + 1, removed: true }));
+    expect(selectFileRecords(many, { withdrawn: true, limit: 10 })).toHaveLength(10);
+  });
+});
+
+describe('verifiedWithdrawals', () => {
+  it('names the CIDs a holder must drop', async () => {
+    const out = await foldWithdrawn([
+      rec({ cid: 'live', timestamp: 1 }),
+      rec({ cid: 'gone', timestamp: 2, removed: true }),
+    ]);
+    expect([...out]).toEqual(['gone']);
+  });
+
+  it('REFUSES an unverified tombstone — this drives deletion on a holder', async () => {
+    // Without verification, anyone able to reach a relay could make every
+    // provider destroy content it is paid to keep.
+    const forged = { ...rec({ cid: 'victim', timestamp: 9, removed: true }), signature: 'not-a-signature' };
+    expect((await foldWithdrawn([forged])).size).toBe(0);
+  });
+
+  it('refuses a tombstone signed by someone other than the uploader', async () => {
+    const t = rec({ cid: 'victim', timestamp: 9, removed: true, uploaderPub: 'alice' });
+    const forged = { ...t, signature: sign('mallory', payloadFor(t)) };
+    expect((await foldWithdrawn([forged])).size).toBe(0);
+  });
+
+  it('a newer verified re-publish cancels an older withdrawal', async () => {
+    const out = await foldWithdrawn([
+      rec({ cid: 'a', timestamp: 5, removed: true }),
+      rec({ cid: 'a', timestamp: 6 }),
+    ]);
+    expect(out.size).toBe(0);
+  });
+
+  it('arrival order does not decide it — chain of timestamps does', async () => {
+    const out = await foldWithdrawn([
+      rec({ cid: 'a', timestamp: 6 }),
+      rec({ cid: 'a', timestamp: 5, removed: true }),
+    ]);
+    expect(out.size).toBe(0);
   });
 });
