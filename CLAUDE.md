@@ -48,7 +48,12 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **458 tests / 69 files passing**, `npm run build` clean.
+Current baseline: **512 tests / 70 files passing**, `npm run build` clean.
+E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
+`.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
+verifying in the app rather than in a unit test: every display defect of
+2026-08-16 passed the unit suite, because each half was individually correct and
+only the rendered combination was wrong.
 Keep both green; add tests next to the code (`foo.ts` → `foo.test.ts`).
 
 ## Where to pick up (as of 2026-08-15)
@@ -142,7 +147,7 @@ shipped this session. What is NOT done is verifying them on the live network.
 - **TESTPLAN**: T8 unchanged (step 5 still blocked on the day-boundary
   decision); **T9** (handoff + repair) and **T10** (file index) are new and unrun.
 
-**Pick up here:**
+**Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
 1. **Deploy the relays, then run T10.** `GET /files` exists only locally. It was
    verified on isolated ports (`PORT=9190 RELAY_DATA_DIR=.relay-verify`) — route
