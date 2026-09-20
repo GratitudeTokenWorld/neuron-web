@@ -19,3 +19,6 @@ reload.log
 *.openrc
 *credentials*.txt
 .openstack-venv/
+
+# E2E captured sessions — contain WALLET KEYS
+e2e/.sessions/

@@ -2008,11 +2008,18 @@ async function startNode() {
       const t = storageTiming();
       const mins = (ms: number) => `${Math.round(ms / 60_000)}min`;
       const detail = `${mins(HEARTBEAT_INTERVAL_MS)} beat / ${mins(REWARD_EPOCH_MS)} epoch / ${mins(MAX_OFFLINE_MS)} lease`;
+      // BOTH profiles go to the console, not just the dev one. The whole point
+      // of this line is that "which clock is running?" is never a hunt, and a
+      // marker that only appears in the abnormal case cannot answer it — the
+      // absence of a warning is indistinguishable from the absence of logging.
+      // Found by the E2E smoke spec, which could see the compressed profile and
+      // not the production one.
+      console.log(`[Storage] timing profile = ${t.name} — ${detail}`);
       if (t.name === 'normal') {
         addLog(`Storage timing: production (${detail})`, 'info');
       } else {
         addLog(`⚠ Storage timing: ${t.name.toUpperCase()} (${detail}) — dev only, must match on every device`, 'warn');
-        console.warn(`[Storage] timing profile = ${t.name} — ${detail}`);
+        console.warn(`[Storage] timing profile = ${t.name} — DEV ONLY, must match on every device`);
       }
     }
     await node.start();

@@ -13,7 +13,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.engine.json && tsc --noEmit -p tsconfig.storage.json",
-    "postinstall": "patch-package"
+    "postinstall": "patch-package",
+    "e2e": "playwright test",
+    "e2e:capture": "tsx e2e/capture-session.mts",
+    "e2e:headed": "playwright test --headed"
   },
   "repository": {
     "type": "git",
@@ -47,6 +50,7 @@
     "vite": "^8.0.2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22.9.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "patch-package": "^8.0.1",
