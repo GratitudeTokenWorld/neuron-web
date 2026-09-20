@@ -22,3 +22,7 @@ reload.log
 
 # E2E captured sessions — contain WALLET KEYS
 e2e/.sessions/
+
+# Playwright run output
+test-results/
+playwright-report/
