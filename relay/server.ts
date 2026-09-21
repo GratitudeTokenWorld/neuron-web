@@ -54,6 +54,10 @@ import {
   selectFileRecords, isWellFormedFileRecord, payloadFor, countLiveFiles, tombstoneExpired,
 } from '../src/engine/content/file-index.js';
 import { AccountAccumulator } from '../src/engine/core/accumulator.js';
+// Archive backfill: the policy for asking peers to fill a gap lives in a PURE
+// module, because this file is covered by neither the typecheck nor any test.
+import { BackfillLimiter } from '../src/engine/net/archive-backfill.js';
+import { getShard } from '../src/engine/core/partition.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
 // vitest can pin them (this file is covered by no typecheck and no test — keep
 // every releasable piece of its logic over there, not here).
@@ -320,6 +324,52 @@ function releaseStaleFaceUses() {
 }
 setInterval(releaseStaleFaceUses, 60_000);
 
+/**
+ * Ask peer relays for an account's blocks, because we were asked for them and
+ * did not have them.
+ *
+ * Demand-driven on a MISS, never a sync-on-rejoin: a relay that syncs its whole
+ * archive on restart is `O(archive)` on the answering side, which is the scale
+ * invariant violated at exactly the place this project keeps violating it. This
+ * asks only for what somebody actually wanted: `O(actual queries)`.
+ *
+ * Fire-and-forget by design. The HTTP request that missed still answers as a
+ * miss — the client asked several relays and takes the union — and the blocks
+ * arrive on the engine-blocks topic a moment later, hash- and
+ * signature-checked by `archiveEngineBlock` like anything else. So a lying peer
+ * cannot inject anything, and the SECOND query for this account succeeds.
+ *
+ * The limiter is what keeps this from being an amplifier: the common miss is a
+ * query for something that exists nowhere, and without a ceiling a stranger's
+ * URL scan would become federation-wide gossip.
+ */
+const backfill = new BackfillLimiter();
+
+/**
+ * Set once libp2p is up. Module scope because the backfill is triggered from an
+ * HTTP handler, which runs outside the libp2p closure where `pubsub` lives —
+ * reaching for it directly threw `pubsub is not defined` on the first miss.
+ * Relay code is typechecked by nothing, so this is the shape that bites.
+ */
+let pubsubRef = null;
+
+function requestArchiveBackfill(accountId, network, haveIndex) {
+  if (!ARCHIVE_ENABLED || !accountId) return;
+  if (!pubsubRef) { dlog('[Backfill] libp2p not up yet — skipping'); return; }
+  const key = `${network}:${accountId}`;
+  const decision = backfill.request(key);
+  if (!decision.ask) {
+    dlog(`[Backfill] not asking for ${accountId.slice(0, 12)}…: ${decision.reason}`);
+    return;
+  }
+  const shard = getShard(accountId);
+  const topic = `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req/${shard}`;
+  const payload = JSON.stringify({ accountId, shard, haveIndex });
+  pubsubRef.publish(topic, new TextEncoder().encode(payload)).catch(() => {});
+  console.log(`[Backfill] asked peers for ${accountId.slice(0, 12)}… `
+    + `shard=${shard} have=${haveIndex} (${decision.reason})`);
+}
+
 function archiveEngineBlock(blockHex, network) {
   if (!ARCHIVE_ENABLED || !blockHex) return;
   let block;
@@ -337,6 +387,10 @@ function archiveEngineBlock(blockHex, network) {
   engineBlockStore.set(block.hash, row);
   indexEngineRow(row);
   engineStoreDirty = true;
+  // Whatever we were missing for this account, we have some of it now. Settling
+  // on the DATA rather than on a peer's acknowledgement is the point: a peer
+  // that replies with nothing has healed nothing.
+  backfill.settle(`${network}:${block.accountId}`);
   // The account exists — its face slot is now permanent.
   if (block.type === 'open') pendingFaceUses.delete(block.accountId);
   dlog(`[Archive] Stored ${block.type} acct=${block.accountId.slice(0, 12)}… idx=${block.index} shard=${block.shard}`);
@@ -634,6 +688,7 @@ function recordOperator(accountId) {
  */
 function performNetworkWipe(newGeneration, source) {
   engineBlockStore.clear(); engineStoreDirty = true;
+  backfill.clear();   // the generation changed; what we could not find no longer means anything
   engineHeightIndex.clear(); conflictAnnounced.clear(); // conflict index follows the archive
   keyBlobStore.clear(); keyBlobDirty = true;
   // Shares go with the accounts they unlock: the wipe just destroyed every
@@ -1053,6 +1108,12 @@ async function main() {
         const contiguous = rows.length > 0 && rows.every((r, i) => r.index === i);
         const sendRow = rows.find(r => r.hash === send);
         if (!contiguous || !sendRow) {
+          // We were asked for a chain we cannot serve. That is the cheapest
+          // possible evidence this archive is behind — it was going to happen
+          // anyway — so ask the peers for it now rather than staying behind
+          // until the account's owner happens to republish.
+          const haveIndex = contiguous && rows.length > 0 ? rows[rows.length - 1].index : -1;
+          requestArchiveBackfill(pub, network, haveIndex);
           res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
           res.end(JSON.stringify({ error: 'chain incomplete or send unknown' }));
         } else {
@@ -1726,6 +1787,7 @@ async function main() {
   // never receives it.
 
   const pubsub = node.services.pubsub;
+  pubsubRef = pubsub;   // see requestArchiveBackfill — HTTP handlers run outside this closure
   const NUM_SYNAPSES = 4;
 
   // G2: the archive is where same-height forks are noticed once recipients stop
