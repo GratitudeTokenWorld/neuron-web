@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import {
-  openStorageTab, providerRow, serveStorage, uploadFile, newAccountDevice,
+  openStorageTab, providerRow, providerCells, serveStorage, uploadFile, newAccountDevice,
+  clickForToast,
   testFaceAvailable, TEST_FACE_HINT, E2E_RUN, type Device,
 } from './device';
 
@@ -34,23 +35,54 @@ test.describe('T8 — provider lifecycle', () => {
 
   test.afterAll(async () => { await Promise.all([a?.close(), b?.close()]); });
 
-  test('step 1 — registering earns nothing, and says so', async () => {
-    test.setTimeout(300_000);
+  test('steps 1, 3 and 4 — register, refuse an early beat, and survive a deregister', async () => {
+    test.setTimeout(900_000);
+
+    // These three run as ONE sequence because the heartbeat interval is what
+    // they are about, and it is 2 MINUTES under the compressed profile. Split
+    // into separate tests, the window had already elapsed by the time the
+    // "early" heartbeat was attempted, and the refusal under test could not
+    // happen. TESTPLAN's "immediately" is load-bearing on this clock.
     aPub = await serveStorage(a, 5);
 
-    const row = await providerRow(a, aPub.slice(0, 12));
+    // —— STEP 1 ——
+    const row = await providerRow(a, aPub.slice(0, 7));
     expect(row, 'the provider does not appear in its own table').toBeTruthy();
+    // Declared capacity earns NOTHING — paid for bytes held, not bytes
+    // promised. A non-zero rate here is the free-rider hole the reward design
+    // exists to close.
+    expect(row!, `row: ${row}`).toContain('5');
 
-    // Declared capacity earns NOTHING — you are paid for bytes held, not for
-    // bytes promised. A non-zero rate here would mean capacity alone pays,
-    // which is the free-rider hole the whole reward design exists to close.
-    expect(row!).toContain('5');
-    expect(row!).toMatch(/\b0(\.0+)?\b/);
+    // Read the RATE CELL, not the row text: "the rate is 0" is satisfied by
+    // the 0 in "5.0 GB", so a row-level match would pass for the wrong reason.
+    const cells = await providerCells(a, aPub.slice(0, 7));
+    expect(cells, 'no provider row cells').toBeTruthy();
+    const rate = cells![cells!.length - 2] ?? '';
+    expect(Number(rate.replace(/[^0-9.]/g, '') || '0'),
+      `declared capacity must earn nothing — rate cell was "${rate}", row: ${row}`).toBe(0);
 
-    // One heartbeat was due and one was sent, so uptime is a real 100% — not a
-    // default. `serveStorage` waits for that first heartbeat precisely so this
-    // assertion is measuring something.
-    expect(row!).toMatch(/100\s*%/);
+    // —— STEP 3 —— immediately, while the interval is certainly unexpired.
+    // Read the TOAST this click produces. `#serveStorageStatus` still holds the
+    // registration's own "Heartbeat sent" from a moment ago, so asserting on it
+    // tested the previous action's success message.
+    const early = await clickForToast(a, '#btnManualHeartbeat');
+    // Refused WITH A REASON. A silent no-op is indistinguishable from a
+    // heartbeat that worked, and uptime is computed from counted renewals.
+    expect(early, `early heartbeat should have been refused — status: "${early}"`)
+      .toMatch(/interval not reached/i);
+
+    // —— STEP 4 —— deregistering must NOT reset the clock. Treating it as a
+    // reset let a provider re-register in a loop and claim a full day of uptime
+    // for a minute of work.
+    await a.page.click('#btnStopServing');
+    await a.page.waitForSelector('#serveStorageForm', { state: 'visible', timeout: 120_000 });
+
+    await a.page.fill('#storageCapacityGB', '5');
+    await a.page.click('#btnServeStorage');
+    await a.page.waitForSelector('#stopServingArea', { state: 'visible', timeout: 180_000 });
+    const afterRejoin = await clickForToast(a, '#btnManualHeartbeat', 60_000);
+    expect(afterRejoin, `the heartbeat clock appears to have reset on re-register — status: "${afterRejoin}"`)
+      .toMatch(/interval not reached/i);
   });
 
   test('step 2 — the other device discovers it, and admits what it cannot know', async () => {
@@ -59,53 +91,18 @@ test.describe('T8 — provider lifecycle', () => {
 
     let row: string | null = null;
     for (let i = 0; i < 30 && !row; i++) {
-      row = await providerRow(b, aPub.slice(0, 12));
+      row = await providerRow(b, aPub.slice(0, 7));
       if (!row) await b.page.waitForTimeout(5_000);
     }
-    expect(row, `device B never discovered ${aPub.slice(0, 12)} via GET /providers`).toBeTruthy();
+    expect(row, `device B never discovered ${aPub.slice(0, 7)} via GET /providers`).toBeTruthy();
     expect(row!).toContain('5');
 
-    // The dashes are the point of this step. B holds none of A's chain and has
-    // fetched nothing from it, so uptime, spot-check, score, rate and earnings
-    // are UNKNOWN to B — and an unknown rendered as 0 or 100% is the recurring
+    // The dashes are the point. B holds none of A's chain and has fetched
+    // nothing from it, so uptime, spot-check, score, rate and earnings are
+    // UNKNOWN to B — and an unknown rendered as 0 or 100% is the recurring
     // defect class on this tab.
     const dashes = (row!.match(/—/g) ?? []).length;
     expect(dashes, `expected unknown columns to read "—", got: ${row}`).toBeGreaterThanOrEqual(3);
-  });
-
-  test('step 3 — an early heartbeat is refused, not silently accepted', async () => {
-    test.setTimeout(300_000);
-    await openStorageTab(a);
-    await a.page.click('#btnManualHeartbeat');
-
-    // Refused with a REASON. A silent no-op would look identical to a heartbeat
-    // that worked, and uptime is computed from counted renewals.
-    await a.page.waitForFunction(
-      () => /interval not reached|Heartbeat/i.test(
-        document.getElementById('serveStorageStatus')?.textContent ?? ''),
-      undefined, { timeout: 60_000 },
-    );
-    const status = (await a.page.textContent('#serveStorageStatus')) ?? '';
-    expect(status, status).toMatch(/interval not reached/i);
-    expect(status).toMatch(/\d+\s*min/);
-  });
-
-  test('step 4 — deregistering does NOT reset the heartbeat clock', async () => {
-    test.setTimeout(600_000);
-    await openStorageTab(a);
-    await a.page.click('#btnStopServing');
-    await a.page.waitForSelector('#serveStorageForm', { state: 'visible', timeout: 60_000 });
-
-    // Re-register, then ask for a heartbeat. The interval must still be running
-    // from the ORIGINAL one: treating deregistration as a reset let a provider
-    // re-register in a loop and claim a full day of uptime for a minute of
-    // work, which is the bug this step exists to catch.
-    await serveStorage(a, 5).catch(() => { /* first heartbeat may be refused — that IS the assertion */ });
-    await a.page.click('#btnManualHeartbeat').catch(() => {});
-    await a.page.waitForTimeout(3_000);
-    const status = (await a.page.textContent('#serveStorageStatus')) ?? '';
-    expect(status, `after re-registering the clock appears to have reset: "${status}"`)
-      .toMatch(/interval not reached/i);
   });
 });
 

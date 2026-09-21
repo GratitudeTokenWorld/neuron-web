@@ -243,16 +243,57 @@ export async function openStorageTab(d: Device): Promise<void> {
 }
 
 /**
+ * Refuse a prefix that cannot identify anything.
+ *
+ * `includes('')` is true of every row, so an empty prefix silently returns the
+ * FIRST provider and every assertion about it passes for the wrong reason —
+ * which is exactly what happened when an earlier step failed before setting the
+ * pub, and the discovery test went green against a row belonging to somebody
+ * else. The table elides pubs to 7 leading characters (`trunc(pub, 14)`), so
+ * anything longer than that cannot match either.
+ */
+function assertUsablePrefix(d: Device, prefix: string): void {
+  if (!prefix || prefix.length < 4) {
+    throw new Error(`[${d.name}] provider lookup needs a real prefix, got "${prefix}" — `
+      + 'an empty one matches every row');
+  }
+  if (prefix.length > 7) {
+    throw new Error(`[${d.name}] provider pubs render elided to 7 characters; `
+      + `"${prefix}" (${prefix.length}) can never match. Use pub.slice(0, 7)`);
+  }
+}
+
+/**
  * The provider row for an account, as the UI renders it — the surface where
  * every 2026-08-16 display defect lived (uptime disagreeing with score, an
  * "average" of one sample, "7/6 heartbeats due", a negative LAST REWARD).
  * Read it as text so a test asserts what a human would actually see.
  */
 export async function providerRow(d: Device, pubPrefix: string): Promise<string | null> {
+  assertUsablePrefix(d, pubPrefix);
   return d.page.evaluate((prefix) => {
     const rows = [...document.querySelectorAll('#storageProvidersList tr')];
     const hit = rows.find((r) => r.textContent?.includes(prefix));
     return hit ? hit.textContent!.replace(/\s+/g, ' ').trim() : null;
+  }, pubPrefix);
+}
+
+/**
+ * A provider's row as CELLS, in column order:
+ * Provider | Capacity | Uptime | Latency | Spot Check | Score | Rate/day | Earned
+ *
+ * `providerRow` returns the whole row as one string, which makes it easy to
+ * write an assertion that passes for the wrong reason — "the rate is 0" is
+ * satisfied by the 0 in "5.0 GB". Read the cell when the claim is about a
+ * specific column.
+ */
+export async function providerCells(d: Device, pubPrefix: string): Promise<string[] | null> {
+  assertUsablePrefix(d, pubPrefix);
+  return d.page.evaluate((prefix) => {
+    const rows = [...document.querySelectorAll('#storageProvidersList tr')];
+    const hit = rows.find((r) => r.textContent?.includes(prefix));
+    if (!hit) return null;
+    return [...hit.querySelectorAll('td')].map((c) => c.textContent!.replace(/\s+/g, ' ').trim());
   }, pubPrefix);
 }
 
@@ -634,4 +675,34 @@ export async function waitForGossipMesh(d: Device, timeoutMs = 120_000): Promise
     if (Date.now() - quietSince >= QUIET_MS) return true;
   }
   return false;
+}
+
+
+/**
+ * Click something and return the TOAST it produced.
+ *
+ * Several storage actions report only through a toast — the manual heartbeat
+ * among them — and a toast removes itself after 4 s. Reading
+ * `#serveStorageStatus` instead returns whatever the LAST action left there,
+ * which is how "the early heartbeat was refused" was tested against the
+ * registration's own success message and failed for the wrong reason.
+ */
+export async function clickForToast(d: Device, selector: string, timeoutMs = 30_000): Promise<string> {
+  // Clear the tray first and count, rather than diffing text: the same action
+  // can legitimately produce the SAME message twice, and a text-diff drops the
+  // second one as "not fresh" — which reads as "no toast appeared".
+  await d.page.evaluate(() => {
+    for (const t of document.querySelectorAll('#toasts .toast')) t.remove();
+  });
+  await d.page.click(selector);
+  const deadline = Date.now() + timeoutMs;
+  let last: string[] = [];
+  while (Date.now() < deadline) {
+    last = await d.page.evaluate(() =>
+      [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent ?? ''));
+    if (last.length > 0) return last[last.length - 1]!;
+    await d.page.waitForTimeout(200);
+  }
+  throw new Error(`[${d.name}] no toast after clicking ${selector} within ${timeoutMs}ms `
+    + `(tray held: ${JSON.stringify(last)})`);
 }
