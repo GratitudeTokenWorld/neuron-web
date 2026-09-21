@@ -23,10 +23,14 @@ Read in this order — do NOT re-derive what they already record:
 - Live probe `npx tsx scripts/g1-resolve-smoke.mts` = **55 checks, ALL CHECKS
   PASSED** (was 41; `/files` coverage added). Run after every relay deploy — and
   wait for the relays to finish restarting first, or you get phantom failures.
-- **Relays**: both cloud boxes (`80.97.27.224`, `80.97.27.112`) run `e51cae0`
-  and are **current** — every commit after it is client-only. TURN (coturn) is
-  live on both, verified from outside with a raw STUN Binding Request plus an
-  unauthenticated Allocate returning `401 realm="neuron"`.
+- **Relays**: both cloud boxes (`80.97.27.224`, `80.97.27.112`) run **`890e047`**
+  (deployed 2026-09-21, restart counts 19→20 — one deliberate restart each, no
+  crash loop, verified after the 60 s timer). They now carry the **archive
+  backfill**: a `/head-proof` miss makes the relay ask its peers for that
+  account's blocks. Verified live — the first miss asks, the second is refused
+  as already in flight, and it found three REAL archive gaps within a minute of
+  going up. No `npm install` was needed: the change adds no external import.
+  The smoke probe is **55/55** against both boxes after the deploy.
 - **E2E**: `npm run e2e` (Playwright, using the installed Chrome/Edge channels).
   `e2e/smoke.spec.ts` needs no fixture and passes 5/5 against a live stack.
 

@@ -194,6 +194,10 @@ shipped this session. What is NOT done is verifying them on the live network.
 
 **Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
+0. **Relays are deployed at `890e047`** (2026-09-21) with the archive backfill
+   live and the smoke probe 55/55. Anything relay-side after that commit needs
+   a deploy before it does anything: `git pull && pm2 restart neuron-relay` per
+   box, then check restart counts **after** 60 s, then run the probe.
 1. **Phase 4 — scale hardening.** This is where the remaining engineering is:
    archive backfill between relays (**demand-driven on a miss, never a
    sync-on-rejoin**, which would be `O(archive)`), custody-proven incentive
