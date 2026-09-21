@@ -761,7 +761,12 @@ export class StorageManager extends EventEmitter {
 
       const result = await this.ledger.createStorageReward(pub, engineKeysFromAppPrivate(keys.priv));
       if (!result.block) {
-        // Not yet eligible (no heartbeats today, or already claimed) - log and continue
+        // The comment here used to say "log and continue" and then logged
+        // nothing, so a provider that never got paid gave no clue why — and
+        // this poll runs every 15 s under the compressed profile, i.e. it was
+        // declining ~100 times an epoch in total silence. Throttled by REASON:
+        // a repeat says nothing new, a change in reason is the whole story.
+        this.logRewardSkip(pub, epochDay, result.error ?? 'not eligible (no counted heartbeats, or nothing stored)');
         continue;
       }
       const submitResult = await this.submitBlock(result.block);
@@ -769,8 +774,24 @@ export class StorageManager extends EventEmitter {
         const amount = Number(result.block.amount ?? 0);
         console.log(`[StorageManager] Reward issued: ${amount} milli-UNIT for ${pub.slice(0, 12)}...`);
         this.emit('storage:reward-issued', { pub, amount, epochDay });
+      } else {
+        // A built-but-rejected reward block is a different failure from an
+        // ineligible one, and far more serious: the chain refused something we
+        // signed. Never silent.
+        console.warn(`[StorageManager] Reward block REJECTED for ${pub.slice(0, 12)}… `
+          + `(epoch ${epochDay}): ${submitResult.error ?? 'unknown'}`);
       }
     }
+  }
+
+  /** Say why a reward was not issued, once per (provider, reason). */
+  private rewardSkipLog = new Map<string, string>();
+  private logRewardSkip(pub: string, epochDay: number, reason: string): void {
+    const key = pub;
+    const line = `${epochDay}:${reason}`;
+    if (this.rewardSkipLog.get(key) === line) return;
+    this.rewardSkipLog.set(key, line);
+    console.log(`[StorageManager] No reward for ${pub.slice(0, 12)}… (epoch ${epochDay}): ${reason}`);
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
