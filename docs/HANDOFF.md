@@ -5,7 +5,10 @@ Continue work on `neuron-web`.
 Read in this order — do NOT re-derive what they already record:
 
 1. **[PRINCIPLES.md](PRINCIPLES.md)** — what the project is FOR, and the filter
-   every change is judged against. New and canonical; `CLAUDE.md` leads with the
+   every change is judged against, including the screening order:
+   **security → performance → decentralisation**, in that order.
+   **[SCREENING.md](SCREENING.md)** is the checklist it produces — what to
+   review for and what to attack, every entry a defect that actually shipped. New and canonical; `CLAUDE.md` leads with the
    short form. It also sets the testing cadence: run the tests that cover what
    changed, full suite only at a commit boundary or before a deploy.
 2. `CLAUDE.md` (auto-loads). Trust *Core principles*, *Where to pick up*,
@@ -20,7 +23,7 @@ Read in this order — do NOT re-derive what they already record:
 
 ## State as of HEAD `15a3f29` (verified, not assumed)
 
-- **544 tests / 72 files green**, `npm run typecheck` clean, `npm run build`
+- **550 tests / 73 files green**, `npm run typecheck` clean, `npm run build`
   clean.
 - App-layer `tsc -p tsconfig.json` = **121 errors — this is the baseline, never
   add to it.** Take a **per-file** count before and after; the total falling

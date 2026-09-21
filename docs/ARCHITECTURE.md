@@ -152,6 +152,48 @@ where redundancy silently fails first.
 
 ---
 
+## The invariant has two dimensions (2026-09-21)
+
+A technical refinement of the scale invariant, not a new principle — the goal
+is unchanged, the maths was incomplete.
+
+`O(own data + followed data)` is a statement about **an instant**: how much a
+node holds and answers at a point in time. Two leaks found on the same day
+satisfied it perfectly at every instant and still exhausted the box, because
+they grew **over time** and never shrank:
+
+- `BackfillLimiter` deleted keys that HEALED and kept forever the ones nothing
+  ever answered — `O(distinct keys ever asked)`.
+- The relay's three per-IP rate-limit maps (`ipVerifyLog`, `ipReleaseLog`,
+  `ipBlobLog`) were never pruned at all. One entry per distinct source address,
+  for the life of the process. With IPv6 a single /64 is 2^64 keys.
+
+So the invariant is properly stated in two parts, and a design must satisfy
+both:
+
+> **Instantaneous:** for any node, memory/storage/bandwidth/CPU is
+> `O(own data + followed data)` — never `O(total network)`.
+>
+> **Sustained:** no per-node structure grows monotonically with TIME or with
+> the number of requests served. Every keyed structure that outlives a request
+> names what removes an entry.
+
+The second has a security corollary that the first does not: **state whose size
+is chosen by an outsider is an attack surface, not a capacity question.** Rate
+limiters are the sharpest case, because their bookkeeping is keyed by exactly
+the thing an attacker varies — the control becomes the vector. Both leaks above
+were in limiters.
+
+Sweeping is usually free, and that is the test of a correct fix: the relay's IP
+entries are already treated as absent once their window elapses, so deleting
+them cannot change a decision (`window-limiter.test.ts` pins that as a
+property). A sweep that would change behaviour is not a sweep, it is a policy
+change wearing one.
+
+The screening checklist this produces is [SCREENING.md](SCREENING.md).
+
+---
+
 ## Design principles (apply everywhere)
 
 > These are the *engineering* principles — how the system is built. They serve

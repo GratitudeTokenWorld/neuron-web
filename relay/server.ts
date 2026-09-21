@@ -59,6 +59,7 @@ import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 import { BackfillLimiter } from '../src/engine/net/archive-backfill.js';
 import { getShard } from '../src/engine/core/partition.js';
 import { peerRelayHttpBase } from '../src/network/account-resolver.js';
+import { sweepExpiredWindows } from '../src/engine/net/window-limiter.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
 // vitest can pin them (this file is covered by no typecheck and no test — keep
 // every releasable piece of its logic over there, not here).
@@ -640,6 +641,33 @@ const ipReleaseLog = new Map();   // ip → { count, windowStart }
 const ipBlobLog = new Map();      // ip → { count, windowStart }
 const RELEASE_IP_MAX_PER_DAY = 30;
 const BLOB_IP_MAX_PER_DAY = 60;
+
+/**
+ * Keep the rate-limit maps bounded.
+ *
+ * These three are keyed by CLIENT IP and were never pruned: one entry per
+ * distinct source address, kept for the life of the process. That makes the
+ * size of an anti-abuse control a number the abuser picks — with IPv6 a single
+ * /64 is 2^64 addresses. The same shape had already bitten BackfillLimiter,
+ * which kept the keys nothing ever answered: limiter bookkeeping is itself
+ * state an attacker grows, and has to be swept like any other cache.
+ *
+ * Dropping an expired entry cannot change a decision — `checkAndRecordIp`
+ * already treats an elapsed window exactly as it treats a missing one — so
+ * this is pure memory reclaim (pinned in window-limiter.test.ts). On a timer,
+ * never per request: per request it would be O(entries) on the hot path to
+ * save memory that is not yet a problem.
+ */
+const IP_LOG_SWEEP_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const dropped = sweepExpiredWindows(ipVerifyLog, IP_WINDOW_MS)
+    + sweepExpiredWindows(ipReleaseLog, IP_WINDOW_MS)
+    + sweepExpiredWindows(ipBlobLog, IP_WINDOW_MS);
+  if (dropped > 0) {
+    dlog(`[Limits] swept ${dropped} expired IP window(s) — `
+      + `${ipVerifyLog.size + ipReleaseLog.size + ipBlobLog.size} live`);
+  }
+}, IP_LOG_SWEEP_MS).unref?.();
 
 function checkAndRecordIp(log, ip, max) {
   if (isLocalIp(ip)) return true;

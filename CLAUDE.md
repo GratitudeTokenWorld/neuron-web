@@ -21,10 +21,13 @@ Read it before anything else here; the short form:
    assimilate new technology; code evolves and syncs across nodes, with
    **changes voted on by a majority of node operators** (the vote and the
    upgrade path are both still unbuilt — do not assume them away).
-4. **Filter the work through these, and test proportionately.** Self-review
-   against the principles after a batch of meaningful changes; run the tests
-   that cover what changed, not the whole suite every time (see *Testing
-   cadence* below).
+4. **Screen every idea through the trinity — SECURITY → PERFORMANCE →
+   DECENTRALISATION, in that order** — then self-review after a batch of
+   meaningful changes, and test proportionately (see *Testing cadence* below).
+   Security first is a gate, not a weighting: a faster or more decentralised
+   design that weakens security is rejected, not traded. What to screen for and
+   what to stress-test: [docs/SCREENING.md](docs/SCREENING.md) — every entry
+   is a defect that actually shipped.
 5. **The principles evolve with Lucian.** Ask for his input, propose changes,
    and treat a principle that keeps needing an exception as the thing that is
    wrong.
@@ -56,7 +59,11 @@ store. It is the **re-platformed** successor to `../neuronchain` — the same ap
 designed to hold the *scale invariant*:
 
 > For any node, memory/storage/bandwidth/CPU must be `O(own data + followed data)` —
-> never `O(total network)`. Any `O(N)` subsystem fails at 10B users (the target,
+> never `O(total network)`, **and nothing may grow monotonically over time** —
+> every keyed structure outliving a request names what removes an entry, because
+> state whose size an outsider chooses is an attack surface rather than a
+> capacity question (ARCHITECTURE.md → *The invariant has two dimensions*).
+> Any `O(N)` subsystem fails at 10B users (the target,
 > decided 2026-08-09). No role is *required* to hold everything — archival
 > super-nodes included; full mirrors are an opt-in bonus, never load-bearing.
 
@@ -93,7 +100,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **544 tests / 72 files passing**, `npm run build` clean.
+Current baseline: **550 tests / 73 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of

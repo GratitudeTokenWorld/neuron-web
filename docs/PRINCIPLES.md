@@ -127,7 +127,30 @@ profiles reject each other's blocks).
 
 ## 4. Filter the work through these principles — and test proportionately.
 
-**4a. Self-review.** After a run of significant changes, stop and re-read the
+**4a. Screen every idea through the trinity: SECURITY → PERFORMANCE →
+DECENTRALISATION, in that order.** Set by Lucian, 2026-09-21. The order is what
+makes this a decision procedure rather than three competing opinions:
+
+- **Security first.** A faster or more decentralised design that weakens the
+  security model is not a trade to be weighed — it is rejected, and a different
+  design is found. "Always strive for secure improvements" is the standing
+  instruction, and it outranks the other two by construction.
+- **Performance second.** Among designs that are equally safe, prefer the one
+  that costs less per node. The scale invariant lives here.
+- **Decentralisation third — not because it matters least**, but because it is
+  the constraint most often reached for to justify compromising the first two.
+  A design that is more decentralised and less safe loses at step 1. Where
+  safety and cost are equal, take the one with no required party.
+
+Where the three genuinely conflict, say so out loud in the commit or the
+document rather than resolving it silently: a conflict is information about the
+design, and burying it is how the resolution stops being reviewable.
+
+The checklist this produces — what to screen for, and what to attack — is
+[SCREENING.md](SCREENING.md). Every entry there comes from a defect this
+project actually shipped.
+
+**4b. Self-review.** After a run of significant changes, stop and re-read the
 work against these principles rather than only against the tests. The question
 is not "does it pass?" but "does this still build the thing described above?".
 A change that improves a number while quietly adding a required party, a paid
@@ -147,7 +170,7 @@ Write the result down where the decision lives — usually ARCHITECTURE.md or th
 relevant section of CLAUDE.md — and raise anything that fails the filter with
 Lucian instead of fixing it silently.
 
-**4b. Test proportionately.** Test efficiently, not exhaustively-by-reflex:
+**4c. Test proportionately.** Test efficiently, not exhaustively-by-reflex:
 
 - **Per change:** run the tests that cover what changed. `npx vitest run
   path/to/thing.test.ts` is the default, not `npm test`.
