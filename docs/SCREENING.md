@@ -133,7 +133,17 @@ Found by the first black-hat pass (2026-09-21) and kept as an adversarial
 control in `provider-ledger.test.ts`. **Open** — the fix is Phase 4's
 custody-proven payouts, which is an economic design decision, not a patch.
 
-### 12. Trusting a claim as proof
+### 12. Numbers without provenance
+
+Every estimate, calculation and projection carries its method (PRINCIPLES.md
+→ 5): hypothesis first, inputs labelled MEASURED / ASSUMED / DERIVED,
+sensitivity shown, reproducible in `src/engine/sim/` rather than asserted in
+prose. A projection presented as a measurement is the analysis-side version of
+rendering the unmeasured as fact — and is committed just as easily:
+`storage-accounting.test.ts` hardcoded a block size and called it measured, in
+the file written to expose exactly that.
+
+### 13. Trusting a claim as proof
 
 A receipt says a provider *cached* something. Deleting the last local copy on
 that basis trusts a message. Ask the holder to produce the bytes.

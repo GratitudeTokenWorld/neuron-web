@@ -189,7 +189,42 @@ Lucian instead of fixing it silently.
   what is genuinely visual: layout, overlay alignment, a banner covering a
   control.
 
-## 5. The principles themselves are a work in progress.
+## 5. Use the scientific method for every estimation, calculation and projection.
+
+Set by Lucian, 2026-09-21. Numbers decide architecture here — whether a design
+scales to 10B, whether a cost is bounded, whether a fix worked — so a number
+produced carelessly is worse than none: it ends the argument without settling
+it.
+
+**Every estimate, calculation and projection must:**
+
+- **State the hypothesis first**, and what result would DISPROVE it. An
+  analysis that cannot fail is the same defect as a test that cannot fail
+  ([SCREENING.md](SCREENING.md) → 4), and it hides just as well.
+- **Label every input** as MEASURED, ASSUMED, or DERIVED, and say where a
+  measured one came from. `projection.ts` does this properly: it takes the
+  canonical byte counts of real signed objects and says so.
+- **Never present a projection as a measurement.** "Measured baseline" and
+  "10B projection" are different claims about different kinds of knowledge,
+  and the second is only as good as its assumptions.
+- **Show the sensitivity.** If the conclusion flips when an assumption moves
+  by 2×, the conclusion is about the assumption, not about the system.
+- **Be reproducible.** A number that lives only in a chat message is an
+  opinion; the same number as a runnable module is evidence. Put it in
+  `src/engine/sim/` where it re-runs with the suite and its inputs are visible.
+- **Re-measure when the system changes.** A stale constant is an assumption
+  wearing a measurement's clothes.
+
+This is the same discipline as *never render the unmeasured as fact*, turned on
+our own analysis rather than on the UI. It is easy to fail: the first draft of
+`storage-accounting.test.ts` hardcoded a block size and called it "measured" —
+inside the very analysis written to expose unmeasured claims. It now measures
+the bytes of a real signed block.
+
+**When the honest answer is "we do not know yet", that is a finding**, and it
+goes in the document next to what it would take to find out.
+
+## 6. The principles themselves are a work in progress.
 
 These rules, the goals behind them and the definitions they use are meant to
 improve continuously, **together with Lucian**. Ask for his input rather than

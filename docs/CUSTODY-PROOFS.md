@@ -4,7 +4,110 @@ Design options for the open finding in ARCHITECTURE.md → *Open security
 finding: storage rewards are self-metered*. Nothing here is decided; this is
 the option space, screened and then attacked.
 
-## The problem, precisely
+## Reframe (Lucian, 2026-09-21) — read this before the option table
+
+The first pass asked "how do we prove custody on-chain?". That was the wrong
+question, and the option table below inherits the error. Three corrections:
+
+### 1. The latency budget is a hard constraint, and it is not the same as the chain's
+
+A blockchain can grow, and 1–2 s of additional finality at billions of users is
+tolerable for a transaction — nobody is watching. **Content retrieval is not
+like that.** People abandon an image at three seconds. So for the storage
+subsystem, security cannot be bought with latency: any mechanism that puts work
+on the read path is disqualified before its security is even discussed.
+
+This is not "performance outranks security here". Security still gates
+(PRINCIPLES.md → 4a). It is that **the security must be achieved INSIDE a
+latency budget the chain cannot meet** — which is what makes it, in Lucian's
+words, a problem needing "a very new approach" rather than a smaller version of
+the consensus one.
+
+### 2. Ask what to REMOVE, not what to add
+
+When stuck, the move is to delete the problematic thing and replace it with
+something better suited to decentralisation and scale. Applied here, the
+problematic thing is not the absence of a proof — it is the **presence of
+storage accounting on the ledger**.
+
+Measured (`sim/storage-accounting.ts`, run in the unit suite):
+
+| | Blocks per provider |
+|---|---|
+| Storage accounting, per YEAR (6 heartbeats + 1 reward per daily epoch) | **2,555** |
+| Over a decade | **25,550** |
+| What `projection.ts` budgets for an account's ENTIRE LIFE | **200** |
+
+A provider exceeds the 10B projection's whole-life assumption in **29 days**,
+and overshoots it **128×** over a decade. Worse than the size is the shape:
+these blocks accrue with the **clock**, not with anything a user did. An idle
+provider — nothing stored, nothing served, nobody reading — writes exactly as
+many as a busy one. That is the sustained half of the invariant
+(ARCHITECTURE.md → *The invariant has two dimensions*) failing inside the
+ledger, and no cadence change fixes it: halving the heartbeat rate halves a
+number that is still unbounded in time.
+
+**So: remove storage blocks from the chain.** Liveness and payment do not
+belong in consensus. Settlement does, and settlement is exactly what a chain is
+good at — batched, infrequent, and nobody waiting on it. Measured at a monthly
+settlement cadence: 120 blocks per provider per decade, inside the projection's
+budget, and **zero when the network is quiet**.
+
+### 3. What the decentralisation leg actually optimises for here
+
+Not "no required party" in the abstract — **flexibility, and the speed at which
+the network adapts** to a storage substrate that is always growing and always
+volatile, so that redundancy is restored in real time. Cleaning up cache and
+content is **secondary**.
+
+That has a sharp, immediate consequence for something already built: a
+returning node currently **discards every foreign byte** once its lease lapsed
+(`custody.ts` → `planRejoin`). Under this priority that is backwards — it
+destroys redundancy the network spent bandwidth creating, in order to tidy up.
+Over-replication is cheap and safe; under-replication is the risk. The rejoin
+rule should keep the bytes and let them serve, discarding only under real space
+pressure. **Open decision** — it reverses a rule that shipped, so it is
+Lucian's call, but the current behaviour contradicts the stated priority.
+
+### The design this points at: let the DATA PATH be the proof
+
+Combining the three corrections gives something the option table below never
+considered, because it was still thinking in proofs:
+
+- **Hot content proves itself, for free.** A provider that answers reads is
+  demonstrably holding and serving; one that does not, is not. The bytes are
+  content-addressed, so the reader verifies them anyway — *a successful
+  retrieval is already a proof of custody*, costing zero extra latency, zero
+  crypto and zero chain. This is the same "verify on USE, not by watching"
+  rule that already drives repair.
+- **Cold content is the only case needing a constructed proof** — and cold
+  content is, by definition, **not latency-sensitive**. So the expensive
+  mechanism runs exactly where its cost does not matter. That asymmetry is the
+  whole trick: the fast path never pays for the slow path's guarantees.
+- **Payment is a side effect of the data path**, not a separate accounting
+  system: readers sign micro-receipts for bytes actually served, aggregated
+  off-chain and settled on-chain rarely.
+
+Hypotheses this design makes, and how to falsify each (PRINCIPLES.md → 5):
+
+| Hypothesis | Disproved by |
+|---|---|
+| H1. Most bytes are served often enough that reads alone keep custody evidence fresh | A read-frequency distribution where a large share of stored bytes go unread for longer than the redundancy-repair window |
+| H2. Removing accounting blocks leaves chain growth proportional to settlements, not time | A design where settlement frequency itself scales with time or provider count |
+| H3. Proof-on-cold costs less than proof-on-everything by the hot/cold ratio | Measuring the ratio and finding cold content dominates |
+| H4. Keeping bytes on rejoin improves durability more than the space it wastes | A churn simulation where retained stale replicas crowd out live ones under capacity pressure |
+
+H1 and H3 are measurable in `sim/` today with a read-distribution model; H4 is
+a variant of the existing `sim/repair.ts` churn harness. **None have been run.**
+Stating them unrun is the point — the design is a hypothesis, not a result.
+
+---
+
+## The problem, precisely (as originally framed)
+
+> Superseded by the reframe above, which rejects the premise that this belongs
+> on-chain at all. Kept because the option table is still the honest map of
+> what was considered, and because the attacks below apply to any design.
 
 Pay a provider for **bytes held, over an epoch**, where:
 

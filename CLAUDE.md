@@ -30,7 +30,12 @@ Read it before anything else here; the short form:
    is a defect that actually shipped. **When the work is security, ATTACK it:**
    the `black-hat-review` skill is the posture and the target list. Dev mode is
    the window — find it before the real ones do on mainnet.
-5. **The principles evolve with Lucian.** Ask for his input, propose changes,
+5. **Scientific method for every estimation, calculation and projection.**
+   State the hypothesis and what would disprove it; label each input MEASURED,
+   ASSUMED or DERIVED; never present a projection as a measurement; show the
+   sensitivity; make it reproducible (put it in `src/engine/sim/`, not in a
+   message). "We do not know yet" is a finding.
+6. **The principles evolve with Lucian.** Ask for his input, propose changes,
    and treat a principle that keeps needing an exception as the thing that is
    wrong.
 
@@ -102,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **551 tests / 73 files passing**, `npm run build` clean.
+Current baseline: **556 tests / 74 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
