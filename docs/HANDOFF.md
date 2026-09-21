@@ -67,7 +67,11 @@ provider that stores nothing out-earns an honest 4 GB one by 2500×, so the
 rational strategy is to store nothing. Demonstrated as an adversarial control
 in `provider-ledger.test.ts`; when custody-proven payouts land, that test
 should FAIL and be rewritten as the guarantee. ARCHITECTURE.md → *Open
-security finding*. **Not fixed — it is an economic design decision.**
+security finding*. **Not fixed — it is an economic design decision.** The
+option space is enumerated, trinity-screened and attacked in
+[CUSTODY-PROOFS.md](CUSTODY-PROOFS.md); three questions there block the work,
+the first being whether the network keeps MINTING for storage (under which
+provider/uploader collusion is unfixable by any proof) or the uploader pays.
 
 ## Your next task, in this order
 

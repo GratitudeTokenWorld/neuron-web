@@ -179,13 +179,28 @@ a flow property that depends on real holders.
 way `face-match.test.ts` keeps the v2 brute force. When custody-proven payouts
 land, that test should FAIL and be rewritten as the guarantee.
 
-**Fix shape (not yet decided).** Pay for custody the network VERIFIED, not
-custody claimed. The pieces already exist — uploader receipts name who
-confirmed a CID, spot checks already evict after two consecutive failures — but
-none of it reaches the reward path, and making it consensus-visible raises
-questions this project has not answered: who attests custody, how attestations
-aggregate on-chain, and what stops a provider and an uploader colluding to
-attest each other. That is Lucian's call, not a patch.
+**Fix shape (not yet decided).** The option space is enumerated, screened
+through the trinity and then attacked in
+[CUSTODY-PROOFS.md](CUSTODY-PROOFS.md). Summary of where that landed:
+
+- Sealing-based proofs (Filecoin-style PoRep/PoSt) are **rejected on
+  Principle 1c/3c** — they cost hours of CPU and gigabytes of RAM, which
+  excludes phones, browsers and single-board computers from ever being
+  providers. That is the trinity's third leg actually biting.
+- The strongest candidate needs **no new cryptography**: content is already
+  chunked with a per-chunk CID manifest, and `consensus/seed.ts` already
+  derives an unpredictable per-epoch beacon. A provider can therefore derive
+  its own challenge offsets, read those chunks and publish a proof anyone can
+  check against the manifest — **with no challenger to collude with, because
+  nobody issues the challenge.**
+- **Collusion between a provider and an uploader is unfixable by any proof
+  system** while the network MINTS the reward, because every proof passes
+  honestly. It becomes economically pointless the moment the uploader pays
+  instead. That is an economic decision, not a cryptographic one.
+- Honest ceiling: this buys **demonstrated retrievability by a distinct
+  identity**, not physical storage. Outsourcing (fetch-on-challenge) and
+  cross-identity deduplication both survive; the second reduces to the Sybil
+  problem, where it belongs.
 
 ---
 
