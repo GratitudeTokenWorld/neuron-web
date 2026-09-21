@@ -154,6 +154,19 @@ where redundancy silently fails first.
 
 ## Design principles (apply everywhere)
 
+> These are the *engineering* principles — how the system is built. They serve
+> the project's core principles (what it is **for**), which are canonical and
+> live in [PRINCIPLES.md](PRINCIPLES.md): for humanity without discrimination;
+> free and open source forever; absolute decentralisation reached progressively,
+> across as many kinds of device as possible, at tens of billions of human and
+> machine users; every change filtered through those and tested proportionately;
+> and the principles themselves revised with Lucian as the work teaches us more.
+> **Where this document and PRINCIPLES.md conflict, PRINCIPLES.md wins** — and
+> the conflict is a bug worth reporting. Two of its commitments are not yet
+> built and must not be assumed away: the cross-node **code-sync/upgrade path**
+> and the **node-operator vote** that ratifies it.
+
+
 1. **Partition, don't replicate.** Shard global state by a partition key; a node
    holds only the shards it subscribes to.
 2. **Interest-based propagation.** You receive a write only if you follow the

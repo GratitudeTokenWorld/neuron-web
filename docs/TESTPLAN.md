@@ -1,8 +1,17 @@
 # Manual E2E test plan — two-relay dev network
 
-The features that need a real face + camera cannot be automated; this is the manual
-matrix. It exercises everything the 470-test suite cannot: live libp2p transport,
+This matrix exercises what the unit suite cannot: live libp2p transport,
 cross-relay federation, the camera/liveness pipeline, and multi-browser sync.
+
+**Much of it is no longer manual.** Account creation is automated by the
+dev-only synthetic face (`src/core/test-face.ts`), so T8–T10 run unattended
+through Playwright — see `.claude/skills/e2e-browser-test/SKILL.md`. What still
+needs a human is anything requiring a REAL face through the camera: T1's live
+capture, T5/T5.3 recovery (the synthetic path produces no trajectory proof, by
+design), and any judgement about how the capture UI actually looks and feels.
+
+**Test proportionately** (PRINCIPLES.md → 4b): run the rows a change touches,
+not the whole matrix; run the whole matrix before a deploy or a phase boundary.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +
 your local dev relay + 2 browser profiles.
@@ -398,7 +407,27 @@ observable in the console; the policy itself is unit-tested
 (`src/engine/content/custody.test.ts`, `src/engine/sim/repair.test.ts`), so what
 this checks is the WIRING — which is the half no test covers.
 
-Two devices, A (uploader) and B (registered storage provider, serving).
+**Automated:** `e2e/custody.spec.ts` (`npm run e2e`). The spec **creates its own
+accounts** — no face capture, no fixture — using the dev-only synthetic face
+(`src/core/test-face.ts`). Run the stack as:
+
+```powershell
+$env:LOCAL_ONLY = '1'; $env:TEST_FACE = '1'; $env:STORAGE_TIMING = 'fast'; npm run dev
+```
+
+`LOCAL_ONLY` is not optional for repeated runs: the cloud relays cap attestation
+at 24 per IP per 24 h, and once that is spent every creation fails with
+`only 0 attester relay(s) responded`. The local relay exempts local IPs and
+`LOCAL_ONLY` drops `REQUIRED_ATTESTERS` to 1, so it alone satisfies the quorum —
+and test traffic stops spending the shared relays' Sybil quota. The spec skips
+itself on the production clock rather than asserting something unreachable.
+
+Devices: A (uploader) and B (registered storage provider, serving) — **plus C
+for step 1 only**. `MIN_REPLICAS` is 2 and the uploader is never one of them
+(authorship is not custody), so on a two-account network `Handoff complete` can
+never be logged: the handoff needs the uploader plus TWO other live providers.
+That is the rule working, not a bug, but it makes step 1 unreachable with two
+devices — this header said two because it predates the decision.
 
 1. **Handoff completes.** On A, upload a small file to the Storage tab.
    **Pass:** `[StorageManager] Cache request published…`, then B logs
@@ -420,7 +449,11 @@ Two devices, A (uploader) and B (registered storage provider, serving).
    first failure; only a second consecutive failure logs
    `Evicting <pub>… after 2 consecutive failures`. A single failure followed by a
    success must leave the holder set unchanged.
-5. **Rejoin past the lease discards.** Stop B for more than one lease —
+5. **Rejoin past the lease discards.** (A restart here means a restart: a
+   browser profile that keeps its IndexedDB. A context re-opened from a saved
+   session alone is a *wiped* device holding the same keys, and it has nothing
+   to discard, so the step would pass without testing anything — the spec uses
+   a persistent `userDataDir` for this reason.) Stop B for more than one lease —
    **12 h at production timing, 6 minutes under `STORAGE_TIMING=fast`** — then
    start it. **Pass:** B logs
    `Rejoin <pub>…: lease lapsed …h ago … discarding N CID(s)`, its stored bytes
@@ -432,15 +465,22 @@ Two devices, A (uploader) and B (registered storage provider, serving).
    the count that drives repair is live leases, and a holder that once confirmed
    is explicitly not one.
 
-## T10 — File index is no longer global (NOT YET RUN)
+## T10 — File index is no longer global (PARTLY RUN)
 
 The last `O(N)` in storage closed 2026-08-15: clients used to ingest and persist
 a record for every file on the network. **Needs a relay deploy** — `GET /files`
 is new.
 
+**Automated:** `e2e/file-index.spec.ts`. Note the timing this row depends on:
+the first file announcement is fire-and-forget, and the recovery is a
+re-announce 5 s after start, 3 s after a peer connects, and then **every 5
+minutes**. A freshly uploaded file can therefore take a full interval to reach
+an archive — allow for it rather than treating the gap as a delivery bug.
+
 1. **Archives answer.** `curl "http://80.97.27.224:9092/files?network=testnet"`
    **Pass:** `{"records":[…],"total":N}` on both relays; `total` is that
-   archive's own count, not a network figure.
+   archive's own count, not a network figure. ☑ **Verified 2026-09-20** on both
+   cloud boxes.
 2. **A client holds only its own.** On device B (which owns no files), open the
    Storage tab and check `node.storage.getFileIndex().size` in the console.
    **Pass:** 0, while device A's upload is visible in `/files` on the relays.
@@ -455,6 +495,40 @@ is new.
    on both relays returns the record with `"removed":true` (a tombstone, not an
    absence — a holder has to be able to *learn* the file was withdrawn).
 
+## Findings from the first automated T9/T10 run (2026-09-20)
+
+Three things the runs surfaced that are **decisions, not test bugs**. None is
+actioned — they need Lucian's call.
+
+1. **A handed-off publisher never drops its copy.** The custody rule says the
+   publisher "keeps no copy by default and is not automatically a replica", but
+   the implementation only stops COUNTING it: handoff logs `safe to close`,
+   emits `storage:handoff-complete`, and nothing deletes the bytes.
+   `clearCached()` will not either — its doc comment says it "Leaves own
+   uploaded blocks intact". Because `repairOnReadFailure` returns early for any
+   node that does not own the cid, the only node that can trigger repair is the
+   one that always holds the content, which makes **T9 step 3 unreachable as
+   written**. Either the publisher should drop its bytes after handoff (matching
+   the rule, and freeing the disk), or the rule and this step should say the
+   publisher keeps an uncounted cached copy.
+
+2. **An account's archive record can regress to a stale balance.**
+   `saveAccount` republishes a caller-supplied object and stamps a monotonically
+   increasing `_version`; the relays resolve conflicts by highest version. Two
+   accounts created seconds apart: one settled at `_version=1, balance=1000000`,
+   the other at `_version=3, balance=0` — the later record carrying LESS state.
+   Whether `/resolve`'s balance is load-bearing for any client decides how much
+   this matters.
+
+3. **A file's first announcement can be lost, and the recovery is slow.** The
+   announcement is fire-and-forget; published into a mesh with no subscriber it
+   is simply dropped. The re-announce fires 5 s after start, 3 s after a peer
+   connects, and then **every 5 minutes**, so a fresh upload can take a full
+   interval to reach an archive. Verified working in isolation (`[Archive]
+   Stored file record` within 90 s of upload with `DEBUG_ARCHIVE=1`), so this is
+   the designed recovery rather than a delivery bug — but any test or UI that
+   assumes prompt archive visibility has to allow for the interval.
+
 ## Result log
 
 | # | Test | Result | Notes |
@@ -468,8 +542,8 @@ is new.
 | T6 | Username uniqueness + face limit | ☑ | Slot counts zero on an operator reset, `nid` preserved |
 | T7 | Operator-gated reset | ☑ | Exercised repeatedly in dev (epoch propagates relay→relay in ~60 s) |
 | T8 | Storage provider lifecycle | ☐ | **Steps 1–4 not yet run.** Register/discover/interval/deregister were all exercised ad-hoc during development on 2026-08-15 (both devices saw each other, rate correctly 0) but not as a recorded pass. Step 5 (reward) is now runnable under `STORAGE_TIMING=fast` — the open question about a clock backdoor is closed: no backdoor, the whole profile compresses |
-| T9 | Publish handoff + repair | ☐ | **Not yet run.** Written 2026-08-15 alongside the lease/repair work. All five steps fit one sitting under `STORAGE_TIMING=fast` (6-minute lease) |
-| T10 | File index is no longer global | ☐ | **Not yet run, and BLOCKED on a relay deploy** — `GET /files` does not exist on the cloud boxes yet |
+| T9 | Publish handoff + repair | ◐ | **Steps 1 + 2 PASS** (2026-09-20, `e2e/custody.spec.ts`, accounts created by the synthetic face). Step 1 needs **three** accounts, not two — see the header. **Step 5 passed its rejoin assertions** (`lease lapsed 6min ago (max 6min)`, discarding, content re-homed) in one run; its setup is flaky late in a full run — run it isolated with `-g "steps 5"`. **Steps 3+4 are unreachable as written** and skip with the reason (the publisher never drops its copy — see Findings). **Step 6 is not asserted** — the reason is recorded at the foot of the spec |
+| T10 | File index is no longer global | ◐ | **Steps 1, 2, 3 and 4 PASS** (2026-09-20, `e2e/file-index.spec.ts`): both cloud boxes answer `/files` with their own `total` — it shipped in `2f66a4c`, an ancestor of the deployed `e51cae0`, so the "blocked on a relay deploy" note was stale. A client holds only its own files, the one-time migration drops a planted foreign record and does not repeat on the next boot, and the archived-files chip reads `—` rather than a bare 0. Archive-receipt timing (step 2b) and the withdrawal tombstone (step 5) are gated on the 5-minute re-announce — see Findings |
 | — | Mobile capture (part of T1) | ☑ | 2026-08-15: account created on a phone through the tunnel. Required three fixes — the capture guide was letterboxed on a portrait feed, close-eyes was unpassable below ~8 fps, and the attesters were unreachable over `https`. Face flows had never been run on a phone before |
 
 **Automated pre-check.** Before the manual matrix, run the live probe — it

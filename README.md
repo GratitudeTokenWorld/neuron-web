@@ -10,7 +10,11 @@ users.
   ledger/consensus/storage are being refactored onto. The engine **is** wired in
   (`node.ts` runs `EngineLedger`), and `storage-manager` moved across with
   Phase 3; the remaining seam is the app-layer types (see `CLAUDE.md`). Test
-  suite: 458 passing.
+  suite: 523 passing.
+- What the project is **for**, and the filter every change is judged against:
+  [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md) — for humanity without
+  discrimination, free and open source forever, absolute decentralisation
+  reached progressively.
 - The full design + threat model + measured results: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Ops: relay/super-node deployment [`docs/SUPERNODE.md`](docs/SUPERNODE.md), cloud
   provisioning [`docs/CLOUD.md`](docs/CLOUD.md), manual E2E matrix
@@ -59,7 +63,7 @@ src/
 - **App** — runs and builds (the neuronchain UI/transport/face/relay, unchanged).
 - **Engine** (`src/engine/` + `src/ledger/`) — phases 0–2 done, Phase 2 consensus
   (fraud proofs + ECVRF committee finality), native NFTs, 2-attester identity;
-  **512 tests passing, engine + storage typechecked**, all 7 scale-invariants
+  **522 tests passing, engine + storage typechecked**, all 7 scale-invariants
   demonstrated by tests (see `docs/ARCHITECTURE.md`). Wired into the app via
   `EngineLedger` (`src/network/node.ts`).
 - **Scale invariant restored** — four `O(N)` violations closed. G1 + G2

@@ -46,28 +46,42 @@ anything looks broken: it separates "the harness is wrong" from "the app is
 wrong", and a suite that skips everything for want of a fixture looks identical
 to one whose harness is dead.
 
-## What cannot be automated, and why
+## Accounts are created by the specs — no capture step
 
-**Account creation.** It needs a live face through a depth sweep and five
-randomly-ordered actions. A synthetic video cannot pass it — deliberately, since
-defeating the gate with a recording is the attack it exists to stop. Chromium's
-`--use-file-for-fake-video-capture` will not help; do not try.
+`newAccountDevice('alice')` opens a device and gives it a brand-new account in
+~4 seconds, with no human. It drives the REAL creation flow — same buttons,
+same PIN dialog, same attestation, same v3 blob and Shamir split — with only
+the camera replaced by a seeded synthetic descriptor
+(`src/core/test-face.ts`, ⚠ dev-only, on the remove-before-production list).
 
-So a device is **seeded from a session captured once by hand**:
+**The stack must be started for it:**
 
 ```powershell
-npm run e2e:capture alice     # create/recover in the window, then press ENTER
+$env:LOCAL_ONLY = '1'; $env:TEST_FACE = '1'; $env:STORAGE_TIMING = 'fast'; npm run dev
 ```
 
-That saves `e2e/.sessions/alice.json` — **wallet keys, gitignored, treat like
-`.relay-*`**. Only localStorage is saved; the chain re-syncs from the archives on
-start, the same path a recovered device takes. A captured session survives a
-*chain* reset but not an *account* wipe: re-capture after any reset that
-destroys accounts.
+- `TEST_FACE=1` bakes the synthetic-face flag. Without it the client constant is
+  `false`, the app opens a real camera, and `createAccount` fails immediately
+  with the remedy rather than hanging on a capture nobody is performing.
+- `LOCAL_ONLY=1` is what makes repeated runs possible. The cloud relays cap
+  attestation at **24 per IP per 24h** (`IP_MAX_PER_DAY`), and a day's debugging
+  exhausts it — every later creation then fails with
+  `only 0 attester relay(s) responded` behind two 429s. The local relay exempts
+  local IPs ("local dev never limited"), and `LOCAL_ONLY` also sets
+  `REQUIRED_ATTESTERS` to 1, so the local relay alone satisfies the quorum.
+  Tests should not be spending the shared relays' Sybil quota anyway.
+- On a `LOCAL_ONLY` stack the only archive the client reaches is the local
+  relay. `RELAY_BASES` still lists the cloud boxes, and the archive assertions
+  accept ANY base holding the record, so they pass either way.
 
-Specs that need one `test.skip()` without it. That is deliberate — a missing
-fixture is not a regression, and a red suite meaning "you did not set up" trains
-people to ignore red.
+Two limits are **per human, and a seed is a human**: `FACE_MAX` allows 3
+accounts per face on testnet, and a username belongs to the nid that claimed it.
+`E2E_RUN` tags every identity per run so neither is re-used — without it a
+re-run fails with `Face limit reached (3/3)` or a 409, both of which read as
+broken code rather than exhausted quota.
+
+**Still manual:** recovery-share release. The synthetic path returns before
+`onPass` fires, so it produces no trajectory proof — by design.
 
 ## The two log streams — confusing them costs a cycle
 
@@ -89,8 +103,8 @@ machine and talk over **loopback WebRTC** — sidestepping the carrier NAT that
 makes phone testing need TURN.
 
 ```ts
-const a = await openDevice('alice', { storageStatePath: 'e2e/.sessions/alice.json' });
-const b = await openDevice('bob',   { storageStatePath: 'e2e/.sessions/bob.json', channel: 'msedge' });
+const a = await newAccountDevice('alice');
+const b = await newAccountDevice('bob', { channel: 'msedge' });
 ```
 
 ⚠ **Custody is per-device.** A seeded session carries an account that is
@@ -107,7 +121,20 @@ Run serial, one worker. The config enforces it; do not raise it.
 - `openDevice(name, opts)` — launches, waits for the node, attaches console capture
 - `openStorageTab(d)` / `storageStats(d)` — the stat chips as a label→value map
 - `providerRow(d, 'prefix')` — a provider's row as rendered text
+- `newAccountDevice(name, opts)` — a device with a brand-new account, no human
+- `createAccount(d, username, pin)` — the creation flow on an open device
+- `profileDir(name)` — a persistent profile path, OUTSIDE the repo: Vite watches
+  the project tree and a live Chrome holds `Default/Network/Cookies` locked, so
+  a profile inside it throws EBUSY and takes the whole dev server down mid-run
+- `waitForGossipMesh(d)` — waits for a circuit-relay reservation. A fresh
+  profile starts with no mesh, and an announcement published into that gap is
+  never delivered; the archive gets it minutes later, which reads as "the
+  archive never got it"
 - `uploadFile(d, name, bytes, seed)` — uploads and returns the CID
+- `serveStorage(d, capacityGB)` — registers and waits for the FIRST heartbeat,
+  i.e. the lease; a registration without one is not custody
+- `contentLibrary(d)` — the device's own-files rows, as rendered
+- `relayFiles(base, params)` / `RELAY_BASES` — the archives' `/files` answer
 - `appLog(d)` — the in-app panel's lines
 - `d.log.waitFor(re, ms)` / `.all(re)` / `.none(re)` — `none()` is the one specs forget
 
@@ -119,6 +146,17 @@ content and nothing would transfer.
 
 - **Assert what a human would see.** Read rendered text, not internals. The
   defects that reached production were all in the rendering.
+- **Prefer a logical assertion to a screenshot.** Almost everything here is
+  decidable in code — rendered text, a log line, an archive's JSON — and a
+  screenshot only defers the judgement to a human. Keep images for what is
+  genuinely visual: overlay alignment, letterboxing, a banner covering a
+  control. (One of those bit this suite: a fixed warning bar sat over the tab
+  strip and swallowed clicks until it was given `pointer-events:none`.)
+- **Check the identifier is rendered in full before matching on it.** The
+  content library ELIDES CIDs (`bafkrei…c6xf6fq`), so `toContain(cid)` can never
+  match — and a negative assertion written that way passes for that reason
+  alone. Match a filename, and assert the positive case too, so the negative
+  cannot pass by rendering nothing.
 - **Assert the impossible cannot appear** — a numerator above its denominator, a
   negative duration, a score above its uptime. Those catch a whole class, not one
   field, and each one here is a real bug that shipped.
@@ -135,10 +173,29 @@ content and nothing would transfer.
 
 - `e2e/smoke.spec.ts` — harness self-check, no fixture needed
 - `e2e/storage-ui.spec.ts` — the display defects of 2026-08-16, as regressions
+- `e2e/custody.spec.ts` — TESTPLAN T9 (handoff, repair, lease lapse)
+- `e2e/file-index.spec.ts` — TESTPLAN T10; its step 1 queries the relays from
+  Node, not through the page, because reading the archive through the client
+  under test proves nothing about which of the two holds the index
 
 ## TESTPLAN rows
 
-`docs/TESTPLAN.md` T8/T9/T10 are written for two devices. T9 steps 1–4, 6 and
-T10 are automatable with two contexts; T9 step 5 needs a >6-minute absence under
-`fast` timing, so give it a long `test.setTimeout()` or run it by hand. T1–T7
-involve faces and stay manual.
+`docs/TESTPLAN.md` T8/T9/T10 are written for two devices, and for T9 step 1
+that is **wrong**: `MIN_REPLICAS` is 2 and the uploader never counts itself, so
+`Handoff complete` needs the uploader plus TWO other live providers — three
+sessions. Steps 2–6 need two. T9 step 5 needs a >6-minute absence under `fast`
+timing (the spec skips itself on the production clock rather than asserting
+something unreachable). T1–T7 involve faces and stay manual.
+
+**A restart needs a persistent profile.** `storageState` carries localStorage
+only, so re-opening a context gives a device with an empty IndexedDB — no
+cached CIDs, no chain. That is a wiped machine holding the same keys, not a
+restart, and a rejoin test against it discards nothing and passes vacuously.
+Pass `userDataDir` (and `fresh: true` to wipe deliberately):
+
+```ts
+const b = await openDevice('bob', {
+  storageStatePath: 'e2e/.sessions/bob.json',
+  userDataDir: 'e2e/.profiles/bob',   // survives close(); seeded on first boot
+});
+```

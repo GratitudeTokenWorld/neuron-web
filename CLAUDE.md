@@ -2,6 +2,48 @@
 
 Guidance for Claude Code when working in this repository.
 
+## Core principles — read first, and judge every change against them
+
+The project's constitution lives in [docs/PRINCIPLES.md](docs/PRINCIPLES.md).
+Read it before anything else here; the short form:
+
+1. **For humanity, no discrimination.** Serves everyone, excludes no one by who
+   they are. One-human-one-account is a *counting* rule, never an eligibility
+   one. A face that fails in bad light is an accessibility bug, not a bad user.
+2. **Free and open source, forever.** No paid tier, no proprietary component a
+   node needs, no dependency that can later charge rent or vanish.
+3. **Absolute decentralisation, reached progressively.** No required party in
+   any role; runs on as many kinds of device as possible; `O(own + followed)`
+   at tens of billions of users, human *and* machine; adaptable enough to
+   assimilate new technology; code evolves and syncs across nodes, with
+   **changes voted on by a majority of node operators** (the vote and the
+   upgrade path are both still unbuilt — do not assume them away).
+4. **Filter the work through these, and test proportionately.** Self-review
+   against the principles after a batch of meaningful changes; run the tests
+   that cover what changed, not the whole suite every time (see *Testing
+   cadence* below).
+5. **The principles evolve with Lucian.** Ask for his input, propose changes,
+   and treat a principle that keeps needing an exception as the thing that is
+   wrong.
+
+A change can pass every test and still fail this filter — by adding a required
+party, a paid dependency, an `O(N)` path, or a new barrier to joining. When that
+happens, raise it rather than fixing it silently.
+
+## Testing cadence — proportionate, not reflexive
+
+- **Per change:** `npx vitest run path/to/changed.test.ts`. This is the default.
+- **Full `npm test`:** before a commit series lands, before a deploy, and when a
+  change reaches across subsystems — not after every edit.
+- **`npm run typecheck`** when engine or storage types move; **`npm run build`**
+  before claiming anything about the bundle.
+- **Playwright for anything a browser has to answer** — UX, usability,
+  rendering, end-to-end confirmation (`.claude/skills/e2e-browser-test/SKILL.md`).
+  Every display defect of 2026-08-16 passed the unit suite.
+- **Prefer a logical assertion to a screenshot.** Whether data was wiped or a
+  record exists is decidable in code; keep images for genuinely visual things
+  (layout, overlay alignment, a banner covering a control).
+
 ## What this is
 
 `neuron-web` is a decentralised social dApp: a browser-first P2P network with its own
@@ -48,7 +90,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **512 tests / 70 files passing**, `npm run build` clean.
+Current baseline: **522 tests / 71 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -149,13 +191,16 @@ shipped this session. What is NOT done is verifying them on the live network.
 
 **Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
-1. **Deploy the relays, then run T10.** `GET /files` exists only locally. It was
-   verified on isolated ports (`PORT=9190 RELAY_DATA_DIR=.relay-verify`) — route
-   answers, relay stable well past the 60 s timer — and the relay's WebCrypto
-   verifier was checked against real `signData` output (honest record passes;
-   inflated size, wrong key both rejected). No cloud box has any of it.
-2. **Run T9.** Steps 1–4 are one sitting; step 5 needs a >12 h absence.
-3. Then **Phase 4**, paying down the migration seam per caller.
+1. **Run T9 + T10.** Both are written as Playwright specs
+   (`e2e/custody.spec.ts`, `e2e/file-index.spec.ts`) and skip without a captured
+   session. **T10 is NOT blocked** — `GET /files` shipped in `2f66a4c`, which is
+   an ancestor of the deployed `e51cae0`, and both cloud boxes answer it (step 1
+   passes today). What is still needed is the manual part: `npm run e2e:capture`
+   for **three** accounts, and a stack on `STORAGE_TIMING=fast`.
+   **Three, not two:** `MIN_REPLICAS` is 2 and the uploader never counts itself,
+   so `Handoff complete` is unreachable with two accounts — T9's "two devices"
+   header predates that decision. Steps 3–6 need only two.
+2. Then **Phase 4**, paying down the migration seam per caller.
 
 `storage-manager.ts` (~1500 lines) has more callers than the ledger did —
 enumerate them before changing what it broadcasts (see the free-rider trap
@@ -518,6 +563,43 @@ Check this list before any deploy that is not a dev server.
   silent. **Switching profiles requires a wipe** — `epochDay` is
   `floor(ts / REWARD_EPOCH_MS)`, so existing epoch numbering becomes meaningless.
 
+- **Synthetic face** (`src/core/test-face.ts`, added 2026-09-20, Lucian's call).
+  `TEST_FACE=1` on the dev server lets a browser profile set
+  `localStorage.neuron_test_face` and create accounts from a **seeded 128-float
+  descriptor**, with no camera and no liveness check. Each seed is a distinct
+  human to every match gate (independent unit vectors in 128-D sit ~1.41 apart,
+  far above `MATCH_THRESHOLD` 0.45), so one machine can hold several accounts.
+
+  **Why it exists:** account creation needed a human per account, so a spec
+  needing three accounts needed three enrolments. E2E accounts now cost ~4
+  seconds each and the captured-session fixture is gone.
+
+  **What it does NOT bypass:** only the camera. `quantizeDescriptor` and
+  `hashDescriptor` build the FaceMap, the relay attests it, the nullifier is
+  issued, the v3 blob seals under `XOR(face, PIN, share)`, and the Shamir share
+  is split — so a test exercises the path that ships. It also cannot produce a
+  trajectory proof (`detectChallenge` returns before `onPass` fires), so
+  **recovery-share release stays manual**.
+
+  **It needed no relay change, and that is worth knowing:**
+  `/face-verify/verify` has always taken a client-supplied descriptor over HTTP
+  and never seen a camera — liveness is enforced entirely client-side. The
+  relay's Sybil defence is the per-IP cap and `FACE_MAX`, not the descriptor's
+  provenance. This feature does not weaken that; it stops tests pretending
+  otherwise.
+
+  **Why it cannot ship:** it is the liveness gate, which is the whole of
+  one-human-one-account, and therefore of consensus weight.
+
+  Structurally dev-only: `vite.config.ts` bakes `__TEST_FACE__` as `false`
+  unless `command === 'serve'` **and** `TEST_FACE=1`, and the seed is ignored
+  without it. Verified: after `npm run build`, `grep -r "neuron_test_face" dist/`
+  and `grep -r "SYNTHETIC FACE" dist/` both find nothing — the PRNG, the
+  descriptor generator, the guards and the warning strings are all eliminated.
+  A red banner is pinned to the page whenever it is active, because an account
+  made this way is indistinguishable from a real one afterwards. **Delete it
+  before any shipped build.**
+
 - **Dev relay proxy** (`src/network/dev-relay-proxy.ts`, added 2026-08-15,
   Lucian's call). The Vite dev server proxies each raw-IP bootstrap relay under
   `/dev-relay/<n>`. Needed because face capture requires a secure context, so a
@@ -558,6 +640,14 @@ shims, or fear resets when a change calls for wiping `.relay-data/` and client
 storage. What must still survive any wipe: the relay **peer-id and attester key**
 files (identity — the baked bootstrap addrs embed the peerIds) and, as always,
 never commit secrets. Leaving dev mode is an explicit user call, not inferred.
+
+**Wipe freely — restated 2026-09-21 because it keeps being treated as a last
+resort.** Wiping the testnet is *cheap and expected*: do it as often as it makes
+the work easier, and do not spend effort preserving state, engineering around a
+stale chain, or designing a test to tiptoe past bad data. If a wipe would make a
+question decidable, wipe. The only things to carry across are the relay peer-id
+and attester keys, and any captured E2E sessions (which the synthetic face has
+now made disposable too — accounts are created on demand).
 
 ## Two-relay dev network & manual testing
 
