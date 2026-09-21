@@ -972,7 +972,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
 | 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10; parity 2026-08-15; repair, handoff, file index and S3 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine), a filesystem adapter and an **opt-in S3-compatible** one (`src/storage`, zero-dependency SigV4 pinned to AWS's published vectors). Provider economy on-chain: four `storage-*` engine block types, `provider-ledger.ts` (registry + **lease liveness** + reward evidence), reward minting guarded by balance conservation *and* an on-chain evidence ceiling, provider **discovery** by verified archive query (`GET /providers`). Custody policy in `content/custody.ts` — live-only replica counting, lapsed-holder repair, rejoin discard, population-scaled jittered cadences, demand-scaled serving capacity. Publish **handoff** (`awaitHandoff`/`stagingCids`, staging persisted). File index off the global topic → `GET /files` + `file-index.ts`. Repair-vs-churn **measured** in `sim/repair.ts`. Remaining: none of the Phase-3 list — see *Where this stands* |
-| 4 — Scale hardening | **in progress 2026-09-21** | relay federation (`engine/net`), capped inflation (`engine/economy`), and **archive backfill** — demand-driven, rate-limited, never a sync-on-rejoin, verified healing in production by `scripts/backfill-smoke.mts`. Chains heal over gossip (`engine-delta-req` on a `/head-proof` miss); the account directory and file index heal over HTTP from peers, because both already expose verified GET endpoints and every record is self-signed. Still missing: **pending sends** (derived from arbitrary senders' blocks, so there is no key to ask by — needs a different shape), **provider records**, custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
+| 4 — Scale hardening | **in progress 2026-09-21** | relay federation (`engine/net`), capped inflation (`engine/economy`), and **archive backfill for every store** — demand-driven, rate-limited, never a sync-on-rejoin, verified healing in production. Chains heal over gossip (`engine-delta-req` on a `/head-proof` miss); the account directory and file index heal over HTTP from peers (both already expose verified, self-signed records); inbound-transfer discovery heals by asking a peer WHICH SENDERS have sends for a recipient, then backfilling those chains. Still missing: **provider records**, custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 55/55 |
 | G3 (a third `O(N)` violation, found later) | **CLOSED 2026-08-15** | the global `keyblobs` topic broadcast every account's encrypted-key blob to every node — G1's shape, hidden behind a security rationale. Replaced by targeted `POST`/`GET /keyblob`. See *Scale-invariant gaps* below |
@@ -1052,10 +1052,18 @@ caller, as each is moved off the `DAGLedger` compatibility surface —
   `engine-delta-req` because relays already served it; the record stores use
   plain HTTP GET against a peer, because they already expose verified
   endpoints and every record is self-signed. Adding a gossip request type for
-  them would have been new trust surface for no gain. `pending-sends` fits
-  neither: the answer is assembled from arbitrary senders' blocks, so there is
-  no key to ask a peer by. It stays open rather than being forced into a shape
-  that does not fit.
+  them would have been new trust surface for no gain.
+- **`pending-sends` was written off too early, and that was wrong.** The first
+  pass recorded it as unbackfillable because its answer is assembled from
+  arbitrary senders' blocks, so "there is no key to ask a peer by". The
+  RECIPIENT is the key: a peer answers "what is addressed to X?" perfectly
+  well, and its answer NAMES the senders — which is exactly what the chain
+  backfill needs and could not otherwise discover. The peer's list is a hint
+  about where to look, never data that is stored, so it cannot make this relay
+  archive anything a sender did not sign. Guarded on the recipient being an
+  account this relay already knows, because an empty `pending-sends` is the
+  correct and common answer and firing on every one would ask peers about
+  every stranger anyone probes.
 - **A shared helper was NOT widened to fit.** `relayHttpBase` ignores tcp
   multiaddrs deliberately — it feeds the client's archive fan-out, where each
   base is another request per lookup (Fan-IN). Relays need the opposite, so
@@ -1085,12 +1093,13 @@ did before.
   a change to what relays broadcast is exactly the kind of thing operators
   would ratify. Recorded here so it is not forgotten when that exists.
 
-**Honest gap:** this covers per-account CHAINS only, because
-`engine-delta-req` is the one peer-query mechanism that already exists. The
-account directory, pending sends, the file index and provider records each
-live in their own store with no equivalent, so a relay that was down still has
-holes in those. Closing them needs a peer-query shape per store — the same
-demand-driven rule, not a sync.
+**Remaining gap:** provider records. Everything else now heals. Also worth
+stating plainly, because it was found by applying this section's own lens: the
+limiter kept ABANDONED keys forever while deleting healed ones, so the module
+whose job is to bound `O(queries)` cost was itself growing `O(distinct keys
+ever asked)` — with a remote trigger. Bounded state over TIME is a different
+property from bounded state at an instant, and the invariant as usually stated
+only covers the second.
 
 ---
 

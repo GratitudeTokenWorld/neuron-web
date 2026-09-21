@@ -55,8 +55,11 @@ describe('backoff', () => {
     let t = 0;
     for (let i = 0; i < 3; i++) { expect(b.request(KEY, t).ask).toBe(true); t += 10_000; }
     expect(b.request(KEY, t)).toEqual({ ask: false, reason: 'giving up on this key' });
-    // And it stays given up, however long we wait.
-    expect(b.request(KEY, t + 86_400_000).ask).toBe(false);
+    // Given up for as long as the key is remembered — but NOT forever. "Nothing
+    // has this account" is true of a moment, and a key kept for all time is
+    // also a key that can never learn otherwise (and O(queries) memory).
+    expect(b.request(KEY, t + 1_000).ask).toBe(false);
+    expect(b.request(KEY, t + DEFAULT_BACKFILL_POLICY.forgetAfterMs + 1_000).ask).toBe(true);
   });
 
   it('forgets the attempts once an answer arrives', () => {
@@ -65,6 +68,31 @@ describe('backoff', () => {
     b.settle(KEY);
     // A healed key is a fresh key: the next genuine miss is a first miss again.
     expect(b.request(KEY, 10_000)).toEqual({ ask: true, reason: 'first miss' });
+  });
+
+  it('drops ABANDONED keys too, not only healed ones', () => {
+    // The leak this missed the first time: `settle` deletes keys that worked,
+    // so only the ones nothing ever answered accumulated — one entry per
+    // distinct key ever asked about, forever. At the 60/min ceiling that is
+    // ~86k permanent entries a day for anyone scanning URLs: O(queries) memory
+    // with a remote trigger, in the module whose whole job is to prevent that.
+    const b = new BackfillLimiter({ cooldownMs: 1, inFlightTtlMs: 1, maxAttempts: 1, forgetAfterMs: 60_000 });
+    b.request('testnet:ghost', 0);
+    expect(b.stats(1_000).tracked).toBe(1);
+    expect(b.request('testnet:ghost', 1_000).reason).toBe('giving up on this key');
+
+    // Past the forget window it is gone — and askable again, because "nothing
+    // has this account" is true of a moment, not of all time.
+    expect(b.stats(61_000).tracked).toBe(0);
+    expect(b.request('testnet:ghost', 61_000)).toEqual({ ask: true, reason: 'first miss' });
+  });
+
+  it('never forgets a key while its request is still in flight', () => {
+    // Dropping an in-flight entry would leak the SLOT instead of the entry.
+    const b = new BackfillLimiter({ inFlightTtlMs: 600_000, forgetAfterMs: 1_000, maxInFlight: 1 });
+    b.request('testnet:slow', 0);
+    expect(b.stats(60_000).tracked).toBe(1);
+    expect(b.request('testnet:other', 60_000)).toEqual({ ask: false, reason: 'too many in flight' });
   });
 
   it('drops healed keys instead of remembering them forever', () => {
@@ -121,6 +149,10 @@ describe('defaults', () => {
     expect(DEFAULT_BACKFILL_POLICY.maxInFlight).toBeLessThanOrEqual(16);
     expect(DEFAULT_BACKFILL_POLICY.maxAttempts).toBeLessThanOrEqual(5);
     expect(DEFAULT_BACKFILL_POLICY.cooldownMs).toBeGreaterThanOrEqual(30_000);
+    // Bounded memory is not optional: without a forget window the map is
+    // O(distinct keys ever asked), which a stranger controls.
+    expect(DEFAULT_BACKFILL_POLICY.forgetAfterMs).toBeGreaterThan(0);
+    expect(DEFAULT_BACKFILL_POLICY.forgetAfterMs).toBeLessThanOrEqual(24 * 3_600_000);
   });
 
   it('clears everything on a wipe', () => {

@@ -50,6 +50,22 @@ export interface BackfillPolicy {
   maxPerMinute: number;
   /** Consecutive unanswered attempts before a key is abandoned. */
   maxAttempts: number;
+  /**
+   * How long a key is remembered after its last ask.
+   *
+   * Without this the map grows by one entry per distinct key ever asked about
+   * and never healed — `settle` deletes the ones that WORKED, and an abandoned
+   * key was kept forever. At 60 asks a minute that is ~86k permanent entries a
+   * day for anyone scanning URLs: `O(queries)` memory with a remote trigger,
+   * which is the invariant this module exists to protect, violated by its own
+   * bookkeeping.
+   *
+   * Forgetting is also the correct BEHAVIOUR. "Nothing has this account" is a
+   * statement about a moment, not forever: an account that did not exist an
+   * hour ago may exist now, and a permanently abandoned key could never learn
+   * that.
+   */
+  forgetAfterMs: number;
 }
 
 /**
@@ -64,6 +80,7 @@ export const DEFAULT_BACKFILL_POLICY: BackfillPolicy = {
   inFlightTtlMs: 15_000,
   maxPerMinute: 60,
   maxAttempts: 3,
+  forgetAfterMs: 3_600_000,
 };
 
 interface KeyState {
@@ -152,6 +169,11 @@ export class BackfillLimiter {
     for (const [key, st] of this.keys) {
       if (st.inFlightSince !== undefined && now - st.inFlightSince >= this.policy.inFlightTtlMs) {
         st.inFlightSince = undefined;   // slot freed; attempts deliberately kept
+      }
+      // Forget keys nothing is waiting on. An in-flight request is never
+      // dropped, or its slot would leak instead of its entry.
+      if (st.inFlightSince === undefined && now - st.lastAskedAt >= this.policy.forgetAfterMs) {
+        this.keys.delete(key);
       }
     }
     const cutoff = now - 60_000;

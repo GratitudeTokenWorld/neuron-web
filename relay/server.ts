@@ -417,6 +417,65 @@ function requestRecordBackfill(kind, query, network) {
   })();
 }
 
+/**
+ * Heal INBOUND-TRANSFER discovery for a recipient we know.
+ *
+ * `/pending-sends` looked unbackfillable at first: its answer is assembled from
+ * arbitrary senders' blocks, so there seemed to be no key to ask a peer by.
+ * That was wrong — the RECIPIENT is the key. A peer can answer "what is
+ * addressed to X?" perfectly well, and its answer names the senders, which is
+ * exactly what the chain backfill needs and could not otherwise know.
+ *
+ * So this asks the peer the same question, then backfills each named sender's
+ * chain through the normal gossip path, where every block is hash- and
+ * signature-checked on ingest. The peer's list is a HINT about where to look,
+ * never data we store: it cannot make us archive anything the sender did not
+ * sign.
+ *
+ * Guarded on the recipient being known to this relay. An empty pending-sends is
+ * the correct and common answer for most accounts, so firing on every empty
+ * result would ask peers about every stranger anyone ever probes. An account
+ * whose record we already hold asking for its own inbound is a plausible gap;
+ * an account we have never heard of is a scan.
+ */
+function requestInboundBackfill(pub, network) {
+  if (!ARCHIVE_ENABLED || PEER_HTTP_BASES.length === 0) return;
+  if (!accountStore.has(`${network}:${pub}`)) {
+    dlog(`[Backfill] not asking for inbound to ${pub.slice(0, 12)}…: account unknown here`);
+    return;
+  }
+  const key = `${network}:inbound:${pub}`;
+  const decision = backfill.request(key);
+  if (!decision.ask) {
+    dlog(`[Backfill] not asking for inbound to ${pub.slice(0, 12)}…: ${decision.reason}`);
+    return;
+  }
+  void (async () => {
+    const body = await fetchFromPeers(`/pending-sends?pub=${encodeURIComponent(pub)}&network=${network}`);
+    const sends = body && Array.isArray(body.sends) ? body.sends : [];
+    const senders = [...new Set(sends.map(x => x && x.sender).filter(Boolean))];
+    if (senders.length === 0) {
+      // Not a failure: the peer agrees nothing is addressed there. Logged so
+      // "we asked and there is nothing" is distinguishable from "we never
+      // asked" — the ambiguity this file keeps paying for.
+      dlog(`[Backfill] peer agrees there is no inbound for ${pub.slice(0, 12)}…`);
+      return;
+    }
+    backfill.settle(key);
+    console.log(`[Backfill] a peer knows ${senders.length} sender(s) with inbound for `
+      + `${pub.slice(0, 12)}… — backfilling their chains`);
+    for (const sender of senders) {
+      // Each sender goes through the ordinary chain backfill, limiter and all,
+      // so this cannot fan out without bound.
+      let haveIndex = -1;
+      for (const r of engineBlockStore.values()) {
+        if (r.network === network && r.accountId === sender && r.index > haveIndex) haveIndex = r.index;
+      }
+      requestArchiveBackfill(sender, network, haveIndex);
+    }
+  })();
+}
+
 function requestArchiveBackfill(accountId, network, haveIndex) {
   if (!ARCHIVE_ENABLED || !accountId) return;
   if (!pubsubRef) { dlog('[Backfill] libp2p not up yet — skipping'); return; }
@@ -1312,6 +1371,9 @@ async function main() {
             }
           }
         }
+        // Nothing addressed to an account we DO know about may mean nothing was
+        // sent, or may mean we slept through it. Ask a peer which it is.
+        if (pub && sends.length === 0) requestInboundBackfill(pub, network);
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify({ headIndex, sends }));
 
