@@ -972,7 +972,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
 | 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10; parity 2026-08-15; repair, handoff, file index and S3 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine), a filesystem adapter and an **opt-in S3-compatible** one (`src/storage`, zero-dependency SigV4 pinned to AWS's published vectors). Provider economy on-chain: four `storage-*` engine block types, `provider-ledger.ts` (registry + **lease liveness** + reward evidence), reward minting guarded by balance conservation *and* an on-chain evidence ceiling, provider **discovery** by verified archive query (`GET /providers`). Custody policy in `content/custody.ts` — live-only replica counting, lapsed-holder repair, rejoin discard, population-scaled jittered cadences, demand-scaled serving capacity. Publish **handoff** (`awaitHandoff`/`stagingCids`, staging persisted). File index off the global topic → `GET /files` + `file-index.ts`. Repair-vs-churn **measured** in `sim/repair.ts`. Remaining: none of the Phase-3 list — see *Where this stands* |
-| 4 — Scale hardening | **started 2026-09-21** — the bulk of what is left | relay federation (`engine/net`), capped inflation (`engine/economy`), and **archive backfill for account chains** (`engine/net/archive-backfill.ts` + the `/head-proof` miss path): demand-driven, rate-limited, never a sync-on-rejoin. Still missing: backfill for the OTHER archive stores (account records, pending sends, files, providers — each has its own store and no peer-query mechanism yet), custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
+| 4 — Scale hardening | **in progress 2026-09-21** | relay federation (`engine/net`), capped inflation (`engine/economy`), and **archive backfill** — demand-driven, rate-limited, never a sync-on-rejoin, verified healing in production by `scripts/backfill-smoke.mts`. Chains heal over gossip (`engine-delta-req` on a `/head-proof` miss); the account directory and file index heal over HTTP from peers, because both already expose verified GET endpoints and every record is self-signed. Still missing: **pending sends** (derived from arbitrary senders' blocks, so there is no key to ask by — needs a different shape), **provider records**, custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 55/55 |
 | G3 (a third `O(N)` violation, found later) | **CLOSED 2026-08-15** | the global `keyblobs` topic broadcast every account's encrypted-key blob to every node — G1's shape, hidden behind a security rationale. Replaced by targeted `POST`/`GET /keyblob`. See *Scale-invariant gaps* below |
@@ -1045,6 +1045,22 @@ caller, as each is moved off the `DAGLedger` compatibility surface —
 ---
 
 ### Principle self-review — 2026-09-21 (archive backfill)
+
+*Updated after the record stores landed.* Two things the second half changed:
+
+- **The mechanism is per-STORE, not universal.** Chains ride
+  `engine-delta-req` because relays already served it; the record stores use
+  plain HTTP GET against a peer, because they already expose verified
+  endpoints and every record is self-signed. Adding a gossip request type for
+  them would have been new trust surface for no gain. `pending-sends` fits
+  neither: the answer is assembled from arbitrary senders' blocks, so there is
+  no key to ask a peer by. It stays open rather than being forced into a shape
+  that does not fit.
+- **A shared helper was NOT widened to fit.** `relayHttpBase` ignores tcp
+  multiaddrs deliberately — it feeds the client's archive fan-out, where each
+  base is another request per lookup (Fan-IN). Relays need the opposite, so
+  they got their own `peerRelayHttpBase`. Making one function serve both would
+  have quietly grown every client's query set to satisfy a relay's need.
 
 Run per PRINCIPLES.md → 4a, because a subsystem's behaviour changed in a way
 other nodes can observe: relays now PUT something on the wire that they never

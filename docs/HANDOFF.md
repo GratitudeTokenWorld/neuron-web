@@ -20,14 +20,14 @@ Read in this order — do NOT re-derive what they already record:
 
 ## State as of HEAD `15a3f29` (verified, not assumed)
 
-- **541 tests / 72 files green**, `npm run typecheck` clean, `npm run build`
+- **542 tests / 72 files green**, `npm run typecheck` clean, `npm run build`
   clean.
 - App-layer `tsc -p tsconfig.json` = **121 errors — this is the baseline, never
   add to it.** Take a **per-file** count before and after; the total falling
   does not prove your file did not gain errors.
 - Live probes, both **ALL CHECKS PASSED**:
   `npx tsx scripts/g1-resolve-smoke.mts` (55 checks) and
-  `npx tsx scripts/backfill-smoke.mts` (the archive heal — ⚠ it stops and
+  `npx tsx scripts/backfill-smoke.mts` (the archive heal: chains, and the record stores — ⚠ it stops and
   starts a relay over ssh). Run after every relay deploy — and wait for the relays to finish
   restarting first, or you get phantom failures.
 - **Relays**: both cloud boxes (`80.97.27.224`, `80.97.27.112`) run **`890e047`**
