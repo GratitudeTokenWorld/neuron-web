@@ -20,7 +20,7 @@ Read in this order — do NOT re-derive what they already record:
 
 ## State as of HEAD `15a3f29` (verified, not assumed)
 
-- **541 tests / 73 files green**, `npm run typecheck` clean, `npm run build`
+- **541 tests / 72 files green**, `npm run typecheck` clean, `npm run build`
   clean.
 - App-layer `tsc -p tsconfig.json` = **121 errors — this is the baseline, never
   add to it.** Take a **per-file** count before and after; the total falling
