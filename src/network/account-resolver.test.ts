@@ -4,6 +4,7 @@ import {
   accountRecordPayload,
   verifyAccountRecordSig,
   relayHttpBase,
+  peerRelayHttpBase,
   looksLikeAccountPub,
   resolveAccountFromRelays,
   fetchPendingSends,
@@ -59,6 +60,24 @@ describe('G1 — on-demand account resolution', () => {
       .toBe('http://80.97.27.224:9092');
     expect(relayHttpBase(undefined)).toBe('');
     expect(relayHttpBase('/ip4/10.0.0.1/tcp/9091/p2p/12D3KooW')).toBe(''); // tcp, not ws
+  });
+
+  it('derives PEER HTTP bases from tcp multiaddrs, which the client helper refuses', () => {
+    // The two exist separately on purpose. `relayHttpBase` feeds the CLIENT's
+    // archive fan-out, where every extra base is another request on every
+    // lookup, so it ignores tcp addresses. Relays have the opposite need: their
+    // peers ARE configured as tcp multiaddrs.
+    expect(peerRelayHttpBase('/ip4/80.97.27.112/tcp/9091/p2p/12D3KooW'))
+      .toBe('http://80.97.27.112:9092');
+    expect(peerRelayHttpBase('/ip4/10.0.0.5/tcp/9091')).toBe('http://10.0.0.5:9092');
+    // ws is two past, tcp is one past — both land on the same HTTP port.
+    expect(peerRelayHttpBase('/ip4/80.97.27.224/tcp/9090/ws/p2p/12D3KooW'))
+      .toBe('http://80.97.27.224:9092');
+    expect(peerRelayHttpBase('/p2p/12D3KooW')).toBe('');
+    expect(peerRelayHttpBase(undefined)).toBe('');
+    // And the client helper still refuses tcp, or every client would silently
+    // start querying bases it was never meant to know about.
+    expect(relayHttpBase('/ip4/10.0.0.1/tcp/9091/p2p/12D3KooW')).toBe('');
   });
 
   it('tells engine account pubs (compressed P-256 hex) from usernames', () => {

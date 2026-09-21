@@ -74,6 +74,31 @@ export function relayHttpBase(addr: string | undefined): string {
 }
 
 /**
+ * HTTP base for a relay reached over RAW TCP — the `PEER_RELAYS` shape.
+ *
+ * Deliberately separate from `relayHttpBase`, which returns '' for a tcp
+ * address on purpose: that function feeds the CLIENT's archive fan-out, and
+ * every base it returns is one more request per `/resolve`, `/providers` and
+ * `/files` (fan-in read from the asking side). Teaching it about tcp would
+ * quietly widen every client's query set to addresses only node peers dial.
+ *
+ * Relays have the opposite need: their peers are configured as tcp multiaddrs
+ * and they must reach those peers' HTTP APIs to backfill record stores. A relay
+ * listens on PORT (ws), PORT+1 (tcp) and PORT+2 (http), so the HTTP API is one
+ * past a tcp address — the same port a ws address reaches by adding two.
+ */
+export function peerRelayHttpBase(addr: string | undefined): string {
+  if (!addr) return '';
+  const dns = addr.match(/\/dns[46]\/([^/]+)\//);
+  if (dns) return `https://${dns[1]}`;
+  const ws = addr.match(/\/ip4\/([^/]+)\/tcp\/(\d+)\/ws(\/|$)/);
+  if (ws) return `http://${ws[1]}:${Number(ws[2]) + 2}`;
+  const tcp = addr.match(/\/ip4\/([^/]+)\/tcp\/(\d+)(\/p2p\/|$)/);
+  if (tcp) return `http://${tcp[1]}:${Number(tcp[2]) + 1}`;
+  return '';
+}
+
+/**
  * Told whether each base answered, so a caller can retire one that never does.
  *
  * Every archive query fans out to EVERY base a node has ever heard of, and the

@@ -58,6 +58,7 @@ import { AccountAccumulator } from '../src/engine/core/accumulator.js';
 // module, because this file is covered by neither the typecheck nor any test.
 import { BackfillLimiter } from '../src/engine/net/archive-backfill.js';
 import { getShard } from '../src/engine/core/partition.js';
+import { peerRelayHttpBase } from '../src/network/account-resolver.js';
 // Recovery-share release gate: the acceptance rules live in a PURE module so
 // vitest can pin them (this file is covered by no typecheck and no test — keep
 // every releasable piece of its logic over there, not here).
@@ -352,6 +353,69 @@ const backfill = new BackfillLimiter();
  * Relay code is typechecked by nothing, so this is the shape that bites.
  */
 let pubsubRef = null;
+
+/**
+ * Our peers' HTTP APIs, derived from the multiaddrs we dial them on.
+ *
+ * Chains are backfilled over gossip (`engine-delta-req`), but the RECORD stores
+ * — the account directory, the file index — have no request message and do not
+ * need one: they already expose verified GET endpoints, and every record is
+ * self-signed. So the relay asks its peers the same way a client would, and
+ * feeds the answer through the SAME archive functions, which verify before
+ * storing. A lying peer can hand us nothing we would keep.
+ */
+const PEER_HTTP_BASES = PEER_RELAYS.map(peerRelayHttpBase).filter(Boolean);
+
+async function fetchFromPeers(path) {
+  for (const base of PEER_HTTP_BASES) {
+    try {
+      const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) continue;
+      return await res.json();
+    } catch { /* peer down or slow — try the next */ }
+  }
+  return null;
+}
+
+/**
+ * Heal a missing ACCOUNT RECORD from a peer.
+ *
+ * Same demand-driven rule as the chain backfill, same limiter, and the same
+ * fire-and-forget answer: the client asked every relay in parallel and takes
+ * the union, so it already has its answer if anyone had one. What this fixes is
+ * the NEXT query, and the case where this relay is the only one a client can
+ * reach.
+ */
+function requestRecordBackfill(kind, query, network) {
+  if (!ARCHIVE_ENABLED || PEER_HTTP_BASES.length === 0) return;
+  const key = `${network}:${kind}:${query}`;
+  const decision = backfill.request(key);
+  if (!decision.ask) {
+    dlog(`[Backfill] not asking peers for ${kind} ${query.slice(0, 24)}: ${decision.reason}`);
+    return;
+  }
+  void (async () => {
+    if (kind === 'account') {
+      const rec = await fetchFromPeers(`/resolve?${query}&network=${network}`);
+      // archiveAccountRecord re-verifies the owner's signature, so this cannot
+      // be used to inject a record a peer invented.
+      if (rec && rec.pub) {
+        archiveAccountRecord(rec, network);
+        backfill.settle(key);
+        console.log(`[Backfill] healed account ${String(rec.pub).slice(0, 12)}… from a peer`);
+      }
+    } else if (kind === 'file') {
+      const body = await fetchFromPeers(`/files?${query}&network=${network}`);
+      const rows = body && Array.isArray(body.records) ? body.records : [];
+      let stored = 0;
+      for (const r of rows) { await archiveFileRecord(r, network); stored++; }
+      if (stored > 0) {
+        backfill.settle(key);
+        console.log(`[Backfill] healed ${stored} file record(s) from a peer`);
+      }
+    }
+  })();
+}
 
 function requestArchiveBackfill(accountId, network, haveIndex) {
   if (!ARCHIVE_ENABLED || !accountId) return;
@@ -1051,6 +1115,14 @@ async function main() {
           withdrawn: q.get('withdrawn') === '1' || undefined,
           limit: Number(q.get('limit')) || undefined,
         });
+        // Asked about ONE specific cid and holding nothing for it: that is a
+        // gap, not a question about an empty network. Only the cid form is
+        // backfilled — an unfiltered `/files` is a browse, and "heal everything
+        // a peer has" is the sync-on-rejoin this design exists to avoid.
+        const askedCid = q.get('cid');
+        if (askedCid && records.length === 0) {
+          requestRecordBackfill('file', `cid=${encodeURIComponent(askedCid)}`, network);
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         // LIVE files, not rows. A withdrawal is retained as a tombstone so a
         // holder can learn about it, but a withdrawn file is not a file —
@@ -1082,6 +1154,13 @@ async function main() {
               if (r.network === network && String(r.username).toLowerCase() === uname) { record = r; break; }
             }
           }
+        }
+        if (!record) {
+          // We were asked for a directory entry we do not have. Ask the peers
+          // for it now: the client already has its answer if any relay had one
+          // (it queries them all), so this heals the NEXT query and the case
+          // where we are the only relay a client can reach.
+          requestRecordBackfill('account', pub ? `pub=${encodeURIComponent(pub)}` : `username=${encodeURIComponent(uname || '')}`, network);
         }
         res.writeHead(record ? 200 : 404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         if (record) {
