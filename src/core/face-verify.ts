@@ -34,6 +34,8 @@ const MODEL_URL = '/models';
  * lighting, pose and camera combination has to fit inside, and the face is the
  * only factor left standing once a PIN leaks.
  */
+import { testFaceSeed, syntheticDescriptor, TEST_FACE_BUILD } from './test-face';
+
 const MATCH_THRESHOLD = 0.45;
 const ENROLLMENT_SAMPLES = 3;
 /**
@@ -74,6 +76,10 @@ export interface FaceMap {
 
 export async function loadModels(): Promise<void> {
   if (modelsLoaded) return;
+  // No camera means no detector: loading ~6 MB of weights would only slow the
+  // test down, and nothing below reads them on this path.
+  const seed = testFaceSeed();
+  if (seed) { testFaceNotice(seed); modelsLoaded = true; return; }
   await faceapi.tf.ready();
   await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
   await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
@@ -85,9 +91,56 @@ export function areModelsLoaded(): boolean {
   return modelsLoaded;
 }
 
+// ──── Synthetic face (⚠ DEV/TEST ONLY) ────
+
+/**
+ * Every camera entry point below short-circuits when a synthetic face is
+ * active, so automated tests can create accounts without a human.
+ *
+ * The guards live HERE, beside the capture code they replace, rather than in
+ * the callers: `challengeAndCapture` alone touches the camera through four
+ * different functions, and a bypass spread across call sites is one missed
+ * branch away from a test that silently exercises neither path. The same reason
+ * the signer and verifier had to be moved into one file.
+ *
+ * `testFaceSeed()` is `null` in any real build — `__TEST_FACE__` is baked
+ * `false` and every branch is eliminated. See `test-face.ts` for the full gate.
+ */
+let announcedTestFace = false;
+function testFaceNotice(seed: string): void {
+  // Gated on the BAKED constant, not on the seed: a bundler can fold
+  // `TEST_FACE_BUILD` to false and drop the body, but it cannot prove anything
+  // about a function call, so the warning text would otherwise ship as dead
+  // code inside a release bundle. Checked by grepping dist/.
+  if (!TEST_FACE_BUILD) return;
+  if (announcedTestFace) return;
+  announcedTestFace = true;
+  console.warn(`[face] ⚠ SYNTHETIC FACE ACTIVE (seed "${seed}") — liveness is NOT being checked. Dev builds only.`);
+}
+
+/** The FaceMap a capture would have produced, built by the real helpers. */
+async function syntheticFaceMap(seed: string): Promise<FaceMap> {
+  // Deliberately the same construction as the tail of `enrollFace`: the
+  // quantization and the hash are what key derivation and the relay's
+  // `faceMapHash` check read, so a parallel implementation here would be a
+  // second source of truth for the one value both sides must agree on.
+  const canonical = syntheticDescriptor(seed);
+  const quantized = quantizeDescriptor(canonical);
+  const hash = await hashDescriptor(quantized);
+  return { canonical, quantized, hash, samples: ENROLLMENT_SAMPLES, createdAt: Date.now() };
+}
+
 // ──── Camera ────
 
 export async function startCamera(video: HTMLVideoElement): Promise<MediaStream> {
+  const testSeed = testFaceSeed();
+  if (testSeed) {
+    // An empty stream, not a fake one: callers only ever pass it back to
+    // `stopCamera`, and giving the <video> no source keeps the element visibly
+    // blank rather than pretending a capture is happening.
+    testFaceNotice(testSeed);
+    return new MediaStream();
+  }
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
   });
@@ -231,6 +284,7 @@ export async function holdPresence(
   guard?: PresenceGuard,
   onStatus?: (cue: CaptureCue) => void,
 ): Promise<boolean> {
+  if (testFaceSeed()) return true;
   const until = Date.now() + ms;
   if (!guard) { await sleep(ms); return true; }
   while (Date.now() < until) {
@@ -265,6 +319,8 @@ export async function holdPresence(
 export async function captureFaceDescriptor(
   video: HTMLVideoElement,
 ): Promise<FaceDescriptor | 'multi' | null> {
+  const testSeed = testFaceSeed();
+  if (testSeed) return { data: syntheticDescriptor(testSeed), capturedAt: Date.now() };
   try {
     const dets = await faceapi
       // 320, not 416: the larger input missed the face repeatedly during capture
@@ -302,6 +358,8 @@ export async function enrollFace(
   onProgress: (step: number, total: number, cue: CaptureCue) => void,
   guard?: PresenceGuard,
 ): Promise<FaceMap | 'low-quality' | null> {
+  const testSeed = testFaceSeed();
+  if (testSeed) return syntheticFaceMap(testSeed);
   const descriptors: number[][] = [];
   /** Luma at each banked sample — trace only, so the spread has context. */
   const lumas: number[] = [];
@@ -705,6 +763,20 @@ export async function calibrateNeutral(
   onStatus?: (cue: CaptureCue) => void,
   guard?: PresenceGuard,
 ): Promise<CalibrationResult> {
+  if (testFaceSeed()) {
+    // Resting values for a frontal face. Nothing reads them on this path —
+    // `detectChallenge` returns before comparing — but they are plausible
+    // rather than zeroed, so a baseline that DID get read would not silently
+    // make every action free.
+    return {
+      ok: true,
+      neutral: {
+        ear: 0.30, lift: 0.00, width: 0.55, open: 0.30,
+        yaw: 0.55, skew: 0.00, centreX: 0.50, brow: 0.28,
+        frac: 0.40, shape: 0.62, earSd: 0.01,
+      },
+    };
+  }
   const FRAMES = 8;
   const FRONTAL_YAW = 0.13;      // |yaw − 0.55| — covers normal facial asymmetry
   const FRONTAL_SKEW = 0.15;
@@ -1002,6 +1074,10 @@ export async function detectChallenge(
    */
   onPass?: (peakRatio: number) => void,
 ): Promise<boolean> {
+  // The action sequence is the liveness gate. A synthetic face cannot perform
+  // one, so it is reported as done — which is precisely the property that must
+  // never exist in a shipped bundle.
+  if (testFaceSeed()) return true;
   const deadline = Date.now() + timeoutMs;
   // Calibrate by SAMPLE COUNT, not wall-clock. The first inference after a model
   // or input-size change costs 1-3s (kernel compilation), which blew straight

@@ -38,7 +38,14 @@ export default defineConfig(({ command }) => {
     allowedHosts: true,
     watch: {
       // Relay runtime state lives in .relay-data/ — never restart Vite over it.
-      ignored: ['**/.relay-data/**', '**/.relay-*.json'],
+      // E2E browser profiles are ignored for a harder reason: a live Chrome
+      // holds `Default/Network/Cookies` locked, and watching it throws EBUSY
+      // from the watcher's error event, which takes the whole dev server down
+      // mid-test. Every later navigation then fails with ERR_CONNECTION_RESET,
+      // which reads like a network fault rather than a file-watch one.
+      // `profileDir()` keeps them in the OS temp dir so this never applies;
+      // this is the guard for a profile pointed somewhere else by hand.
+      ignored: ['**/.relay-data/**', '**/.relay-*.json', '**/e2e/.profiles/**', '**/e2e/.sessions/**'],
     },
     proxy: {
       // Proxy relay WebSocket through Vite so the tunnel URL (port 5173/443)
@@ -138,6 +145,17 @@ export default defineConfig(({ command }) => {
     // it, wipe first (epoch numbering changes), and check the badge on the
     // Storage tab.
     __STORAGE_TIMING__: JSON.stringify(process.env.STORAGE_TIMING || 'normal'),
+    // ⚠ DEV SERVER ONLY, REMOVE BEFORE PRODUCTION — `TEST_FACE=1` lets a
+    // browser profile set `localStorage.neuron_test_face` and create accounts
+    // from a SYNTHETIC face descriptor, with no camera and no liveness check.
+    // It exists because account creation otherwise needs a human per account,
+    // and specs that need three accounts needed three enrolments.
+    //
+    // `command === 'serve'` is the structural guard, the same one the dev relay
+    // proxy uses: any build bakes `false`, so every branch in test-face.ts and
+    // the seven guards in face-verify.ts are dead-code eliminated. Verify with
+    // `grep -r neuron_test_face dist/` — it must find nothing.
+    __TEST_FACE__: JSON.stringify(command === 'serve' && process.env.TEST_FACE === '1'),
   },
   resolve: {
     alias: {

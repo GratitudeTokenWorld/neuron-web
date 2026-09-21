@@ -16,6 +16,7 @@ import { devRelayBaseFor } from './network/dev-relay-proxy';
 import { sign as engineSignRecord } from './engine/core/keys';
 import { relayHttpBase } from './network/account-resolver';
 import { REQUIRED_ATTESTERS } from './ledger/engine-ledger';
+import { testFaceSeed, TEST_FACE_BUILD } from './core/test-face';
 import {
   storageTiming, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS, MAX_OFFLINE_MS,
 } from './engine/content/provider-ledger';
@@ -2020,6 +2021,30 @@ async function startNode() {
       } else {
         addLog(`⚠ Storage timing: ${t.name.toUpperCase()} (${detail}) — dev only, must match on every device`, 'warn');
         console.warn(`[Storage] timing profile = ${t.name} — DEV ONLY, must match on every device`);
+      }
+    }
+    // ⚠ DEV ONLY — a synthetic face bypasses the liveness gate entirely, so an
+    // account created here proves nothing about personhood. Announced on EVERY
+    // start, in the console and in the panel, and pinned to the page as a
+    // banner: an account made this way is indistinguishable from a real one
+    // afterwards, so the only place it can be flagged is while it is happening.
+    if (TEST_FACE_BUILD) {
+      const seed = testFaceSeed();
+      if (seed) {
+        console.warn(`[face] ⚠ SYNTHETIC FACE MODE — seed "${seed}". No liveness check. Dev builds only.`);
+        addLog(`⚠ Synthetic face mode (seed "${seed}") — liveness is NOT checked`, 'warn');
+        const banner = document.createElement('div');
+        banner.id = 'testFaceBanner';
+        banner.textContent = `⚠ SYNTHETIC FACE MODE — seed "${seed}" — accounts created here are NOT liveness-checked`;
+        // `pointer-events:none` is load-bearing, not cosmetic: a fixed bar at the
+        // top of the viewport sits over the tab strip and swallows the clicks
+        // aimed at it, so the warning about automated accounts would break the
+        // automation it exists to flag. Bottom-anchored for the same reason —
+        // the header is the one region something always needs to click.
+        banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;pointer-events:none;'
+          + 'background:var(--danger,#c0392b);color:#fff;font-size:12px;font-weight:600;text-align:center;'
+          + 'padding:4px 8px;letter-spacing:0.3px;';
+        document.body.appendChild(banner);
       }
     }
     await node.start();
