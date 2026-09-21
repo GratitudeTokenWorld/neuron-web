@@ -365,7 +365,24 @@ function requestArchiveBackfill(accountId, network, haveIndex) {
   const shard = getShard(accountId);
   const topic = `neuronchain/${PROTOCOL_VERSION}/${network}/engine-delta-req/${shard}`;
   const payload = JSON.stringify({ accountId, shard, haveIndex });
-  pubsubRef.publish(topic, new TextEncoder().encode(payload)).catch(() => {});
+
+  // SUBSCRIBE FIRST, and let the subscription travel before publishing.
+  //
+  // Shard topics are dynamic: a relay only joins one when it sees a PEER
+  // subscribe to it (the subscription-change mirror below). Publishing to a
+  // topic nobody has joined sends the message precisely nowhere — the first
+  // version of this did exactly that, and the ask was logged while the peer
+  // relay never saw a thing. Subscribing makes our interest visible, the peer's
+  // mirror joins the same topic, and the request then has somewhere to land.
+  //
+  // The delay is one gossipsub heartbeat plus slack: subscription propagation
+  // and mesh formation take 1-3 heartbeats, and publishing inside that window
+  // is the same silent no-op by a different route.
+  try { pubsubRef.subscribe(topic); } catch { /* already subscribed */ }
+  setTimeout(() => {
+    pubsubRef?.publish(topic, new TextEncoder().encode(payload)).catch(() => {});
+  }, 1_500);
+
   console.log(`[Backfill] asked peers for ${accountId.slice(0, 12)}… `
     + `shard=${shard} have=${haveIndex} (${decision.reason})`);
 }
