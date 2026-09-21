@@ -97,6 +97,24 @@ Hypotheses this design makes, and how to falsify each (PRINCIPLES.md → 5):
 | H3. Proof-on-cold costs less than proof-on-everything by the hot/cold ratio | Measuring the ratio and finding cold content dominates |
 | H4. Keeping bytes on rejoin improves durability more than the space it wastes | A churn simulation where retained stale replicas crowd out live ones under capacity pressure |
 
+**H4 has now been run** (`sim/repair.ts`, 2026-09-21) and the answer is
+conditional, which is more useful than a yes. Keeping bytes is durability-
+neutral-to-positive **only because spares are evictable**: the first attempt
+kept them without modelling eviction and the churn scenarios failed outright —
+retained spares filled the fleet and repair had nowhere to place. With
+`planEviction` sacrificing spares before leased copies, the same fleet under
+the same churn holds exactly `REDUNDANCY_TARGET` and loses nothing.
+
+Two things that falls out of it:
+
+- **Keeping is safe *because* spares are evictable, not because storage is
+  free.** Remove the eviction and the sim fails again. That is the honest
+  statement of the trade.
+- **Retained spares do not inflate the counted redundancy**, which was the
+  original worry behind discarding. The lease already stopped counting them at
+  the moment it lapsed, so the mean lands exactly on target while the bytes
+  survive and keep serving.
+
 H1 and H3 are measurable in `sim/` today with a read-distribution model; H4 is
 a variant of the existing `sim/repair.ts` churn harness. **None have been run.**
 Stating them unrun is the point — the design is a hypothesis, not a result.

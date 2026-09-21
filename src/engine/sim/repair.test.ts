@@ -109,17 +109,31 @@ describe('repair vs churn — durability as a flow', () => {
     expect(c.churnRate).not.toBe(a.churnRate);
   });
 
-  it('a returning node past the lease does not resurrect replicas the network re-homed', () => {
-    // Long absences (slow rejoin) with ample repair: every lapse is repaired
-    // onto a live node, and the returning node discards rather than re-adding
-    // itself. If planRejoin kept the content, mean replicas would drift ABOVE
-    // the target as the same object accumulated stale holders.
+  it('a returning node keeps its bytes WITHOUT resurrecting counted replicas', () => {
+    // Rewritten 2026-09-21 with the rejoin reversal. It used to assert that a
+    // returning node DISCARDS, on the worry that keeping content would drift
+    // mean replicas above the target as objects accumulated stale holders.
+    //
+    // That worry is answered by the lease, not by deletion: the lapse already
+    // removed the assignment (step 2), so a retained copy is an uncounted
+    // spare and the counted mean still lands exactly on the target. The bytes
+    // survive, serve reads, and cost nothing in accounting.
+    //
+    // The real cost of keeping is CAPACITY, and this run is what measures it:
+    // with `planEviction` sacrificing spares before leased copies, a fleet
+    // under the same churn is just as durable as one that deleted on rejoin.
+    // Remove the eviction from `repair.ts` and this test fails — which is the
+    // honest statement of the trade: keeping is safe *because* spares are
+    // evictable, not because storage is free.
     const stats = runRepairScenario({
       objects: 30, fleet: 100,
       churnPerTick: 0.05, rejoinPerTick: 0.05,
       repairPerTick: 200, ticks: TICKS, seed: 9,
     });
     expect(stats.durable).toBe(true);
+    // Exactly the target: retained spares do not inflate it, because the lease
+    // stopped counting them the moment it lapsed.
     expect(stats.finalMeanReplicas).toBe(REDUNDANCY_TARGET);
+    expect(stats.lost).toBe(0);
   });
 });

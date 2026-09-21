@@ -1,4 +1,4 @@
-import { planRepair, planRejoin, REDUNDANCY_TARGET } from '../content/custody.js';
+import { planRepair, planRejoin, planEviction, REDUNDANCY_TARGET } from '../content/custody.js';
 import { MAX_OFFLINE_MS } from '../content/provider-ledger.js';
 
 /**
@@ -160,10 +160,16 @@ export function runRepairScenario(config: RepairScenarioConfig): RepairStats {
       if (online(n)) {
         if (rand() < churnPerTick) offlineFor[n] = 1;
       } else if (rand() < rejoinPerTick) {
-        // 3 — a returning node runs the real rejoin policy. Past the lease it
-        // discards everything: those bytes were re-homed while it was away, and
-        // keeping them would consume the capacity it is re-advertising while
-        // inflating apparent redundancy with copies nobody counts.
+        // 3 — a returning node runs the real rejoin policy. Since the reversal
+        // (2026-09-21) a lapsed lease KEEPS its bytes as uncounted spares: they
+        // stop counting toward the target (step 2 already removed them from
+        // `holders`) but go on existing and serving. Only owner-released
+        // content is dropped.
+        //
+        // That makes capacity the interesting variable, which is why placement
+        // below evicts spares instead of treating a full node as unusable —
+        // modelling the keep without the eviction would measure half a policy
+        // and report it as the whole.
         const plan = planRejoin({
           offlineMs: offlineFor[n]! * 60 * 60 * 1000,
           held: [...held[n]!].map(String),
@@ -188,7 +194,33 @@ export function runRepairScenario(config: RepairScenarioConfig): RepairStats {
     // the churn rate the replica stock falls monotonically no matter how the
     // rest of the system is designed.
     let budget = repairPerTick;
-    const freeSpace = (n: number) => capacityPerNode - held[n]!.size;
+    /** Objects this node physically holds but is not a counted holder of. */
+    const sparesOf = (n: number) => [...held[n]!].filter(o => !holders[o]!.has(n));
+    /**
+     * Space available for a new assignment, counting what `planEviction` would
+     * reclaim. A node full of uncounted spares is not full: under real pressure
+     * it sacrifices them, in that order, before any leased copy.
+     */
+    const freeSpace = (n: number) => capacityPerNode - held[n]!.size + sparesOf(n).length;
+    /** Make room by evicting spares, using the SHIPPING eviction policy. */
+    const makeRoom = (n: number) => {
+      if (capacityPerNode - held[n]!.size > 0) return;
+      const spares = sparesOf(n);
+      const plan = planEviction({
+        usedBytes: held[n]!.size,
+        capacityBytes: capacityPerNode - 1,          // need room for one more
+        held: [...held[n]!].map(o => ({
+          cid: String(o),
+          bytes: 1,
+          leased: holders[o]!.has(n),
+        })),
+      });
+      for (const cid of plan.evict) {
+        if (!spares.includes(Number(cid))) continue;  // never evict a leased copy here
+        unplace(Number(cid), n);
+        held[n]!.delete(Number(cid));
+      }
+    };
     // Every object is planned every tick even after the budget is spent —
     // otherwise the unfunded demand of the objects the loop never reached would
     // be invisible, and `starvedRate` would read 0 in exactly the collapse this
@@ -213,6 +245,7 @@ export function runRepairScenario(config: RepairScenarioConfig): RepairStats {
       for (const gone of plan.drop) unplace(o, Number(gone));
       let placed = 0;
       for (const add of plan.add) {
+        makeRoom(Number(add));
         if (budget <= 0) break;
         budget--;
         place(o, Number(add));
