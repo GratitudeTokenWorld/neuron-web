@@ -516,8 +516,21 @@ export class StorageManager extends EventEmitter {
   private repairOnReadFailure(cid: string): void {
     this.cidToSmokeAddrs.delete(cid);        // every known source failed; re-learn them
 
+    // Say why, always. A silent return here is indistinguishable from "the
+    // read never happened", and telling those apart is what the last three
+    // debugging rounds in this file were actually spent on.
     const tracked = this.trackedCids.get(cid);
-    if (!tracked || !this.localKeys.has(tracked.ownerPub)) return;
+    if (!tracked) {
+      console.warn(`[StorageManager] Read failed for ${cid.slice(0, 16)}… — not repairing: `
+        + `this node tracks no such CID (only the owner can re-place a file). `
+        + `Tracked: [${[...this.trackedCids.keys()].map(c => c.slice(0, 16)).join(', ')}]`);
+      return;
+    }
+    if (!this.localKeys.has(tracked.ownerPub)) {
+      console.warn(`[StorageManager] Read failed for ${cid.slice(0, 16)}… — not repairing: `
+        + `owned by ${tracked.ownerPub.slice(0, 12)}…, which is not a local account`);
+      return;
+    }
 
     this.cidStuckCount.delete(cid);          // a real failure outranks any backoff
     tracked.lastDistributed = 0;
@@ -1811,6 +1824,28 @@ export class StorageManager extends EventEmitter {
 
   getTrackedCids(): Map<string, { ownerPub: string; confirmedProviders: Set<string> }> {
     return this.trackedCids;
+  }
+
+  /**
+   * Holders of a CID, split into the two counts that must never be conflated.
+   *
+   * `live` is the only one that means anything about durability: it is the
+   * number of holders whose custody lease is current. `ever` is a memory of
+   * confirmations received, which includes holders that have since gone away.
+   * A count that mixes them is not a measurement, it is a guess — and the
+   * first honest failure takes the object below the threshold the guess said
+   * was met (custody.ts → liveHolders).
+   *
+   * Returned together so anything rendering the number can show its sample
+   * size rather than a bare figure.
+   */
+  holderCounts(cid: string): { live: number; ever: number } {
+    const tracked = this.trackedCids.get(cid);
+    if (!tracked) return { live: 0, ever: 0 };
+    return {
+      live: this.liveHolderCount(tracked.confirmedProviders),
+      ever: tracked.confirmedProviders.size,
+    };
   }
 
   /**

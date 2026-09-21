@@ -4236,11 +4236,22 @@ function refreshStorage() {
       const visCell = r.encrypted
         ? `<span style="color:var(--warning);font-size:11px;font-weight:600;">Private</span>`
         : `<span style="color:var(--accent);font-size:11px;font-weight:600;">Public</span>`;
-      const tracked = trackedCids.get(r.cid);
-      const providerCount = tracked ? tracked.confirmedProviders.size : 0;
-      const providerCell = providerCount > 0
-        ? `<span style="color:var(--success);font-size:11px;font-weight:600;">${providerCount}</span>`
-        : `<span style="color:var(--text-muted);font-size:11px;">Local only</span>`;
+      // LIVE holders, not "confirmed ever". The column used to show
+      // `confirmedProviders.size`, which counts holders whose lease lapsed long
+      // ago — the exact guess the custody rules forbid treating as replicas, and
+      // the number a user would read as "my file is safe on 3 machines" while
+      // all three were gone. The sample size rides along so the figure can be
+      // judged rather than trusted.
+      const holders = node.storage.holderCounts(r.cid);
+      const providerCell = holders.ever === 0
+        ? `<span style="color:var(--text-muted);font-size:11px;">Local only</span>`
+        : holders.live > 0
+          ? `<span style="color:var(--success);font-size:11px;font-weight:600;">${holders.live} live</span>`
+            + (holders.ever > holders.live
+              ? `<span style="color:var(--text-muted);font-size:10px;"> (${holders.ever} ever)</span>`
+              : '')
+          : `<span style="color:var(--danger);font-size:11px;font-weight:600;">0 live</span>`
+            + `<span style="color:var(--text-muted);font-size:10px;"> (${holders.ever} ever)</span>`;
       return `<tr>
         <td>${escHtml(r.name)}</td>
         <td>${icon} ${escHtml(r.contentType)}</td>

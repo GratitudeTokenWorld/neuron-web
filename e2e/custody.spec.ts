@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import {
   openDevice, openStorageTab, uploadFile, serveStorage, newAccountDevice,
-  testFaceAvailable, TEST_FACE_HINT, profileDir, E2E_RUN, type Device,
+  testFaceAvailable, TEST_FACE_HINT, profileDir, contentLibrary, E2E_RUN, type Device,
 } from './device';
 
 /**
@@ -142,7 +142,7 @@ test.describe('T9 — repair', () => {
 
   test.afterAll(async () => { await Promise.all([a?.close(), b?.close(), c?.close()]); });
 
-  test('handoff releases the publisher copy, on PROVEN custody', async () => {
+  test('steps 3+4 — release on proven custody, then repair on a failed read', async () => {
     test.setTimeout(900_000);
     const cid = await uploadFile(a, `repair-${E2E_RUN}.bin`, 64 * 1024);
 
@@ -158,28 +158,28 @@ test.describe('T9 — repair', () => {
     // releasing on "confirmed ever" deletes the last real copy.
     expect(released).not.toMatch(/0 live holder/);
 
-    // STEP 3+4 are still NOT asserted, and the reason has moved twice.
-    //
-    // Fixed since this was written: the publisher used to keep its copy
-    // forever (so the only node that may repair always had the bytes); the
-    // UI's availability check inherited retrieve()'s 10-MINUTE deadline; and
-    // the repair trigger was keyed on "nothing came back at all" when the
-    // usual shape of a lost file is a readable manifest pointing at content
-    // nobody can serve.
-    //
-    // What remains: with every holder closed, the read never returns to the
-    // UI at all. `retrieve` logs `not local — trying 2 peer(s)` and retries,
-    // and the not-found branch that now reports the failure is never reached,
-    // so nothing is logged. The peers it dials are the relay, not the closed
-    // providers, which suggests the 20 s bound is not being applied on every
-    // path into retrieve.
-    //
-    // Next step is a decision, not a guess: whether an owner's read should ask
-    // the archives for current holders (`GET /providers`) before concluding
-    // the content is gone — which would also make the failure honest rather
-    // than a timeout. Until then the repair POLICY stays covered where it is
-    // testable: custody.test.ts (live-only counting, two-strike eviction,
-    // rejoin discard) and engine/sim/repair.ts (repair-vs-churn, measured).
+    // STEP 3 — the publisher now holds nothing, so a read must reach the
+    // network. With every holder gone it fails, and a failed read is the
+    // cheapest liveness evidence there is, so repair starts on USE rather than
+    // on a timer watching every holder (O(watchers × watched)).
+    await Promise.all([b.close(), c.close()]);
+    a.log.clear();
+
+    await a.page.fill('#retrieveCid', cid);
+    await a.page.selectOption('#retrieveContentFrom', { index: 0 });
+    await a.page.click('#btnRetrieveContent');
+
+    const verdict = await a.log.waitFor(/Read failed for /, 120_000);
+    // The rejection branches say why they declined, so a failure here names the
+    // cause instead of timing out on a silent return — which is what three
+    // rounds of debugging this step were actually spent on.
+    expect(verdict, verdict).toMatch(/repairing now/);
+    expect(verdict).toContain(cid.slice(0, 16));
+
+    // STEP 4 — one failure is not an eviction. Two consecutive ones are: a
+    // single flaky WebRTC dial is not evidence, and evicting on it made every
+    // relay hiccup start a repair round against holders that were fine.
+    a.log.none(/Evicting .* after 1 consecutive failure/);
   });
 
   // STEP 3+4 — repair on read failure — remain UNVERIFIED end to end, and the
@@ -234,7 +234,8 @@ test.describe('T9 — the lease is what counts', () => {
     test.setTimeout(900_000);
 
     await serveStorage(b);
-    const cid = await uploadFile(a, 'lease.bin', 64 * 1024);
+    const leaseName = `lease-${E2E_RUN}.bin`;
+    const cid = await uploadFile(a, leaseName, 64 * 1024);
     await b.log.waitFor(/\[StorageManager\] Cached /, 180_000);
 
     // Away for longer than one lease: MAX_OFFLINE_MS is 3 heartbeat intervals,
@@ -252,10 +253,28 @@ test.describe('T9 — the lease is what counts', () => {
     // goes live again and he is counted once more (correctly — the repair round
     // then re-sends him the content he discarded). Sampling after that reports
     // the healed state and says nothing about the lapse.
-    // STEP 6 is deliberately NOT asserted here — see the note at the end of this
-    // file. The rule it describes (only live leases count) is what `liveHolders`
-    // and `planRepair` implement, and those are unit-tested; what is hard is
-    // catching the one LOG LINE that prints the count.
+    // STEP 6 — a lapsed holder stops counting, read off the screen.
+    //
+    // This used to chase a LOG LINE, which turned out to be unobservable: the
+    // re-replication loop returns early when no provider is live at all, and
+    // when one is, the line sits behind a backoff that grows past any sensible
+    // wait. The count is now rendered in the content library, so it can simply
+    // be READ — on demand, at the moment the test cares about, which is what a
+    // person would do. (The column previously showed "confirmed ever", i.e. it
+    // counted this very holder as a replica while its lease was long gone.)
+    await openStorageTab(a);
+    // The library renders on demand; give it a beat after the tab switch.
+    await a.page.waitForTimeout(2_000);
+    const rows = await contentLibrary(a);
+    // Matched on the FILENAME. The CID cell elides to roughly
+    // `bafkrei…2ujcdcm`, so even a short prefix of the real CID does not appear
+    // in the row text — only the codec prefix every CID shares does.
+    const row = rows.find((r) => r.includes(leaseName));
+    expect(row, `no library row for this upload. Rows: ${JSON.stringify(rows)}`).toBeTruthy();
+    // 0 live, and the memory of the confirmation is shown as the sample size
+    // rather than as the count.
+    expect(row!).toMatch(/0 live/);
+    expect(row!).toMatch(/\(\d+ ever\)/);
 
     // Same profile, no reseed: this is bob coming back, not a new device.
     b = await openDevice('bob', { userDataDir: bobDir, headless: true, channel: 'msedge' });
@@ -273,29 +292,3 @@ test.describe('T9 — the lease is what counts', () => {
   });
 });
 
-/**
- * STEP 6 — "lapsed holders stop counting" — is not asserted by this suite, and
- * the reason is worth recording rather than leaving as a gap someone re-derives.
- *
- * The step's pass condition is a LOG LINE: A's re-replication should read
- * `at 0/10 live (1 confirmed ever)` while the holder's lease is lapsed. Getting
- * that line printed needs three things at once, and two of them fight the test:
- *
- *  1. Another provider must be live, because `retryUnconfirmedDistributions`
- *     returns at the top when `selectProviders(1)` is empty — so with the
- *     lapsed holder as the only provider the loop bails BEFORE logging, and the
- *     line can never appear. (Adding a third device fixes this one.)
- *  2. The CID's backoff must have elapsed. `lastDistributed` gates the loop and
- *     the wait grows with `cidStuckCount` (observed at 100 s and climbing), so
- *     after a few rounds against an absent holder the next line can be further
- *     away than the lapse itself. Two runs of 12+ minutes saw no line at all.
- *  3. It must be sampled after the lapse, not before — the newest matching line
- *     is otherwise one from while the holder was still healthy.
- *
- * The RULE is not unverified: `liveHolders` and `planRepair` decide it, and
- * `engine/content/custody.test.ts` pins them, including that lapsed holders are
- * dropped rather than merely uncounted. What is unverified is the wiring's
- * narration of it. If this is worth closing, the cheap way is a counter the UI
- * renders (a replica count on the Storage tab, which a spec can read on demand)
- * rather than a log line behind two timers.
- */

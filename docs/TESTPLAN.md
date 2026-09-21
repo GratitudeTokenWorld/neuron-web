@@ -500,7 +500,11 @@ an archive — allow for it rather than treating the gap as a delivery bug.
 Three things the runs surfaced that are **decisions, not test bugs**. None is
 actioned — they need Lucian's call.
 
-1. **A handed-off publisher never drops its copy.** The custody rule says the
+1. **A handed-off publisher never drops its copy.** ☑ **FIXED** — it now
+   releases once holders have *proven* custody (a receipt is a claim; the
+   holders are asked to produce the bytes first). Original text follows.
+
+    The custody rule says the
    publisher "keeps no copy by default and is not automatically a replica", but
    the implementation only stops COUNTING it: handoff logs `safe to close`,
    emits `storage:handoff-complete`, and nothing deletes the bytes.
@@ -520,14 +524,24 @@ actioned — they need Lucian's call.
    Whether `/resolve`'s balance is load-bearing for any client decides how much
    this matters.
 
-3. **A file's first announcement can be lost, and the recovery is slow.** The
-   announcement is fire-and-forget; published into a mesh with no subscriber it
-   is simply dropped. The re-announce fires 5 s after start, 3 s after a peer
-   connects, and then **every 5 minutes**, so a fresh upload can take a full
-   interval to reach an archive. Verified working in isolation (`[Archive]
-   Stored file record` within 90 s of upload with `DEBUG_ARCHIVE=1`), so this is
-   the designed recovery rather than a delivery bug — but any test or UI that
-   assumes prompt archive visibility has to allow for the interval.
+3. **A file's first announcement can be lost.** It is fire-and-forget; published
+   into a mesh with no subscriber it is simply dropped, and the only recovery
+   was the 5-minute re-announce. An announcement is now *verified* against an
+   archive and re-published if absent (four bounded attempts), so a miss says so
+   instead of being silent.
+
+   **Correction (2026-09-21):** the "archive never received it" failures that
+   originally motivated this were NOT a delivery problem. `uploadFile` in the
+   E2E harness scraped the CID from `distributeContent: cid=${cid.slice(0,20)}…`
+   — a **truncated** 20-character prefix that looks exactly like a CID and
+   matches nothing. Every lookup keyed on it missed silently: `/files?cid=`
+   never matched (read as "the archive doesn't have it") and
+   `trackedCids.get()` found no entry (read as "repair is broken"). With the
+   full CID, T10 step 2b passes in **1.2 s**. The verify-and-retry is still
+   worth having — the failure mode it closes is real — but it was not the cause
+   of anything observed here. A truncated identifier that still parses as one is
+   a nasty failure shape; the helper now reads the CID from the result panel and
+   rejects anything under 40 characters.
 
 ## Result log
 

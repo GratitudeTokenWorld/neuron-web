@@ -128,7 +128,8 @@ test.describe('T10 — a client holds only its own files', () => {
     // record is indistinguishable from one that never arrived, so the delete
     // has to be something a peer can ask for and verify.
     await openStorageTab(a);
-    const cid = await uploadFile(a, 'withdraw-me.bin', 32 * 1024);
+    const name = `withdraw-me-${E2E_RUN}.bin`;
+    const cid = await uploadFile(a, name, 32 * 1024);
 
     // Same 5-minute re-announce interval as step 2 — see the note there.
     let published = false;
@@ -141,13 +142,24 @@ test.describe('T10 — a client holds only its own files', () => {
     }
     expect(published, 'the file never reached an archive, so withdrawal cannot be tested').toBe(true);
 
-    // Remove it through the UI the owner actually uses.
-    await a.page.evaluate((c: string) => {
+    // Remove it through the UI the owner actually uses. Located by the button's
+    // LABEL: a row has four actions and picking "the first button" clicked
+    // "Use CID", so the confirm dialog never opened and the failure looked like
+    // a missing dialog rather than a mis-aimed click.
+    // Located by FILENAME, not CID: the library elides CIDs
+    // (`bafkrei…c6xf6fq`), so matching the full string finds nothing — the same
+    // trap that made a negative assertion pass for the wrong reason in step 2.
+    const removed = await a.page.evaluate((n: string) => {
       const row = [...document.querySelectorAll('#contentLibraryList tr')]
-        .find((r) => r.textContent?.includes(c.slice(0, 16)));
-      const btn = row?.querySelector<HTMLButtonElement>('button[data-remove], button.btn-danger, button');
-      btn?.click();
-    }, cid);
+        .find((r) => r.textContent?.includes(n));
+      if (!row) return 'row not found';
+      const btn = [...row.querySelectorAll('button')]
+        .find((b) => /^remove$/i.test(b.textContent?.trim() ?? ''));
+      if (!btn) return 'no Remove button in the row';
+      (btn as HTMLButtonElement).click();
+      return 'clicked';
+    }, name);
+    expect(removed, 'could not reach the row Remove button').toBe('clicked');
     await a.page.click('#btnRemoveFileConfirm', { timeout: 15_000 });
 
     let tombstoned = false;

@@ -298,9 +298,28 @@ export async function uploadFile(
   });
   await d.page.fill('#storageContentName', name);
   await d.page.click('#btnStoreContent');
-  // The CID is only knowable once the store completes; the log carries it.
-  const line = await d.log.waitFor(/distributeContent: cid=([a-z0-9]+)/, 180_000);
-  return /cid=([a-z0-9]+)/.exec(line)![1]!;
+
+  // Read the CID from the RESULT PANEL, not from the log.
+  //
+  // `distributeContent` logs `cid=${cid.slice(0, 20)}…` — truncated for
+  // readability — and scraping that returned a 20-character prefix that looks
+  // exactly like a CID and matches nothing. Every lookup keyed on it silently
+  // missed: `trackedCids.get()` found no entry so repair declined ("this node
+  // tracks no such CID"), and `/files?cid=` never matched, which read as the
+  // archive not having received the announcement. Two T10 rows and the whole
+  // of T9 step 3 were chasing that. The panel shows the full CID, which is
+  // also what a person would copy.
+  await d.page.waitForSelector('#storageCidResult', { state: 'visible', timeout: 180_000 });
+  const cid = await d.page.evaluate(() => {
+    const text = document.getElementById('storageCidResult')?.textContent ?? '';
+    return /CID:\s*([A-Za-z0-9]+)/.exec(text)?.[1] ?? '';
+  });
+  // A CID is far longer than the 20-char prefix the log prints; anything short
+  // is the old bug coming back.
+  if (cid.length < 40) {
+    throw new Error(`[${d.name}] CID looks truncated ("${cid}") — read it from #storageCidResult, not the log`);
+  }
+  return cid;
 }
 
 /**
@@ -463,7 +482,7 @@ async function enterPin(d: Device, pin: string, title: RegExp): Promise<void> {
       const overlay = [...document.querySelectorAll('div')].find((x) => x.style.zIndex === '9999');
       return !!overlay && new RegExp(t, 'i').test(overlay.textContent ?? '');
     },
-    title.source, { timeout: 120_000 },
+    title.source, { timeout: 240_000 },
   );
   await d.page.locator('input[type="password"]:visible').last().fill(pin);
 
@@ -521,20 +540,35 @@ export async function newAccountDevice(
   });
   try {
     await createAccount(d, ident, opts.pin ?? '1234');
-  } catch (err) {
+  } catch (err) {  // eslint-disable-line @typescript-eslint/no-unused-vars
     // One retry, on a clean page. Creation talks to the relay several times and
     // a loaded machine (three describes' worth of browsers already opened and
     // closed) can stall it past the dialog timeout — observed once, and working
     // again seconds later. A retry is cheap; a run lost at the fourth setup is
     // twenty minutes. The reload matters: the first attempt may have left the
     // form mid-flow.
-    console.warn(`[${name}] account creation failed, retrying once: ${(err as Error).message.slice(0, 120)}`);
-    await d.page.reload();
-    await d.log.waitFor(/\[StorageManager\] Started/, 60_000);
-    await createAccount(d, `${ident}r`, opts.pin ?? '1234');
-    d.username = `${ident}r`;
-    await waitForGossipMesh(d);
-    return d;
+    // Creation talks to the relay several times, and by the fourth describe of
+    // a run the machine has opened and closed a dozen browsers while the single
+    // local relay has minted as many accounts. It stalls, then works again
+    // seconds later. Two retries with a settle between, because one was not
+    // enough to make a full-file run reliable — and a run lost at the last
+    // setup is twenty minutes.
+    console.warn(`[${name}] account creation failed, retrying: ${(err as Error).message.slice(0, 120)}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await d.page.waitForTimeout(10_000 * attempt);
+      await d.page.reload();
+      await d.log.waitFor(/\[StorageManager\] Started/, 120_000);
+      try {
+        const retryName = `${ident}r${attempt}`;
+        await createAccount(d, retryName, opts.pin ?? '1234');
+        d.username = retryName;
+        await waitForGossipMesh(d);
+        return d;
+      } catch (again) {
+        if (attempt === 2) throw again;
+        console.warn(`[${name}] retry ${attempt} failed: ${(again as Error).message.slice(0, 100)}`);
+      }
+    }
   }
   d.username = ident;
   await waitForGossipMesh(d);
