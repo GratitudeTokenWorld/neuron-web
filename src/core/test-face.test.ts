@@ -117,6 +117,22 @@ describe('a built bundle carries none of it', () => {
   const dist = 'dist/assets';
   const built = existsSync(dist) ? readdirSync(dist).filter((f: string) => f.endsWith('.js')) : [];
 
+  it('is gated on BOTH the build command and the env var, in vite.config.ts', () => {
+    // The dist check below can only run when a build exists, and a test that
+    // silently skips is worth nothing on the day it matters. This one never
+    // skips: it reads the config and asserts the structural guard itself, which
+    // is the thing a refactor would plausibly drop. `command === 'serve'` is
+    // what makes a production build incapable of enabling this at all — losing
+    // it would leave only an env var between a release bundle and a liveness
+    // bypass.
+    const config = readFileSync('vite.config.ts', 'utf8');
+    const at = config.indexOf('__TEST_FACE__:');
+    expect(at, '__TEST_FACE__ is no longer defined in vite.config.ts').toBeGreaterThan(-1);
+    const decl = config.slice(at, at + 200);
+    expect(decl).toContain("command === 'serve'");
+    expect(decl).toContain("process.env.TEST_FACE === '1'");
+  });
+
   it.skipIf(built.length === 0)('has no trace of the synthetic face in dist/', () => {
     const forbidden = ['neuron_test_face', 'SYNTHETIC FACE', 'liveness is NOT', 'testFaceBanner'];
     for (const file of built) {
