@@ -972,7 +972,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
 | 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10; parity 2026-08-15; repair, handoff, file index and S3 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine), a filesystem adapter and an **opt-in S3-compatible** one (`src/storage`, zero-dependency SigV4 pinned to AWS's published vectors). Provider economy on-chain: four `storage-*` engine block types, `provider-ledger.ts` (registry + **lease liveness** + reward evidence), reward minting guarded by balance conservation *and* an on-chain evidence ceiling, provider **discovery** by verified archive query (`GET /providers`). Custody policy in `content/custody.ts` — live-only replica counting, lapsed-holder repair, rejoin discard, population-scaled jittered cadences, demand-scaled serving capacity. Publish **handoff** (`awaitHandoff`/`stagingCids`, staging persisted). File index off the global topic → `GET /files` + `file-index.ts`. Repair-vs-churn **measured** in `sim/repair.ts`. Remaining: none of the Phase-3 list — see *Where this stands* |
-| 4 — Scale hardening | **barely started — the bulk of what is left** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only. Missing: archive backfill between relays (demand-driven, never sync-on-rejoin), custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
+| 4 — Scale hardening | **started 2026-09-21** — the bulk of what is left | relay federation (`engine/net`), capped inflation (`engine/economy`), and **archive backfill for account chains** (`engine/net/archive-backfill.ts` + the `/head-proof` miss path): demand-driven, rate-limited, never a sync-on-rejoin. Still missing: backfill for the OTHER archive stores (account records, pending sends, files, providers — each has its own store and no peer-query mechanism yet), custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 55/55 |
 | G3 (a third `O(N)` violation, found later) | **CLOSED 2026-08-15** | the global `keyblobs` topic broadcast every account's encrypted-key blob to every node — G1's shape, hidden behind a security rationale. Replaced by targeted `POST`/`GET /keyblob`. See *Scale-invariant gaps* below |
@@ -1041,6 +1041,40 @@ Then **Phase 4**, which is where the remaining engineering is. The migration
 seam (~121 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
 caller, as each is moved off the `DAGLedger` compatibility surface —
 `storage-manager.ts` was moved this way and took the count from 182 to 123.
+
+---
+
+### Principle self-review — 2026-09-21 (archive backfill)
+
+Run per PRINCIPLES.md → 4a, because a subsystem's behaviour changed in a way
+other nodes can observe: relays now PUT something on the wire that they never
+did before.
+
+- **Scale invariant (3d) — the one that mattered.** The request is made only
+  for what a client actually asked for and the archive could not serve:
+  `O(actual queries)`, never `O(archive)`. The real hazard was not the healing,
+  it was amplification — the common miss is a query for something that exists
+  nowhere, so an unbounded version turns any stranger's URL scan into
+  federation-wide gossip. Capped at 60/min per relay, which is `O(1)` traffic
+  per relay regardless of network size, with per-key backoff and abandonment.
+- **No required party (3a) — improved.** A relay no longer permanently lacks
+  what a peer holds, so no single relay is the required one for a given
+  account's proof.
+- **Free and open (2).** Pure module, no new dependency.
+- **Access (1).** Slightly positive: a client on a poor link gets an answer
+  from whichever relay it can reach rather than needing the one that happens to
+  hold the data.
+- **Operator vote (3e).** Not consensus-visible — no block validity changes —
+  but it IS federation-visible, and under the eventual upgrade/vote machinery
+  a change to what relays broadcast is exactly the kind of thing operators
+  would ratify. Recorded here so it is not forgotten when that exists.
+
+**Honest gap:** this covers per-account CHAINS only, because
+`engine-delta-req` is the one peer-query mechanism that already exists. The
+account directory, pending sends, the file index and provider records each
+live in their own store with no equivalent, so a relay that was down still has
+holes in those. Closing them needs a peer-query shape per store — the same
+demand-driven rule, not a sync.
 
 ---
 
