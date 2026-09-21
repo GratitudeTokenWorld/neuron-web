@@ -139,6 +139,26 @@ the node's identity and breaks the baked bootstrap address).
 | `ARCHIVE` | on | `ARCHIVE=0` → pure relay, no engine-block archival |
 | `ENGINE_BLOCKS_FILE` | `.relay-engine-blocks.json` | archive path |
 | `PEER_RELAYS` | empty | comma-separated multiaddrs of *other* super-nodes/relays to federate with |
+
+> ⚠ **`pm2 delete` + `pm2 start` silently DE-FEDERATES a relay.**
+> `ecosystem.config.cjs` has no `env` block on purpose — it inherits
+> `PEER_RELAYS` from the shell — and a non-interactive `ssh host "pm2 start …"`
+> has no such shell. The relay then comes up perfectly healthy: `/relay-info`
+> answers 200, the archive loads, clients connect. It simply never talks to the
+> other relay again, so nothing federates and every cross-relay behaviour fails
+> for a reason nothing logs. Done accidentally on 2026-09-21 while clearing a
+> debug flag; found because the backfill probe stopped healing.
+>
+> **Use `pm2 restart neuron-relay`** (which preserves the existing env), or if
+> you must recreate the process, source the env first:
+>
+> ```sh
+> cd ~/neuron-web && set -a && . ~/.relay-env && set +a
+> pm2 start relay/ecosystem.config.cjs && pm2 save
+> ```
+>
+> Check it took: `pm2 jlist` → the app's `pm2_env.PEER_RELAYS` must be set.
+> `pm2 save` persists the process list so a reboot restores it.
 | `FACE_DB_FILE` / `SIGNING_KEY_FILE` / `ATTESTER_KEY_FILE` / `PEER_ID_FILE` | `.relay-*.json` | identity/state paths |
 
 `LOCAL_ONLY` is a **dev-only** flag (it gates the Vite dev plugin + client build); the

@@ -25,13 +25,15 @@ Read in this order — do NOT re-derive what they already record:
 - App-layer `tsc -p tsconfig.json` = **121 errors — this is the baseline, never
   add to it.** Take a **per-file** count before and after; the total falling
   does not prove your file did not gain errors.
-- Live probe `npx tsx scripts/g1-resolve-smoke.mts` = **55 checks, ALL CHECKS
-  PASSED**. Run after every relay deploy — and wait for the relays to finish
+- Live probes, both **ALL CHECKS PASSED**:
+  `npx tsx scripts/g1-resolve-smoke.mts` (55 checks) and
+  `npx tsx scripts/backfill-smoke.mts` (the archive heal — ⚠ it stops and
+  starts a relay over ssh). Run after every relay deploy — and wait for the relays to finish
   restarting first, or you get phantom failures.
 - **Relays**: both cloud boxes (`80.97.27.224`, `80.97.27.112`) run **`890e047`**
-  (deployed 2026-09-21; restart counts 19→20, i.e. one deliberate restart each
-  and no crash loop, checked *after* the 60 s timer). They carry the archive
-  backfill. Anything relay-side committed after that needs a deploy before it
+  (deployed 2026-09-21). They carry the archive backfill, **verified healing in
+  production** by `scripts/backfill-smoke.mts`. Restart counters were reset to 0
+  when the processes were recreated, so compare against 0, not the old 19. Anything relay-side committed after that needs a deploy before it
   does anything at all.
 - **E2E**: `npm run e2e`. T8, T9 and T10 all pass unattended. Run the stack as
   `LOCAL_ONLY=1 TEST_FACE=1 STORAGE_TIMING=fast npm run dev` — see the skill for
@@ -94,6 +96,11 @@ Read in this order — do NOT re-derive what they already record:
   caught exactly this way.
 - **Verify infrastructure from OUTSIDE.** `systemctl is-active` proved nothing
   about TURN; a raw STUN probe did.
+- **`pm2 delete` + `pm2 start` de-federates a relay, silently.** The ecosystem
+  file inherits `PEER_RELAYS` from the shell and a non-interactive ssh has
+  none, so the relay comes up healthy, answers 200, and never speaks to its
+  peer again. Use `pm2 restart`, or source `~/.relay-env` first. Details and
+  the check in SUPERNODE.md.
 - **Do not guess twice.** Get the log line, the archive query, or the probe
   first.
 
