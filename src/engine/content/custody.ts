@@ -158,6 +158,24 @@ export function planRepair(args: {
   return { drop, add, live: live.length, shortfall: need - add.length };
 }
 
+/**
+ * A duration in the largest unit that still says something.
+ *
+ * Hardcoded hours were wrong here: `MAX_OFFLINE_MS` scales with the active
+ * timing profile, so under `STORAGE_TIMING=fast` (6-minute lease) the lapse
+ * message read `lease lapsed 0h ago (max 0h)` — the same defect family as
+ * `LAST REWARD -59066340h ago`, a fixed unit rendered against a clock that
+ * moved. The unit has to follow the profile, or the one line that explains why
+ * a node just discarded its entire disk is unreadable in exactly the profile
+ * that discarding is tested under.
+ */
+function fmtSpan(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1_000)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}min`;
+  const h = Math.round(ms / 3_600_000);
+  return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`;
+}
+
 // ── Rejoin ───────────────────────────────────────────────────────────────────
 
 export interface RejoinPlan {
@@ -211,8 +229,8 @@ export function planRejoin(args: {
       keep: [],
       discard: [...held],
       lapsed: true,
-      reason: `lease lapsed ${Math.round(offlineMs / 3_600_000)}h ago `
-        + `(max ${Math.round(MAX_OFFLINE_MS / 3_600_000)}h) — content re-homed, discarding ${held.length} CID(s)`,
+      reason: `lease lapsed ${fmtSpan(offlineMs)} ago `
+        + `(max ${fmtSpan(MAX_OFFLINE_MS)}) — content re-homed, discarding ${held.length} CID(s)`,
     };
   }
 

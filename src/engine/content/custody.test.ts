@@ -11,7 +11,7 @@ import {
   pollIntervalMs,
   CustodySignals,
 } from './custody.js';
-import { MAX_OFFLINE_MS } from './provider-ledger.js';
+import { MAX_OFFLINE_MS, applyStorageTiming } from './provider-ledger.js';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -154,6 +154,30 @@ describe('planRejoin', () => {
   it('draws the line exactly at MAX_OFFLINE_MS, not near it', () => {
     expect(planRejoin({ offlineMs: MAX_OFFLINE_MS - 1, held }).lapsed).toBe(false);
     expect(planRejoin({ offlineMs: MAX_OFFLINE_MS, held }).lapsed).toBe(true);
+  });
+
+  it('states the lapse in a unit that survives a compressed profile', () => {
+    // The reason line hardcoded hours while MAX_OFFLINE_MS scales with the
+    // timing profile, so under `fast` (6-minute lease) the only message
+    // explaining why a node just erased its disk read `lapsed 0h ago (max 0h)`.
+    // Same family as `LAST REWARD -59066340h ago`: a fixed unit against a moved
+    // clock. This is asserted under `fast` because that is the profile T9 step 5
+    // runs in — the normal profile could never have shown the bug.
+    try {
+      applyStorageTiming('fast');
+      const reason = planRejoin({ offlineMs: MAX_OFFLINE_MS + 60_000, held }).reason;
+      expect(reason).not.toMatch(/0h/);
+      expect(reason).toMatch(/lapsed \d+min ago \(max \d+min\)/);
+    } finally {
+      // A profile is global mutable state and a CONSENSUS input; leaking `fast`
+      // into a later test would re-number every epoch it asserts on.
+      applyStorageTiming('normal');
+    }
+  });
+
+  it('still reads in hours at production timing', () => {
+    const reason = planRejoin({ offlineMs: MAX_OFFLINE_MS, held }).reason;
+    expect(reason).toMatch(/lapsed 12h ago \(max 12h\)/);
   });
 });
 
