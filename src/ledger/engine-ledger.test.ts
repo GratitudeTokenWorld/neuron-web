@@ -12,6 +12,33 @@ function identityFor(pub: string, human: string): OpenIdentity {
   return { nullifier: human, attestations: [createAttestation('personhood', commitment, attester)] };
 }
 
+describe('knowsAccountBalance', () => {
+  it('separates "holds nothing" from "we hold none of their chain"', async () => {
+    // Both render as 0 from getAccountBalance, and under the scale invariant a
+    // node holding no chain for a stranger is the NORMAL case — so a screen
+    // that shows the number without asking this reports a balance it never
+    // measured.
+    const ledger = new EngineLedger('testnet');
+    const alice = generateKeyPair();
+    const stranger = generateKeyPair();
+
+    // Registered from a directory record, but no chain held: unknown, not zero.
+    ledger.registerAccount({ username: 'stranger', pub: stranger.pub });
+    expect(ledger.getAccountBalance(stranger.pub)).toBe(0);
+    expect(ledger.knowsAccountBalance(stranger.pub)).toBe(false);
+
+    // An account we hold: known.
+    ledger.registerAccount({ username: 'alice', pub: alice.pub });
+    await ledger.openAccount(alice.pub, alice, identityFor(alice.pub, 'human-knows-alice'));
+    expect(ledger.knowsAccountBalance(alice.pub)).toBe(true);
+    expect(ledger.getAccountBalance(alice.pub)).toBe(VERIFICATION_MINT_AMOUNT);
+
+    // A frozen account is the third case and is deliberately KNOWN: its balance
+    // is void, not unmeasured. Freezing is exercised in fraud-safety.test.ts.
+  });
+
+});
+
 describe('EngineLedger (core flow on the new engine)', () => {
   it('opens accounts, deduplicates by human, and mints the genesis balance', async () => {
     const ledger = new EngineLedger('testnet');

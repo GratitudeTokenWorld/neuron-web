@@ -16,27 +16,44 @@ something below is wrong, vague, or missing, say so.
 
 ## 1. NeuronWeb is for humanity. No discrimination.
 
-The network serves people — all of them — and excludes no one by geography,
-wealth, language, hardware, politics, belief, or any other attribute.
+**This is primarily about ACCESS to the technology** — clarified by Lucian,
+2026-09-21. Not a social-policy statement: it is a statement about who can
+obtain, run, modify and deploy the software, and on what.
 
-**What this rules in:** running on cheap and old devices, not just new ones;
-working on poor connections; no privileged class of participant who gets a
-better network than everyone else.
+Three concrete commitments:
 
-**What this rules out:** any gate that admits some humans and not others by who
-they are rather than by whether they are a distinct human. Note the deliberate
-exception: *one human, one account* is a **counting** rule, not a
-discrimination rule — it exists so that no one can drown out everybody else, and
-it must therefore be applied identically to every person.
+**1a. Access to the technology and its licence.** Anyone may obtain, read, run,
+modify and redistribute it, with no permission to ask for and no one able to
+revoke it. This is the same commitment as Principle 2 seen from the user's
+side rather than the project's.
 
-**Where this already bites:** the biometric gate exists to establish personhood,
-never eligibility. A face that cannot be captured well in poor light is an
-**accessibility bug**, not an invalid user — that is why enrollment quality is
-measured by cross-session distance rather than by a luminance floor
-(ARCHITECTURE.md → identity; CLAUDE.md → *Face matching*). If a change would
-make the network harder to join for people with worse cameras, worse light,
-worse phones or worse links, that is a cost against this principle and must be
-argued explicitly.
+**1b. Versatility of deployment — cross-OS, cross-platform.** The software must
+run wherever people are, not only where it is convenient for us to build: every
+major desktop and mobile OS, browsers, headless servers, single-board
+computers. A platform that cannot run a node is a population that cannot
+participate, which is what discrimination means here. See Principle 3c: this
+diversity is *also* the redundancy the network's durability rests on.
+
+**1c. Expanding into Web3 IoT.** Devices are first-class participants, not an
+afterthought — which is why Principle 3d says "tens of billions of users, human
+AND machine". An IoT node has little storage, little CPU, intermittent power
+and a bad link, so the per-node cost model has to fit inside that envelope. The
+scale invariant (`O(own data + followed data)`) is what makes this possible at
+all: a node that must hold `O(total network)` can never be a sensor.
+
+**What this rules out:** a platform-exclusive build, a licence that restricts
+who may run or fork it, a dependency that only exists on one OS, and a resource
+floor that quietly excludes small devices. If a change would raise the minimum
+machine needed to participate, that is a cost against this principle and must
+be argued explicitly.
+
+**One-human-one-account is not in tension with this.** It is a *counting* rule
+so no one can drown out everybody else, applied identically to every person —
+not an eligibility test. Its corollary is an accessibility duty: the biometric
+gate establishes personhood, never worthiness, so a face that cannot be
+captured well on a cheap camera in poor light is an accessibility bug and not
+an invalid user (CLAUDE.md → *Face matching*, and the measured finding that
+cross-session distance — not luminance — is what decides recoverability).
 
 ## 2. NeuronWeb will forever be free and open source.
 
@@ -163,9 +180,9 @@ Open questions currently sitting against these principles:
   vote weighted without recreating one-machine-one-vote Sybil exposure?
 - **How does code sync across nodes** without a required publisher — the
   upgrade path is itself a place a required party could sneak in.
-- **How far does "no discrimination" reach into moderation** — a network for
-  all of humanity still has to decide what it does about abuse, and that
-  decision has not been made.
+- **Moderation.** Principle 1 is about access to the technology, so it does not
+  by itself settle what the network does about abusive *content*. That decision
+  has not been made, and it is a protocol question as much as a policy one.
 
 ---
 

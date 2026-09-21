@@ -673,6 +673,11 @@ function showAccountDetail(pub: string) {
   const detail = $('#explorerDetail');
   const acc = node.ledger.getAccountByPub ? node.ledger.getAccountByPub(pub) : undefined;
   const username = acc?.username ?? trunc(pub);
+  // "0 UNIT" and "we hold none of this account's chain" are different facts,
+  // and under the scale invariant the second is the NORMAL case for a stranger
+  // looked up in the directory. Rendering the first when we mean the second is
+  // the recurring defect on this screen's siblings, so it is asked explicitly.
+  const balanceKnown = node.ledger.knowsAccountBalance(pub);
   const balance = node.ledger.getAccountBalance(pub);
   const chain = node.ledger.getAccountChain(pub);
   const provider = node.ledger.storageProviders.get(pub);
@@ -749,7 +754,11 @@ function showAccountDetail(pub: string) {
       </div>
       <div class="stats-grid" style="margin-bottom:0;">
         <div class="stat-item"><div class="stat-label">Public Key</div><div class="stat-value small">${cpBtn(pub)}${escHtml(trunc(pub, 24))}</div></div>
-        <div class="stat-item"><div class="stat-label">UNIT Balance</div><div class="stat-value">${formatUNIT(balance)} UNIT</div></div>
+        <div class="stat-item"><div class="stat-label">UNIT Balance</div><div class="stat-value">${
+          balanceKnown
+            ? `${formatUNIT(balance)} UNIT`
+            : '<span style="color:var(--text-muted)" title="This node holds none of this account&apos;s chain, so its balance is unknown here — not zero.">&mdash;</span>'
+        }</div></div>
         <div class="stat-item"><div class="stat-label">Blocks</div><div class="stat-value">${chain.length}</div></div>
         ${acc ? `<div class="stat-item"><div class="stat-label">Generation</div><div class="stat-value">${(acc as unknown as Record<string, unknown>).generation ?? 0}</div></div>` : ''}
       </div>

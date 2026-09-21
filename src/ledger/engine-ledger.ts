@@ -253,6 +253,23 @@ export class EngineLedger extends EventEmitter {
     return h && h.chain.length ? h.chain[h.chain.length - 1]! : null;
   }
 
+  /**
+   * Do we actually KNOW this account's balance?
+   *
+   * `getAccountBalance` returns 0 for an account whose chain this node does not
+   * hold, which is indistinguishable from an account that really has nothing —
+   * and under the scale invariant NOT holding a stranger's chain is the normal
+   * case, not an edge case. Anything that renders a balance has to ask this
+   * first, or it reports a number it never measured (CLAUDE.md → "never render
+   * the unmeasured as fact").
+   *
+   * A frozen account is a different thing: its balance IS known, and it is
+   * void.
+   */
+  knowsAccountBalance(pub: string): boolean {
+    return this.equivocated.has(pub) || !!this.getAccountHead(pub);
+  }
+
   getAccountBalance(pub: string): number {
     if (this.equivocated.has(pub)) return 0;  // frozen: balance void
     const head = this.getAccountHead(pub);

@@ -560,7 +560,7 @@ export class SmokeStore {
     return this.store(encrypted);
   }
 
-  async retrieveDecrypted(cidStr: string, keys: KeyPair, timeoutMs = 600_000): Promise<Uint8Array | undefined> {
+  async retrieveDecrypted(cidStr: string, keys: KeyPair, timeoutMs: number = 600_000): Promise<Uint8Array | undefined> {
     try {
       const encrypted = await this.retrieve(cidStr, timeoutMs);
       const aesKey = await deriveContentKey(keys);
@@ -572,8 +572,8 @@ export class SmokeStore {
     return this.storeEncrypted(new TextEncoder().encode(text), keys);
   }
 
-  async retrieveText(cidStr: string, keys: KeyPair): Promise<string | undefined> {
-    const bytes = await this.retrieveDecrypted(cidStr, keys);
+  async retrieveText(cidStr: string, keys: KeyPair, timeoutMs?: number): Promise<string | undefined> {
+    const bytes = await this.retrieveDecrypted(cidStr, keys, timeoutMs);
     return bytes ? new TextDecoder().decode(bytes) : undefined;
   }
 
@@ -581,8 +581,8 @@ export class SmokeStore {
     return this.storeText(JSON.stringify(data), keys);
   }
 
-  async retrieveJSON<T>(cidStr: string, keys: KeyPair): Promise<T | undefined> {
-    const text = await this.retrieveText(cidStr, keys);
+  async retrieveJSON<T>(cidStr: string, keys: KeyPair, timeoutMs?: number): Promise<T | undefined> {
+    const text = await this.retrieveText(cidStr, keys, timeoutMs);
     if (!text) return undefined;
     try { return JSON.parse(text) as T; } catch { return undefined; }
   }
@@ -762,9 +762,22 @@ export class SmokeStore {
    *   isStream   — true if the file uses the OPFS streaming path (> 8 MB)
    *   meta       — ContentMeta if the manifest was readable; undefined if not found
    */
+  /**
+   * Is this content reachable, and what is its manifest?
+   *
+   * `timeoutMs` defaults to 20 s, NOT to `retrieve`'s 10-minute default. This
+   * is the "fast availability check" the UI runs before a download, and it
+   * inherited a deadline meant for pulling an 8 MB chunk over a slow relay: a
+   * read against content with no reachable holder sat on "Checking…" for ten
+   * minutes and told the user nothing. Worse, repair is triggered by exactly
+   * that failure — the not-found branch reports the read failure — so the
+   * unbounded wait also stopped the network from re-placing content that had
+   * gone missing. A bounded answer is what makes the failure actionable.
+   */
   async checkAvailability(
     metaCid: string,
     keys?: KeyPair,
+    timeoutMs = 20_000,
   ): Promise<{
     available: boolean;
     isStream: boolean;
@@ -776,12 +789,12 @@ export class SmokeStore {
 
     // Try encrypted manifest first (if keys provided)
     if (keys) {
-      meta = await this.retrieveJSON<FullMeta>(metaCid, keys);
+      meta = await this.retrieveJSON<FullMeta>(metaCid, keys, timeoutMs);
     }
     // Fall back to unencrypted JSON
     if (!meta) {
       try {
-        const bytes = await this.retrieve(metaCid);
+        const bytes = await this.retrieve(metaCid, timeoutMs);
         meta = JSON.parse(new TextDecoder().decode(bytes)) as FullMeta;
       } catch { /* not found */ }
     }

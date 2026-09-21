@@ -7,9 +7,12 @@ Guidance for Claude Code when working in this repository.
 The project's constitution lives in [docs/PRINCIPLES.md](docs/PRINCIPLES.md).
 Read it before anything else here; the short form:
 
-1. **For humanity, no discrimination.** Serves everyone, excludes no one by who
-   they are. One-human-one-account is a *counting* rule, never an eligibility
-   one. A face that fails in bad light is an accessibility bug, not a bad user.
+1. **For humanity, no discrimination — chiefly about ACCESS.** To the
+   technology, to the licence, and to running it: cross-OS, cross-platform,
+   down to single-board computers, expanding into Web3 IoT (which is why the
+   target is tens of billions of users, human *and machine*). A platform that
+   cannot run a node is a population that cannot participate.
+   One-human-one-account is a *counting* rule, never an eligibility one.
 2. **Free and open source, forever.** No paid tier, no proprietary component a
    node needs, no dependency that can later charge rent or vanish.
 3. **Absolute decentralisation, reached progressively.** No required party in

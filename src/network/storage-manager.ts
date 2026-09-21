@@ -1151,6 +1151,26 @@ export class StorageManager extends EventEmitter {
    * the caller: between the receipt that triggered this and the delete, a lease
    * can lapse, and releasing against a stale count drops the last real copy.
    */
+  /**
+   * How many live holders can actually SERVE this cid right now?
+   *
+   * Bounded and parallel: one short HTTP fetch per holder, and a holder that
+   * does not answer quickly is simply not counted — this is a gate on deleting
+   * data, so the safe failure is to count fewer and keep the bytes.
+   */
+  private async proveCustody(cid: string, confirmed: ReadonlySet<string>): Promise<number> {
+    const providers = this.ledger.getStorageProviders();
+    const checks = [...confirmed]
+      .filter(pub => this.ledger.isProviderLive(pub))
+      .map(pub => providers.find(p => p.pub === pub)?.smokeAddr)
+      .filter((addr): addr is string => !!addr)
+      .map(addr => this.store.fetchBlockFromProvider(addr, cid, 8_000)
+        .then(bytes => bytes.length > 0)
+        .catch(() => false));
+    if (checks.length === 0) return 0;
+    return (await Promise.all(checks)).filter(Boolean).length;
+  }
+
   private async releasePublisherCopy(cid: string): Promise<void> {
     const tracked = this.trackedCids.get(cid);
     if (!tracked) return;
@@ -1159,6 +1179,24 @@ export class StorageManager extends EventEmitter {
 
     const live = this.liveHolderCount(tracked.confirmedProviders);
     if (!mayReleasePublisherCopy(live)) return;
+
+    // A RECEIPT IS A CLAIM, NOT PROOF OF CUSTODY. Everything above this line is
+    // bookkeeping: a provider said it cached the content and its lease is live.
+    // Deleting our only copy on that basis trusts a message. So the holders are
+    // asked to produce the bytes before we throw ours away, and enough of them
+    // must answer to satisfy MIN_REPLICAS on PROVEN custody rather than claimed
+    // custody.
+    //
+    // The root CID is the thing checked. Custody is all-or-nothing on the
+    // provider side — `handleCacheRequest` publishes no receipt unless every
+    // chunk arrived — so a holder that serves the root is a holder that
+    // completed the transfer.
+    const proven = await this.proveCustody(cid, tracked.confirmedProviders);
+    if (!mayReleasePublisherCopy(proven)) {
+      console.warn(`[StorageManager] Not releasing ${cid.slice(0, 16)}… — `
+        + `${proven}/${live} claimed holder(s) could actually serve it. Keeping our copy.`);
+      return;   // no releasedCids entry: the next receipt retries this
+    }
 
     this.releasedCids.add(cid);
     try {
@@ -1558,9 +1596,12 @@ export class StorageManager extends EventEmitter {
         if (!wasHandedOff && live >= MIN_REPLICAS) {
           console.log(`[StorageManager] Handoff complete for ${receipt.cid.slice(0, 16)}… (${live} live holders) — safe to close`);
           this.emit('storage:handoff-complete', { cid: receipt.cid, live });
-          // Authorship is not custody: hand the bytes over for real.
-          void this.releasePublisherCopy(receipt.cid);
         }
+        // Authorship is not custody: hand the bytes over for real. Attempted on
+        // EVERY qualifying receipt, not only on the transition — a release can
+        // decline because the holders could not prove custody, and that has to
+        // be retried as more receipts arrive rather than never tried again.
+        if (live >= MIN_REPLICAS) void this.releasePublisherCopy(receipt.cid);
         // If still under-replicated, reset lastDistributed so the next retry interval
         // fires quickly instead of waiting a full 30s cycle from the original send time.
         if (live < Math.min(this.signals.targetFor(receipt.cid), MAX_REPLICA_TARGET)) {
