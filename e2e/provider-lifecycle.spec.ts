@@ -124,20 +124,26 @@ test.describe('T8 step 5 — the reward', () => {
   test('pays for bytes HELD, one epoch behind, and only once', async () => {
     test.skip(timing(a) !== 'fast',
       `needs STORAGE_TIMING=fast (12-minute epoch); this stack runs "${timing(a)}" (24-hour epoch)`);
-    test.setTimeout(1_800_000);
+    test.setTimeout(2_700_000);
 
     await serveStorage(a, 5);
-    // The provider must actually HOLD something: a reward is metered by stored
-    // bytes, so an empty provider crossing an epoch boundary earns exactly 0
-    // and would make this step pass while measuring nothing.
-    await uploadFile(b, `reward-${E2E_RUN}.bin`, 256 * 1024);
+    // Enough bytes to be PAYABLE, not merely non-empty. The reward is
+    // 1000 x storedGB x countedHeartbeats/6 in milli-UNIT, so 256 KB earns
+    // 1000 x 0.00024 = 0.24 and truncates to zero — the run then fails with
+    // "calculated reward is zero", which is the rule working and the test
+    // measuring nothing. 12 MB earns ~12 milli-UNIT at full uptime.
+    // (The manual pass on record was 98 milli-UNIT for 101 MB.)
+    await uploadFile(b, `reward-${E2E_RUN}.bin`, 12 * 1024 * 1024);
     await a.log.waitFor(/\[StorageManager\] Cached /, 300_000);
 
     // Wait out an epoch boundary, then claim. Rewards settle one epoch behind:
     // the claim names the epoch BEFORE its own block, never the running one —
     // billing the running epoch pays a fraction of what was earned and closes
     // that epoch permanently.
-    const issued = await a.log.waitFor(/Reward issued: (\d+) milli-UNIT/, 1_500_000);
+    // Up to two epoch boundaries: the provider has to be registered at the
+    // START of the epoch it is paid for, so registering mid-epoch means the
+    // first boundary only makes it eligible and the second pays it.
+    const issued = await a.log.waitFor(/Reward issued: (\d+) milli-UNIT/, 2_400_000);
     const amount = Number(/Reward issued: (\d+)/.exec(issued)![1]);
     expect(amount, `reward should be non-zero for a provider holding bytes: ${issued}`).toBeGreaterThan(0);
 

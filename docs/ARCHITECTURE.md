@@ -1008,13 +1008,30 @@ face), which is what turned three latent defects into findings:
 
 | Row | State |
 |---|---|
-| T9 step 1 — handoff completes on two live leases | **pass** (needs THREE accounts: MIN_REPLICAS is 2 and the uploader never counts itself) |
-| T9 step 2 — staging survives a reload, retried without re-upload | **pass** |
-| T9 steps 3+4 — repair on read failure | **still not observable**, but three real blockers are fixed: the publisher never dropped its copy (now released on *proven* custody), the availability check inherited retrieve()'s 10-minute deadline (bounded to 20 s), and the repair trigger was keyed on "nothing came back at all" when the usual shape of a lost file is a readable manifest pointing at unservable content. What remains is that the read never returns to the UI when every holder is gone — next step is deciding whether an owner's read should ask the archives for current holders first |
-| T9 step 5 — rejoin past the lease discards | **pass** (run it isolated: `-g "steps 5"`) |
-| T9 step 6 — lapsed holders stop counting | **not asserted.** The rule is unit-tested; the *log line* that reports it sits behind an early return and a growing backoff. A rendered replica count would be the cheap way to close it |
-| T10 steps 1, 2, 3, 4 | **pass** — archives answer with their own `total`, a client holds only its own files, the one-time migration drops a planted foreign record once, and the chip reads `—` rather than a bare 0 |
-| T10 2b + 5 — archive receipt, withdrawal tombstone | **flaky.** Delivery is confirmed within 5 s single-device; two devices under load can still miss for minutes. An announcement is now *verified* against an archive and re-published if absent, so a miss says so instead of being silent |
+| T8 steps 1–4 — provider lifecycle | **pass**. Capacity earns nothing until bytes are held; discovery is by archive query and renders `—` for what the observer cannot know; an immediate second heartbeat is refused; and a deregister does **not** reset the heartbeat clock |
+| T8 step 5 — the reward | **pass**. Two conditions the test had to respect: the provider must be registered at the epoch's START (registering mid-epoch costs a full epoch before it is even eligible), and it must hold bytes worth paying for — `1000 × storedGB × counted/6` milli-UNIT truncates to **zero** below ~1 MB held |
+| T9 — all steps | **pass**: handoff on two live leases, durable staging, release-then-repair, rejoin discard, and lapsed holders not counting |
+| T10 — all steps | **pass**: archives answer with their own `total`, clients hold only their own files, the migration runs once, the chip reads `—`, and a withdrawal lands as a tombstone |
+
+Three defects and three false greens came out of running them. The defects:
+the publisher never released its copy, an account record could regress to a
+stale unsigned balance, and a file's first announcement could be lost with only
+a 5-minute re-announce behind it. The false greens are the more instructive
+half, because every one of them was a test that could not fail:
+
+- the harness scraped CIDs from a log line that **truncates to 20 characters**,
+  so every lookup keyed on one silently missed — which is what made T9 step 3
+  look like broken repair and two T10 rows look like lost announcements;
+- a provider lookup ran with an **empty prefix**, and `includes('')` matches
+  every row, so a discovery test went green against someone else's provider;
+- "the rate is 0" was asserted against the whole row, where it is satisfied by
+  the 0 in "5.0 GB".
+
+And two silent rejections were made to speak, both found the same way — by a
+test waiting on a log line no code path could emit: `repairOnReadFailure` now
+says why it declined, and `issueRewardsIfEligible` says why a provider was not
+paid (its comment said "log and continue" and it logged nothing, while polling
+every 15 s under the compressed clock).
 
 `GET /files` was never blocked on a relay deploy — it shipped in `2f66a4c`, an
 ancestor of the deployed `e51cae0`. T8 step 5's day-boundary question is closed

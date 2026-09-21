@@ -194,18 +194,15 @@ shipped this session. What is NOT done is verifying them on the live network.
 
 **Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
-1. **T9 steps 3+4 — one decision away.** Three blockers are fixed (publisher
-   releases on proven custody; `checkAvailability` bounded to 20 s; the repair
-   trigger keyed on *unavailable* rather than *nothing at all*), but with every
-   holder gone the read still never returns to the UI. Decide whether an
-   owner's read should ask the archives for current holders (`GET /providers`)
-   before concluding the content is gone — the spec records the evidence.
-2. **Phase 4 — scale hardening.** This is where the remaining engineering is:
+1. **Phase 4 — scale hardening.** This is where the remaining engineering is:
    archive backfill between relays (**demand-driven on a miss, never a
    sync-on-rejoin**, which would be `O(archive)`), custody-proven incentive
    payouts, adaptive limits, security bounds, and the sustained load test.
-3. **Multi-device custody** (decided, unbuilt): per-device chains with an
+2. **Multi-device custody** (decided, unbuilt): per-device chains with an
    account-signed delegation. Settle the pseudonymous device-group tag first.
+3. **T8–T10 all run unattended now** (`npm run e2e`). T9 and T10 pass in full;
+   T8 steps 1–4 pass. Keep them green — they found three product defects and
+   three assertions that could not fail.
 4. **The migration seam**, per caller — 121 app-layer type errors.
 
 `storage-manager.ts` (~1500 lines) has more callers than the ledger did —
