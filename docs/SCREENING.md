@@ -118,7 +118,22 @@ what a node must **answer**, not only what it holds.
 de-federated both relays: healthy-looking, 200s, and no peer contact. Config
 that arrives from the environment needs an explicit check that it arrived.
 
-### 11. Trusting a claim as proof
+### 11. Self-reported numbers that meter a payout
+
+Ask of every payout term: **who computes this, and what does a lie buy them?**
+
+Storage rewards are `BASE_RATE × min(storedGB, capacityAtStart) × uptime`, and
+both volume terms come from the provider: `storedBytes` rides in its own
+heartbeat, `capacityAtStart` is whatever it declared. `validate` checks the
+claim against `rewardTerms`, which is computed from the same self-report — the
+verification is circular. The on-chain evidence ceiling bounds UPTIME, which is
+cheap to produce honestly, and bounds nothing about volume.
+
+Found by the first black-hat pass (2026-09-21) and kept as an adversarial
+control in `provider-ledger.test.ts`. **Open** — the fix is Phase 4's
+custody-proven payouts, which is an economic design decision, not a patch.
+
+### 12. Trusting a claim as proof
 
 A receipt says a provider *cached* something. Deleting the last local copy on
 that basis trusts a message. Ask the holder to produce the bytes.
@@ -129,6 +144,10 @@ that basis trusts a message. Ask the holder to produce the bytes.
 
 Ordered by what would hurt most, not by ease.
 
+0. **Attack it deliberately.** `.claude/skills/black-hat-review/SKILL.md` —
+   pick a target worth attacking, write the attacker's goal in one sentence,
+   and BUILD the attack rather than arguing about it. Dev mode is the window:
+   data is disposable and there is no real money yet.
 1. **Sustained write load over time** — the one still unbuilt. Not "is per-node
    cost bounded now?" but "does any per-node structure grow monotonically over
    hours at target write rates?". This is the test that would have found both

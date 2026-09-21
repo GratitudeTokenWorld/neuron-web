@@ -210,6 +210,47 @@ describe('reward terms', () => {
     expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 4);
   });
 
+  /**
+   * ⚠ ADVERSARIAL CONTROL — this test asserts a WEAKNESS, not a guarantee.
+   *
+   * Attacker's goal: earn full storage rewards while holding nothing.
+   *
+   * The payout is `BASE_RATE × min(storedGB, capacityAtStart) × uptime`. Both
+   * terms come from the provider itself: `storedBytes` rides in its own
+   * heartbeat block, and `capacityAtStart` is whatever it declared when it
+   * registered. The on-chain "evidence ceiling" bounds UPTIME (counted
+   * heartbeats), which is cheap to produce honestly — it bounds nothing about
+   * volume. `validate` then checks the claimed `storedGB` against
+   * `rewardTerms`, which is computed from the same self-report, so the
+   * verification is circular.
+   *
+   * Cost to the attacker: one registration and six heartbeats per epoch. No
+   * bytes are transferred, no content is served, no spot check is involved in
+   * the payout at all.
+   *
+   * Kept as a control the way `face-match.test.ts` keeps the v2 brute force:
+   * when custody-proven payouts land (ARCHITECTURE → Phase 4), this test
+   * should FAIL and be rewritten as the guarantee.
+   */
+  it('ATTACK: a provider that stores nothing earns the full rate by declaring capacity', () => {
+    const HUGE_GB = 10_000;
+    const pl = registered(HUGE_GB, DAY - REWARD_EPOCH_MS);   // costs nothing to declare
+    fullDay(pl, 100, HUGE_GB * GB_BYTES);                    // self-reported, never verified
+
+    const terms = pl.rewardTerms(PUB, 100);
+    if (typeof terms === 'string') throw new Error(terms);
+    expect(terms.storedGB).toBe(HUGE_GB);
+    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * HUGE_GB);
+
+    // And the honest provider next door, holding 4 GB for real, earns 2500×
+    // less for doing actual work. The incentive points the wrong way.
+    const honest = registered(10, DAY - REWARD_EPOCH_MS);
+    fullDay(honest, 100, 4 * GB_BYTES);
+    const honestTerms = honest.rewardTerms(PUB, 100);
+    if (typeof honestTerms === 'string') throw new Error(honestTerms);
+    expect(terms.amount / honestTerms.amount).toBe(HUGE_GB / 4);
+  });
+
   it('caps payment at declared capacity — over-reporting bytes earns nothing extra', () => {
     const pl = registered(10, DAY - REWARD_EPOCH_MS);
     fullDay(pl, 100, 500 * GB_BYTES);   // claims to hold 50× what it offered
