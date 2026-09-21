@@ -126,74 +126,63 @@ test.describe('T9 — staging is durable', () => {
 });
 
 test.describe('T9 — repair', () => {
-  let a: Device, b: Device;
+  let a: Device, b: Device, c: Device;
 
   test.beforeAll(async () => {
-    test.setTimeout(600_000);
+    test.setTimeout(900_000);
     test.skip(!await testFaceAvailable(), TEST_FACE_HINT);
     a = await newAccountDevice('alice');
     b = await newAccountDevice('bob', { channel: 'msedge' });
+    // Two providers, because repair-on-read only becomes reachable once the
+    // publisher has HANDED OVER — which needs MIN_REPLICAS live holders.
+    c = await newAccountDevice('carol');
     await serveStorage(b);
+    await serveStorage(c);
   });
 
-  test.afterAll(async () => { await Promise.all([a?.close(), b?.close()]); });
+  test.afterAll(async () => { await Promise.all([a?.close(), b?.close(), c?.close()]); });
 
-  test('step 3 — a read failure repairs immediately, and step 4: one failure is not an eviction', async () => {
-    test.setTimeout(600_000);
+  test('the publisher hands over for real — handoff releases its own copy', async () => {
+    test.setTimeout(900_000);
     const cid = await uploadFile(a, `repair-${E2E_RUN}.bin`, 64 * 1024);
-    await b.log.waitFor(/\[StorageManager\] Cached /, 180_000);
 
-    // PRECONDITION, and currently an unmet one — see the note below.
-    //
-    // `repairOnReadFailure` returns immediately unless the node OWNS the cid
-    // (`!this.localKeys.has(tracked.ownerPub)` → return), so the uploader is the
-    // only node that can log `repairing now`. But a read only reaches the
-    // network when the block is not already local, and the uploader's copy is
-    // never dropped: handoff logs "safe to close" and emits an event, and
-    // nothing anywhere deletes the bytes. `clearCached()` will not do it
-    // either — its own doc comment says it "Leaves own uploaded blocks intact".
-    //
-    // So the one node that CAN repair always holds the content, and this step
-    // cannot fire on a network where the publisher never lets go. That is a gap
-    // between the custody rule ("the publisher keeps no copy by default and is
-    // not automatically a replica") and the implementation, which keeps the
-    // copy and merely stops counting it. Skipped with the reason rather than
-    // left to time out for five minutes against a condition that cannot occur.
-    await a.page.click('#btnClearCache');
-    await a.page.click('#btnClearCacheConfirm');
-    await a.page.waitForTimeout(3_000);
+    // Authorship is not custody. Until the release shipped, handoff logged
+    // "safe to close" and deleted nothing: the publisher stopped being COUNTED
+    // as a replica while still storing every byte it had ever uploaded.
+    await a.log.waitFor(/Handoff complete for/, 300_000);
+    const released = await a.log.waitFor(/Released own copy of/, 120_000);
+    expect(released).toMatch(/\d+ live holder\(s\) have custody/);
+    expect(released).toContain(cid.slice(0, 16));
 
-    const ownerStillHolds = await a.page.evaluate(async () => {
-      // OPFS is where the blocks live; if the root CID's blob survives a cache
-      // clear, the owner can still serve its own read.
-      try {
-        const root = await navigator.storage.getDirectory();
-        for await (const _ of (root as unknown as { keys(): AsyncIterable<string> }).keys()) return true;
-      } catch { /* OPFS unavailable */ }
-      return false;
-    }).catch(() => true);
-
-    test.skip(ownerStillHolds,
-      'the publisher still holds its own copy after handoff, and only the owner can trigger '
-      + 'repair-on-read — so this step is unreachable until a handed-off publisher drops its bytes '
-      + '(custody rule vs implementation; see the comment in this test)');
-
-    await b.close();
-    a.log.clear();
-
-    await a.page.fill('#retrieveCid', cid);
-    await a.page.selectOption('#retrieveContentFrom', { index: 0 });
-    await a.page.click('#btnRetrieveContent');
-
-    const line = await a.log.waitFor(/Read failed for .* repairing now/s, 300_000);
-    expect(line).toMatch(/\d+ live holder/);
-
-    // Step 4: a single failure must NOT evict. Two consecutive ones do — one
-    // flaky WebRTC dial is not evidence, and evicting on it made every relay
-    // hiccup start a repair round against holders that were fine.
-    a.log.none(/Evicting .* after 1 consecutive failure/);
-    expect(a.log.all(/Read failed for/).length).toBeGreaterThan(0);
+    // And it released against LIVE holders, never a remembered confirmation —
+    // releasing on "confirmed ever" deletes the last real copy.
+    expect(released).not.toMatch(/0 live holder/);
   });
+
+  // STEP 3+4 — repair on read failure — remain UNVERIFIED end to end, and the
+  // reason is now a different one from when this was written.
+  //
+  // The original blocker is fixed: the publisher used to keep its copy forever,
+  // so the only node allowed to repair (`repairOnReadFailure` returns early
+  // unless the node owns the cid) always had the bytes and no read could fail.
+  // It now releases at handoff, asserted above.
+  //
+  // What blocks it now is the retrieve path. The UI checks availability FIRST
+  // and only renders "Content not found" afterwards; `reportReadFailure` is
+  // wired into that branch, but against a cid with zero reachable holders the
+  // availability check does not return in any reasonable time — the panel sits
+  // on "Checking…" and the branch is never reached, so nothing is logged at
+  // all. Two things to decide, both Lucian's call:
+  //
+  //   1. `checkAvailability` needs a bounded deadline. "Checking…" forever is
+  //      the worst of both worlds: the user learns nothing and repair, which is
+  //      triggered by exactly this failure, never starts.
+  //   2. Whether an owner's read should consult the archives for holders
+  //      (`GET /providers`) before concluding the content is gone.
+  //
+  // Until then the repair POLICY is covered where it is testable:
+  // engine/content/custody.test.ts (live-only counting, two-strike eviction,
+  // rejoin discard) and engine/sim/repair.ts (repair-vs-churn, measured).
 });
 
 test.describe('T9 — the lease is what counts', () => {
