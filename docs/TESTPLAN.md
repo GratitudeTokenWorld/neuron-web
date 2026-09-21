@@ -10,7 +10,7 @@ needs a human is anything requiring a REAL face through the camera: T1's live
 capture, T5/T5.3 recovery (the synthetic path produces no trajectory proof, by
 design), and any judgement about how the capture UI actually looks and feels.
 
-**Test proportionately** (PRINCIPLES.md → 4b): run the rows a change touches,
+**Test proportionately** (PRINCIPLES.md → 4): run the rows a change touches,
 not the whole matrix; run the whole matrix before a deploy or a phase boundary.
 
 **Topology under test:** 2 cloud relays (super-node archive + attester each) +

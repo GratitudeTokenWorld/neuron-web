@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **556 tests / 74 files passing**, `npm run build` clean.
+Current baseline: **576 tests / 76 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -214,8 +214,10 @@ shipped this session. What is NOT done is verifying them on the live network.
    box, then check restart counts **after** 60 s, then run the probe.
 1. **Phase 4 — scale hardening.** This is where the remaining engineering is:
    archive backfill between relays (**demand-driven on a miss, never a
-   sync-on-rejoin**, which would be `O(archive)`), custody-proven incentive
-   payouts, adaptive limits, security bounds, and the sustained load test.
+   sync-on-rejoin**, which would be `O(archive)`), the storage incentive
+   decision (current direction: **remove payment**, throttle on locally-metered
+   reciprocity — CUSTODY-PROOFS.md, measured in `sim/reciprocity.ts`), adaptive
+   limits, security bounds, and the sustained load test.
 2. **Multi-device custody** (decided, unbuilt): per-device chains with an
    account-signed delegation. Settle the pseudonymous device-group tag first.
 3. **T8–T10 all run unattended now** (`npm run e2e`). T9 and T10 pass in full;

@@ -18,7 +18,7 @@ subsystem, security cannot be bought with latency: any mechanism that puts work
 on the read path is disqualified before its security is even discussed.
 
 This is not "performance outranks security here". Security still gates
-(PRINCIPLES.md → 4a). It is that **the security must be achieved INSIDE a
+(PRINCIPLES.md → 4). It is that **the security must be achieved INSIDE a
 latency budget the chain cannot meet** — which is what makes it, in Lucian's
 words, a problem needing "a very new approach" rather than a smaller version of
 the consensus one.
@@ -118,6 +118,129 @@ Two things that falls out of it:
 H1 and H3 are measurable in `sim/` today with a read-distribution model; H4 is
 a variant of the existing `sim/repair.ts` churn harness. **None have been run.**
 Stating them unrun is the point — the design is a hypothesis, not a result.
+
+---
+
+## Paying per read and per write — and then not paying at all (2026-09-21)
+
+Lucian's proposal: **remove heartbeat payment entirely and pay for successful
+reads and writes instead, especially reads.** Keep a balance for those two
+statistics the way a coin balance is kept; on each successful retrieval, signal
+size, time taken and anything else relevant; compress the values; and store them
+somewhere the update **replaces** the value rather than appending a block.
+
+The instinct is right, and the "replace, don't append" requirement is the load-
+bearing part of it. Worked through, it splits into three findings.
+
+### 1. "Replace, don't append" has a name: a monotone counter per pair
+
+The mechanism that makes an update a real update is a **monotone counter
+receipt per (reader, provider) pair**. Receipt *N* supersedes *N−1*, so a
+thousand reads between the same two parties collapse to **one** stored receipt:
+the newest. State becomes `O(distinct counterparties)` instead of
+`O(interactions)`, and settlement collapses it again — many receipts into one
+on-chain transfer. That is why it can beat an ordinary token transaction: it is
+an aggregation layer, and its compression ratio is reads ÷ settlements. Nothing
+appends; the newest signed counter simply overwrites the previous one, and an
+old receipt is not evidence of anything because a higher one exists.
+
+`sim/storage-accounting.ts` already measured the settlement half: 120 blocks per
+provider per decade at a monthly cadence, versus 25,550 for the heartbeat
+design, and **zero when the network is quiet**.
+
+### 2. Who pays decides whether it is attackable — and one field must never meter payment
+
+Black-hat pass on the receipt design:
+
+- **If the network MINTS per read**, a reader and a provider collude to
+  fabricate reads and it is free money. This is unfixable by any receipt
+  scheme, because every receipt in the fraud is honestly signed by a real
+  identity over a real counter. The signature is not the weak part; the
+  *funding* is.
+- **If the PUBLISHER pays** for distribution of their own content — the way a
+  site pays for bandwidth — collusion becomes self-dealing: you pay yourself
+  and lose the fee. Readers still read for free, so Principle 1's access
+  commitment is untouched.
+- **"Time it took to retrieve" is self-reported and unverifiable.** It may
+  inform routing and local reputation, where gaming it buys you more traffic
+  and therefore costs you bandwidth. It must never meter a payout
+  (SCREENING.md → 11 is the same defect, already open).
+
+### 3. The stronger move is to remove the payment as well — measured
+
+Applying "what can be REMOVED" one step further: delete the money, and throttle
+reads and writes against a **pairwise, locally-metered reciprocity budget** that
+rises with demonstrated good behaviour. Serving a peer earns credit *with that
+peer and nobody else*; spending credit is how you get served.
+
+Screened security-first (PRINCIPLES.md → 4), this is not a cheaper payment, it
+is a smaller attack surface:
+
+- **Nothing mintable, so nothing to steal.** SCREENING.md → 11 (rewards metered
+  by self-report) *disappears* rather than being patched: a lie about bytes held
+  buys credit only in the liar's own books.
+- **Credit is local and non-transferable, so collusion buys nothing.** Two nodes
+  inflating each other change no third node's budget. The attack that defeats
+  every receipt design is structurally absent instead of defended against — and
+  the mirror image holds too: nobody can *lower* a competitor's standing with
+  anyone else, so there is no reputation-poisoning attack either.
+- **Observation replaces testimony.** A budget rises because of transfers the
+  node performed itself, verified by content-address before credit is granted.
+  No claim to forge, because no claim is made.
+
+Measured in `sim/reciprocity.ts` (H-P2, falsifier: free-riders obtaining what
+contributors get, or a newcomer starving). Contributors are served **~8× better
+than free-riders**, an honest newcomer joining with no history overtakes a
+free-rider within the run, and the floor holds. Three failure modes were found
+by *running* it, and each is kept as a control:
+
+| Variant | Contributor | Free-rider | Why it fails |
+|---|---|---|---|
+| **Design** (mutual, sticky, per-server floor) | 0.42 | 0.05 | — |
+| Free floor granted **per stranger** | 0.65 | 0.54 | A subsidy keyed by something the attacker picks: spread requests thin and free-riding is free |
+| **Uniform** partner selection | 0.21 | 0.01 | Credit never accumulates if you never meet the same peer twice — the *ratio* looks superb while everyone starves |
+| Relationships **one-directional** | 0.19 | 0.03 | Earning credit where you never spend it |
+
+Two design requirements fall out, and neither was obvious beforehand:
+
+- **Partner selection must be sticky.** The uniform case is the one that looks
+  healthiest by ratio and is second-worst by service — the identical trap as
+  repair-vs-churn, where a collapsed network reads as a fine ratio. Judge the
+  stock, never the ratio.
+- **Custody assignments should be PAIRED.** Reciprocity needs demand in both
+  directions; a provider serving readers who have nothing it wants is exactly
+  why storage markets normally reach for money. Pairing makes storage payable in
+  storage. This is a concrete, testable change to how holders are assigned.
+
+**The conflict, stated out loud as Principle 4 requires:** reciprocity is
+exclusionary by nature and Principle 1 is about ACCESS. A sensor or a phone has
+little to give back. The `newPeerPrior` floor — an unconditional per-server
+allowance every peer gets before it has done anything — is where the principle
+lives, and `freeridersKeepTheFloor` is the test that the mechanism has not eaten
+it. The floor must be a **per-server budget shared among strangers**, never a
+per-stranger grant; the table above is what the per-stranger form costs.
+
+**Residual attacks, honestly ranked:**
+
+1. **Whitewashing.** A free-rider whose credit decays simply makes a new
+   identity and resets to the floor. The defence is the nullifier: a new
+   identity costs a human. This is one-human-one-account doing load-bearing
+   economic work, not just consensus work.
+2. **Sybil floor-farming.** The floor is a subsidy, so `identities × servers ×
+   newPeerPrior` is free service per round. It must stay small enough that a
+   Sybil fleet's aggregate is affordable — the floor is a security parameter,
+   not a generosity setting.
+3. **Eclipse via the working set.** Sticky partners are what make credit work
+   and also what an attacker wants to fill. Working sets must stay diverse and
+   partly refreshed; no peer may become a sole source.
+
+**Recommendation: remove payment for now**, as Lucian suggested, and build the
+throttle. It is strictly less attack surface than any payment design, it removes
+2,555 blocks/provider/year, and it can be replaced by the receipt design later
+if reciprocity proves insufficient — whereas a minted currency is very hard to
+take back. What is NOT yet measured: whether reciprocity holds when demand is
+genuinely one-sided at scale (H-P3, unrun) and the read-frequency distribution
+behind H1/H3 above.
 
 ---
 

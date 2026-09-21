@@ -204,6 +204,15 @@ through the trinity and then attacked in
 
 ---
 
+**Direction as of 2026-09-21 — remove the payment rather than prove the claim.**
+Measured in `sim/reciprocity.ts`: throttling reads and writes against a
+pairwise, locally-metered reciprocity budget serves contributors ~8× better than
+free-riders with no mintable value anywhere in the system, which makes this
+finding *disappear* instead of being patched — there is no payout left for a
+self-report to meter. Full option space, the black-hat pass and the three
+measured failure modes: [CUSTODY-PROOFS.md](CUSTODY-PROOFS.md) → *Paying per
+read and per write — and then not paying at all*. Not yet decided or built.
+
 ## The invariant has two dimensions (2026-09-21)
 
 A technical refinement of the scale invariant, not a new principle — the goal
@@ -272,6 +281,35 @@ The screening checklist this produces is [SCREENING.md](SCREENING.md).
 5. **Bounded, archival history.** Never silently destroy data (today's prune
    does); move cold history to content-addressed archival held by super-nodes,
    committed by Merkle root.
+
+### What the core principles rule OUT, concretely
+
+PRINCIPLES.md states intent; these are the constraints that intent imposes on
+this design, and they are the form the principles actually take in review.
+
+- **From Principle 1 (access).** No platform-exclusive build. No licence term
+  restricting who may run or fork it. No dependency that exists on only one OS.
+  No resource floor that quietly excludes small devices — an IoT node has little
+  storage, little CPU, intermittent power and a poor link, and the scale
+  invariant is what lets it participate at all: a node obliged to hold
+  `O(total network)` can never be a sensor.
+  Its accessibility corollary: the biometric gate establishes **personhood, not
+  worthiness**. A face that captures poorly on a cheap camera in bad light is an
+  accessibility bug, not an invalid user — see CLAUDE.md → *Face matching*, and
+  the measured finding that cross-session distance, not luminance, is what
+  decides recoverability.
+- **From Principle 2 (free and open).** The storage layer may never *require* an
+  object store and no default config may point at a commercial one (the
+  filesystem backend is the zero-dependency bottom layer and the CI target; S3
+  is opt-in and operator-configured). Engine modules stay dependency-light
+  (`@noble/*` only) for the same reason: every dependency is a party that could
+  later charge rent or vanish.
+- **From Principle 3 (progressive decentralisation).** A shortcut is only
+  legitimate with an entry on CLAUDE.md's *Remove before production* list, a
+  structural guarantee it cannot ship, and a named replacement beside it — the
+  dev relay proxy is the worked example. And because the operator vote does not
+  exist yet, any change to consensus-visible behaviour is a change to something
+  that will eventually need ratifying: keep it small, reversible and documented.
 
 ---
 
@@ -862,6 +900,68 @@ predicted:
   for a scale it does not have. Applied to the provider poll and the spot-check
   sweep — the two fixed cadences this section warned about.
 
+### Fan-IN at a billion followers (measured 2026-09-21)
+
+Lucian's question: what happens to an account with 1B followers? The Fan-IN
+doctrine above covers popular *answers*; it does not cover a popular
+*recipient*. Measured in `sim/fan-in.ts`, run in the unit suite.
+
+**Following is free, and that is structural rather than lucky.** A follow is
+local state — `Subscription.follow` writes to an in-memory Set and publishes
+nothing. No follow block, no follower list, no counter. A famous account stores
+zero bytes per follower and its chain does not grow when someone follows it. The
+scale invariant holds exactly where the pressure is greatest.
+
+Three things are NOT free, and they are separate problems:
+
+**1. Inbound messages — the real fan-in.** Replies, mentions and transfers each
+differ, so "identical answers absorb fan-in" does not apply: no cache serves a
+million distinct messages as one. The bound is that **inbound is a queue the
+receiver samples, never a list it must drain**:
+
+- An unclaimed send stays on the SENDER's chain, where it was already written
+  and already paid for. It costs the receiver nothing until the receiver
+  chooses to claim it. (This is already how `GET /pending-sends` works — the
+  design was right before the reason for it was written down.)
+- The receiver applies its own **admission rate**, and that rate is a ceiling,
+  not a charge: a quiet account pays for what it actually received.
+
+| Senders over 30 days | Receiver blocks if it claims everything | Under a 200/day admission rate |
+|---|---|---|
+| 1,000 | 1,000 | 1,000 |
+| 1,000,000,000 | 1,000,000,000 | **6,000** |
+
+The measured property is the asymmetry: doubling the admission rate doubles the
+cost, multiplying the audience by 10⁶ changes it by zero.
+
+**2. The archive's pending-send index is the O(senders) structure.** The client
+is fine; the relay is not, and this is where the cost actually lands. It needs
+a per-recipient cap — but **a bare cap is itself the attack**: with 1,000 slots,
+1,000 dust sends from one account evict every real pending payment. The cap must
+therefore carry a **per-sender share**, which prices eviction in *identities*
+rather than in messages: at 1,000 slots and 4 per sender, flooding costs 250
+identities, and an identity costs a nullifier — i.e. a human. That is the one
+Sybil price this system charges, and here it is doing real work.
+
+Eviction is also **recoverable rather than destructive**: the sender still holds
+the block and can re-present it through `GET /head-proof`. The index is a
+convenience for discovery, never a delivery guarantee, and nothing may be built
+that assumes otherwise.
+
+**3. Aggregate stats: a follower count is undefined, not merely expensive.**
+Because follows are local and never published, **no party anywhere holds the
+input** to the sum. The only observable trace is shard subscription, and a shard
+covers ~2.4M accounts at the 10B target — that is not a follower count, and its
+coarseness is a privacy property as much as a measurement limit.
+
+Publishing follows would make the number computable, and it is exactly the
+`O(N)` design this project has already removed three times (G1, G3, the file
+index). So: **display `—`**, per *never render the unmeasured as fact*. What can
+honestly replace it is a **windowed interaction count** — "N accounts interacted
+with this one in the last 30 days" — computed from what archives already hold
+and bounded by the admission rate times the window, with the audience absent
+from the formula entirely.
+
 ### Multi-device custody: per-device chains (DECIDED 2026-08-16)
 
 **Decision (Lucian):** an account may serve storage from MANY devices. Declared
@@ -1164,7 +1264,7 @@ caller, as each is moved off the `DAGLedger` compatibility surface —
   they got their own `peerRelayHttpBase`. Making one function serve both would
   have quietly grown every client's query set to satisfy a relay's need.
 
-Run per PRINCIPLES.md → 4a, because a subsystem's behaviour changed in a way
+Run per PRINCIPLES.md → 4 (trigger list in SCREENING.md → Using this), because a subsystem's behaviour changed in a way
 other nodes can observe: relays now PUT something on the wire that they never
 did before.
 
@@ -1522,6 +1622,19 @@ indicator needs an inbox ack.
   can't be cheaply simulated by idle/scripted accounts (else age farming returns).
 - **Identity-commitment registry** is itself global state — keep it tiny
   (nullifiers only) and shardable, or anchor it externally if it grows.
+- **Governance is unbuilt, and must not be assumed away.** Principle 3 commits
+  to changes being ratified by a majority of node operators. Neither half
+  exists: (a) the **cross-node code-sync / upgrade path**, which is itself a
+  place a required party could enter unnoticed, since whoever publishes the
+  upgrade is trusted by everyone who applies it; and (b) the **operator vote** —
+  who counts as an operator, how a vote is weighted without recreating
+  one-machine-one-vote Sybil exposure, and how a node refuses an upgrade it did
+  not ratify.
+- **Moderation is undecided, and is a protocol question as much as a policy
+  one.** Principle 1 is about access to the technology, so it does not by itself
+  settle what the network does about abusive *content*. Nothing here has been
+  chosen, and choosing badly is irreversible in a system with no required party
+  to appeal to.
 - **Super-node incentives & shard security** (takeover/eclipse) are the make-or-break
   operational risks; the bonded-stake + slashing + beacon-randomized-committee design
   addresses the economics, but the residual risks now move to: **slashing/fraud-proof

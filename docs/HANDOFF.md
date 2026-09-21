@@ -78,8 +78,13 @@ provider/uploader collusion is unfixable by any proof) or the uploader pays.
 1. **Phase 4 — the rest of scale hardening.** Backfill for the OTHER archive
    stores (account directory, pending sends, file index, provider records — each
    has its own store and no peer-query mechanism yet; same demand-driven rule,
-   never a sync). Then custody-proven incentive payouts, adaptive limits,
-   security bounds, and the sustained load test.
+   never a sync). Then the storage incentive decision — the current direction
+   is to REMOVE payment and throttle on reciprocity instead of proving custody
+   for a payout (CUSTODY-PROOFS.md → *Paying per read and per write*, measured
+   in `sim/reciprocity.ts`) — plus adaptive limits, security bounds, and the
+   sustained load test. Receiver-side inbound admission and the per-sender share
+   of the pending-send index belong here too (ARCHITECTURE.md → *Fan-IN at a
+   billion followers*).
 2. **Multi-device custody** (decided, unbuilt): per-device chains with an
    account-signed delegation. Settle the pseudonymous device-group tag first.
 3. **The migration seam**, per caller — 121 app-layer type errors.
@@ -147,7 +152,7 @@ provider/uploader collusion is unfixable by any proof) or the uploader pays.
 1. **The pseudonymous device-group tag.** Per-device chains need SOME linkage
    for the replica rule, and unlinkability fights bounded minting.
    ARCHITECTURE.md → *Multi-device custody*.
-2. **The operator vote and the code-sync/upgrade path** (PRINCIPLES.md → 3e).
+2. **The operator vote and the code-sync/upgrade path** (PRINCIPLES.md → 3; ARCHITECTURE.md → Hard problems).
    Both are stated commitments with no design at all, and every
    consensus-visible change quietly accrues debt against them.
 3. **Moderation.** Principle 1 is about access to the technology, so it does not

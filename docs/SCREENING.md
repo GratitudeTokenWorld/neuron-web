@@ -45,6 +45,12 @@ finding, not a performance one.
   twice: `BackfillLimiter` kept every key nothing ever answered, and the
   relay's three per-IP maps were never pruned at all — with IPv6, a single /64
   gives 2^64 keys.
+- **A per-key ALLOWANCE is the same shape as per-key state.** A free
+  allowance granted *per stranger* is a subsidy keyed by something the attacker
+  chooses, so spreading requests across peers makes it unlimited. Measured in
+  `sim/reciprocity.ts`: the per-stranger floor erases the difference between a
+  contributor and a free-rider entirely. A floor must be a budget the SERVER
+  has, shared among strangers.
 - Bounded at an instant ≠ bounded over time. `O(own + followed)` describes a
   moment; a map that only ever grows satisfies it at every instant and still
   exhausts the box. See ARCHITECTURE.md → *The invariant has two dimensions*.
@@ -135,13 +141,30 @@ custody-proven payouts, which is an economic design decision, not a patch.
 
 ### 12. Numbers without provenance
 
-Every estimate, calculation and projection carries its method (PRINCIPLES.md
-→ 5): hypothesis first, inputs labelled MEASURED / ASSUMED / DERIVED,
-sensitivity shown, reproducible in `src/engine/sim/` rather than asserted in
-prose. A projection presented as a measurement is the analysis-side version of
+The procedure PRINCIPLES.md → 5 requires. Every estimate, calculation and
+projection must:
+
+- **State the hypothesis first, and what result would DISPROVE it.** An
+  analysis that cannot fail is the same defect as a test that cannot fail
+  (§4 above), and it hides just as well.
+- **Label every input MEASURED, ASSUMED or DERIVED**, and say where a measured
+  one came from. `sim/projection.ts` does this properly: it takes the canonical
+  byte counts of real signed objects, and says so.
+- **Never present a projection as a measurement.** "Measured baseline" and "10B
+  projection" are different kinds of knowledge, and the second is only ever as
+  good as its assumptions.
+- **Show the sensitivity.** If the conclusion flips when an assumption moves by
+  2×, the conclusion is about the assumption, not about the system.
+- **Be reproducible.** A number that lives only in a chat message is an opinion;
+  the same number as a runnable module is evidence. It goes in
+  `src/engine/sim/`, where it re-runs with the suite and its inputs are visible.
+- **Re-measure when the system changes.** A stale constant is an assumption
+  wearing a measurement's clothes.
+
+A projection presented as a measurement is the analysis-side version of
 rendering the unmeasured as fact — and is committed just as easily:
 `storage-accounting.test.ts` hardcoded a block size and called it measured, in
-the file written to expose exactly that.
+the very file written to expose that failure.
 
 ### 13. Trusting a claim as proof
 
@@ -186,8 +209,22 @@ Ordered by what would hurt most, not by ease.
 
 ## Using this
 
-- Screen at the points PRINCIPLES.md → 4a lists (after a batch, when
-  other-node-visible behaviour changes, before a new phase).
+**When the self-review is due** (PRINCIPLES.md → 4 says it is required; this is
+when). Any one of these is a trigger:
+
+- a batch of meaningful changes has landed — roughly, enough that you would
+  write a handoff note about it;
+- a subsystem's behaviour changed in a way another node can observe;
+- a shortcut was taken that needs an entry on CLAUDE.md's *Remove before
+  production* list; or
+- a new phase of work is about to start.
+
+Re-read the work against the principles rather than against the tests: the
+question is not "does it pass?" but "does this still build the thing the
+principles describe?". Write the result where the decision lives — usually
+ARCHITECTURE.md or the relevant section of CLAUDE.md — and raise anything that
+fails the filter with Lucian instead of fixing it silently.
+
 - A finding that fails **security** stops the change. One that fails
   performance or decentralisation gets written down and weighed.
 - When something escapes anyway, add it here with what it cost. That is the
