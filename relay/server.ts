@@ -1926,8 +1926,16 @@ async function main() {
       pubsub.publish(topic, new TextEncoder().encode(JSON.stringify({ blockHex: r.blockHex }))).catch(() => {});
     }
     // Log every request (even 0) so we can tell "request never arrived" from
-    // "archive had nothing for this account".
-    dlog(`[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`);
+    // "archive had nothing for this account" — the ambiguity that cost a full
+    // debugging round when backfill requests were silently landing nowhere.
+    //
+    // Serving something is NOT debug-only: it is one line per actual heal, and
+    // it is the only evidence from outside that the backfill loop closes rather
+    // than just asking. The empty case stays behind DEBUG_ARCHIVE because a
+    // relay answers "nothing for that account" constantly.
+    const line = `[Archive] Delta req acct=${accountId.slice(0, 12)}… shard=${shard} `
+      + `have=${haveIndex} → served ${matches.length}/${engineBlockStore.size}`;
+    if (matches.length > 0) console.log(line); else dlog(line);
   }
 
   pubsub.addEventListener('message', (evt) => {
