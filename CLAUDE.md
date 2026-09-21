@@ -27,7 +27,9 @@ Read it before anything else here; the short form:
    Security first is a gate, not a weighting: a faster or more decentralised
    design that weakens security is rejected, not traded. What to screen for and
    what to stress-test: [docs/SCREENING.md](docs/SCREENING.md) — every entry
-   is a defect that actually shipped.
+   is a defect that actually shipped. **When the work is security, ATTACK it:**
+   the `black-hat-review` skill is the posture and the target list. Dev mode is
+   the window — find it before the real ones do on mainnet.
 5. **The principles evolve with Lucian.** Ask for his input, propose changes,
    and treat a principle that keeps needing an exception as the thing that is
    wrong.

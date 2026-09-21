@@ -58,6 +58,17 @@ Read in this order — do NOT re-derive what they already record:
 - **Phase 4 started**: archive backfill between relays, demand-driven on a miss
   and rate-limited, deployed and verified live.
 
+## Open security finding — read before touching rewards
+
+**Storage rewards are self-metered.** The payout is
+`BASE_RATE × min(storedGB, capacityAtStart) × uptime` and both volume terms
+come from the provider itself, validated against the same self-report. A
+provider that stores nothing out-earns an honest 4 GB one by 2500×, so the
+rational strategy is to store nothing. Demonstrated as an adversarial control
+in `provider-ledger.test.ts`; when custody-proven payouts land, that test
+should FAIL and be rewritten as the guarantee. ARCHITECTURE.md → *Open
+security finding*. **Not fixed — it is an economic design decision.**
+
 ## Your next task, in this order
 
 1. **Phase 4 — the rest of scale hardening.** Backfill for the OTHER archive
