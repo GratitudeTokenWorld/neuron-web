@@ -246,27 +246,91 @@ export function planRejoin(args: {
   released?: ReadonlySet<string>;
 }): RejoinPlan {
   const { offlineMs, held, released } = args;
+  const lapsed = offlineMs >= MAX_OFFLINE_MS;
 
-  if (offlineMs >= MAX_OFFLINE_MS) {
-    return {
-      keep: [],
-      discard: [...held],
-      lapsed: true,
-      reason: `lease lapsed ${fmtSpan(offlineMs)} ago `
-        + `(max ${fmtSpan(MAX_OFFLINE_MS)}) — content re-homed, discarding ${held.length} CID(s)`,
-    };
-  }
-
+  // KEEP THE BYTES. Reversed 2026-09-21 (Lucian's call).
+  //
+  // This used to discard every foreign byte once the lease had lapsed, on the
+  // reasoning that the network had re-homed the content so holding an uncounted
+  // copy was waste. That is tidiness winning over durability, and it is the
+  // wrong trade: over-replication is cheap and safe, under-replication is the
+  // risk, and the discarded bytes were redundancy the network had already spent
+  // bandwidth creating. Deleting them converts a returning node from "extra
+  // resilience, free" into "a node that must be re-fed".
+  //
+  // The decentralisation leg optimises for FLEXIBILITY and the speed at which
+  // the network restores redundancy — cleanup is secondary
+  // (PRINCIPLES.md → 3, CUSTODY-PROOFS.md → Reframe). So a lapsed lease stops
+  // the copy COUNTING toward `REDUNDANCY_TARGET`; it does not stop it existing
+  // or serving. Space is reclaimed under real pressure instead — `planEviction`.
+  //
+  // What a lapse still means, unchanged: `liveHolders` must not count this node,
+  // or the durability figure becomes a guess again.
   const keep: string[] = [];
   const discard: string[] = [];
   for (const cid of held) (released?.has(cid) ? discard : keep).push(cid);
+
   return {
     keep,
     discard,
-    lapsed: false,
-    reason: discard.length > 0
-      ? `lease live — keeping ${keep.length} CID(s), dropping ${discard.length} released by their owner`
-      : `lease live — keeping all ${keep.length} CID(s), no re-transfer needed`,
+    lapsed,
+    reason: lapsed
+      ? `lease lapsed ${fmtSpan(offlineMs)} ago (max ${fmtSpan(MAX_OFFLINE_MS)}) — `
+        + `keeping ${keep.length} CID(s) as uncounted spare redundancy`
+        + (discard.length > 0 ? `, dropping ${discard.length} released by their owner` : '')
+      : discard.length > 0
+        ? `lease live — keeping ${keep.length} CID(s), dropping ${discard.length} released by their owner`
+        : `lease live — keeping all ${keep.length} CID(s), no re-transfer needed`,
+  };
+}
+
+/**
+ * What to delete when the disk is actually full.
+ *
+ * This is where cleanup belongs: driven by SPACE PRESSURE, not by a clock. A
+ * node discards only as much as it must to get back under its declared
+ * capacity, and it discards the least useful bytes first.
+ *
+ * Order of sacrifice, least valuable first:
+ *  1. CIDs their owner released — nobody wants these at all.
+ *  2. Copies whose lease has lapsed (uncounted spares) — losing one costs the
+ *     network nothing it is counting on.
+ *  3. Leased copies, oldest-touched first — only if the first two were not
+ *     enough, because dropping one of these really does reduce redundancy.
+ *
+ * Returns the CIDs to delete, in order, stopping as soon as enough space is
+ * freed. Deleting more than necessary is the behaviour this replaces.
+ */
+export function planEviction(args: {
+  /** Bytes currently used. */
+  usedBytes: number;
+  /** Bytes this node offered to provide. */
+  capacityBytes: number;
+  /** Candidates with their size and status, in any order. */
+  held: ReadonlyArray<{ cid: string; bytes: number; leased: boolean; releasedByOwner?: boolean; lastTouched?: number }>;
+}): { evict: string[]; freedBytes: number; reason: string } {
+  const over = args.usedBytes - args.capacityBytes;
+  if (over <= 0) {
+    return { evict: [], freedBytes: 0, reason: 'within declared capacity — nothing to evict' };
+  }
+
+  const rank = (h: { leased: boolean; releasedByOwner?: boolean }): number =>
+    h.releasedByOwner ? 0 : h.leased ? 2 : 1;
+  const ordered = [...args.held].sort((a, b) =>
+    rank(a) - rank(b) || (a.lastTouched ?? 0) - (b.lastTouched ?? 0));
+
+  const evict: string[] = [];
+  let freed = 0;
+  for (const h of ordered) {
+    if (freed >= over) break;
+    evict.push(h.cid);
+    freed += h.bytes;
+  }
+  return {
+    evict,
+    freedBytes: freed,
+    reason: `over capacity by ${Math.round(over / 1e6)}MB — evicting ${evict.length} CID(s) `
+      + `(released first, then uncounted spares, then leased)`,
   };
 }
 

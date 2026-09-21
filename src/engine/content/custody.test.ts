@@ -8,6 +8,7 @@ import {
   replicaTarget,
   planRepair,
   planRejoin,
+  planEviction,
   mayReleasePublisherCopy,
   pollIntervalMs,
   CustodySignals,
@@ -120,16 +121,32 @@ describe('planRepair', () => {
 describe('planRejoin', () => {
   const held = ['cidA', 'cidB', 'cidC'];
 
-  it('discards everything foreign once the lease has lapsed', () => {
+  it('KEEPS everything foreign when the lease has lapsed — reversed 2026-09-21', () => {
+    // This asserted the opposite until Lucian reversed it. Discarding on lapse
+    // is tidiness beating durability: those bytes are redundancy the network
+    // already paid bandwidth to create, and deleting them turns a returning
+    // node from free resilience into a node that must be re-fed. Over-
+    // replication is cheap; under-replication is the risk.
     const plan = planRejoin({ offlineMs: MAX_OFFLINE_MS, held });
     expect(plan.lapsed).toBe(true);
-    expect(plan.keep).toEqual([]);
-    expect(plan.discard).toEqual(held);
+    expect(plan.keep).toEqual(held);
+    expect(plan.discard).toEqual([]);
+    expect(plan.reason).toMatch(/uncounted spare redundancy/);
   });
 
-  it('discards after a long absence even when nothing was released', () => {
+  it('keeps them however long the absence was', () => {
     const plan = planRejoin({ offlineMs: 30 * 24 * HOUR, held, released: new Set() });
-    expect(plan.discard).toHaveLength(3);
+    expect(plan.keep).toHaveLength(3);
+    expect(plan.discard).toHaveLength(0);
+  });
+
+  it('still drops what the OWNER released, lapsed or not', () => {
+    // The one thing a lapse does not excuse: content its owner withdrew is
+    // wanted by nobody, so keeping it is pure waste rather than spare
+    // redundancy.
+    const plan = planRejoin({ offlineMs: MAX_OFFLINE_MS, held, released: new Set(['cidB']) });
+    expect(plan.discard).toEqual(['cidB']);
+    expect(plan.keep).toEqual(['cidA', 'cidC']);
   });
 
   it('keeps everything for a restart inside the lease — a reboot costs no re-transfer', () => {
@@ -179,6 +196,68 @@ describe('planRejoin', () => {
   it('still reads in hours at production timing', () => {
     const reason = planRejoin({ offlineMs: MAX_OFFLINE_MS, held }).reason;
     expect(reason).toMatch(/lapsed 12h ago \(max 12h\)/);
+  });
+});
+
+describe('planEviction', () => {
+  const MB = 1_000_000;
+
+  it('does nothing while inside declared capacity', () => {
+    // Cleanup is driven by SPACE PRESSURE, never by a clock. This is the whole
+    // point of the rejoin reversal: bytes are kept until they actually cost
+    // something.
+    const plan = planEviction({
+      usedBytes: 500 * MB,
+      capacityBytes: 1_000 * MB,
+      held: [{ cid: 'a', bytes: 500 * MB, leased: true }],
+    });
+    expect(plan.evict).toEqual([]);
+    expect(plan.reason).toMatch(/within declared capacity/);
+  });
+
+  it('sacrifices owner-released bytes first, then uncounted spares, then leased', () => {
+    const plan = planEviction({
+      usedBytes: 400 * MB,
+      capacityBytes: 100 * MB,
+      held: [
+        { cid: 'leased', bytes: 100 * MB, leased: true },
+        { cid: 'spare', bytes: 100 * MB, leased: false },
+        { cid: 'released', bytes: 100 * MB, leased: true, releasedByOwner: true },
+        { cid: 'spare2', bytes: 100 * MB, leased: false },
+      ],
+    });
+    // Nobody wants the released one; losing a spare costs the network nothing
+    // it is counting on; the leased copy is the last resort because dropping it
+    // genuinely lowers redundancy.
+    expect(plan.evict[0]).toBe('released');
+    expect(plan.evict.slice(1, 3).sort()).toEqual(['spare', 'spare2']);
+    expect(plan.evict).not.toContain('leased');
+  });
+
+  it('stops as soon as it is back under capacity, never evicting more', () => {
+    const plan = planEviction({
+      usedBytes: 250 * MB,
+      capacityBytes: 200 * MB,
+      held: [
+        { cid: 'a', bytes: 50 * MB, leased: false },
+        { cid: 'b', bytes: 50 * MB, leased: false },
+        { cid: 'c', bytes: 50 * MB, leased: false },
+      ],
+    });
+    expect(plan.evict).toHaveLength(1);
+    expect(plan.freedBytes).toBe(50 * MB);
+  });
+
+  it('breaks ties by least recently touched', () => {
+    const plan = planEviction({
+      usedBytes: 200 * MB,
+      capacityBytes: 100 * MB,
+      held: [
+        { cid: 'fresh', bytes: 100 * MB, leased: false, lastTouched: 9_000 },
+        { cid: 'stale', bytes: 100 * MB, leased: false, lastTouched: 1_000 },
+      ],
+    });
+    expect(plan.evict[0]).toBe('stale');
   });
 });
 

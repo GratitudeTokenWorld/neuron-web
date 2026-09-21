@@ -565,9 +565,14 @@ export class StorageManager extends EventEmitter {
       // never renewed — the same clock `ProviderLedger.isLive` reads.
       const since = provider.lastHeartbeat > 0 ? provider.lastHeartbeat : provider.registeredAt;
       const plan = planRejoin({ offlineMs: now - since, held: await this.store.listCached() });
+      // Say what happened even when nothing is deleted. Since the reversal
+      // (2026-09-21) a lapsed lease KEEPS its bytes as uncounted spare
+      // redundancy, so "nothing to discard" is the normal, interesting case —
+      // and a silent return here would make a rejoin indistinguishable from a
+      // node that never came back.
+      if (plan.lapsed) console.log(`[StorageManager] Rejoin ${pub.slice(0, 12)}…: ${plan.reason}`);
       if (plan.discard.length === 0) continue;
 
-      console.log(`[StorageManager] Rejoin ${pub.slice(0, 12)}…: ${plan.reason}`);
       // `listCached()` is foreign content only — a node's own uploads live under
       // /blocks/ without a /cached/ marker — so this never touches the CIDs this
       // node is the owner and distributor of.

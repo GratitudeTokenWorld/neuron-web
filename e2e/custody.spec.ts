@@ -285,10 +285,15 @@ test.describe('T9 — the lease is what counts', () => {
     // clock, the same defect family as `LAST REWARD -59066340h ago`, and it is
     // the only line that explains why a node just erased its disk.
     expect(rejoin).not.toMatch(/\b0h\b/);
-    expect(rejoin).toMatch(/discarding \d+ CID\(s\)/);
+    // Reversed 2026-09-21: a lapsed lease KEEPS its bytes as uncounted spare
+    // redundancy rather than discarding them. This asserted `discarding N
+    // CID(s)` until then — the old rule deleted redundancy the network had
+    // already paid bandwidth to create.
+    expect(rejoin).toMatch(/keeping \d+ CID\(s\) as uncounted spare redundancy/);
 
-    // And the discarded bytes are really gone, not merely uncounted.
-    expect(rejoin).toMatch(/content re-homed/);
+    // They are UNCOUNTED, not gone: the bytes stay and keep serving while
+    // `liveHolders` refuses to count them toward REDUNDANCY_TARGET.
+    expect(rejoin).toMatch(/lease lapsed/);
   });
 });
 

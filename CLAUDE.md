@@ -232,8 +232,14 @@ below).
 - **Durability is a FLOW property.** Content survives because the network
   re-distributes the minimum replica count faster than holders are lost
   (repair ≥ churn) — not because many copies exist.
-- **Replicas are held under a liveness LEASE, not owned.** Discard + refill
-  from declared capacity after `MAX_OFFLINE`.
+- **Replicas are held under a liveness LEASE, not owned** — but a lapsed lease
+  stops a copy COUNTING, not existing. **Reversed 2026-09-21:** a returning node
+  KEEPS its foreign bytes as uncounted spare redundancy and goes on serving
+  them; only content its owner released is dropped. Space is reclaimed under
+  real pressure (`planEviction`), never on a clock. Discarding on lapse was
+  tidiness beating durability — it deleted redundancy the network had already
+  paid bandwidth to create. Over-replication is cheap; under-replication is the
+  risk (PRINCIPLES.md → 3, CUSTODY-PROOFS.md → Reframe).
 - **Authorship is not custody.** Published content is handed to the network;
   the publisher keeps no copy by default and is not automatically a replica
   (except while the network finishes replicating it). Ownership is on-chain,

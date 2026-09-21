@@ -449,7 +449,12 @@ devices — this header said two because it predates the decision.
    first failure; only a second consecutive failure logs
    `Evicting <pub>… after 2 consecutive failures`. A single failure followed by a
    success must leave the holder set unchanged.
-5. **Rejoin past the lease discards.** (A restart here means a restart: a
+5. **Rejoin past the lease KEEPS (reversed 2026-09-21).** It used to discard;
+   it now retains the bytes as uncounted spare redundancy and says so
+   (`keeping N CID(s) as uncounted spare redundancy`). The lapse still stops
+   the copy COUNTING toward `REDUNDANCY_TARGET` — that is step 6 — it just no
+   longer deletes redundancy the network paid to create. Space is reclaimed
+   under real pressure (`planEviction`), never on a clock. (A restart here means a restart: a
    browser profile that keeps its IndexedDB. A context re-opened from a saved
    session alone is a *wiped* device holding the same keys, and it has nothing
    to discard, so the step would pass without testing anything — the spec uses
