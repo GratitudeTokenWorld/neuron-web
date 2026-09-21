@@ -37,7 +37,7 @@ import {
   claimableEpochDay, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS,
 } from '../engine/content/provider-ledger';
 import {
-  REDUNDANCY_TARGET, MAX_REPLICA_TARGET, MIN_REPLICAS,
+  REDUNDANCY_TARGET, MAX_REPLICA_TARGET, MIN_REPLICAS, mayReleasePublisherCopy,
   CustodySignals, planRepair, planRejoin, pollIntervalMs, liveHolders,
 } from '../engine/content/custody';
 import type { Block as EngineBlock } from '../engine/core/block';
@@ -154,6 +154,19 @@ export class StorageManager extends EventEmitter {
   private spotCheckTimer: ReturnType<typeof setTimeout> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private statsRefreshInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * CIDs whose bytes we published and have since handed over (see
+   * `releasePublisherCopy`). In memory only: after a restart the blocks are
+   * simply gone, so the push path below fails harmlessly and providers fall
+   * back to fetching from the holders, which is the path that has to work
+   * anyway.
+   */
+  private releasedCids = new Set<string>();
+  /**
+   * Ask the archives whether they hold a file record yet. Injected by `node.ts`
+   * (which owns the relay bases) so this module keeps no transport knowledge.
+   */
+  private archiveProbe?: (cid: string) => Promise<{ present: boolean; removed: boolean }>;
   private reannounceInterval: ReturnType<typeof setInterval> | null = null;
   private reannounceDebounce: ReturnType<typeof setTimeout> | null = null;
 
@@ -212,6 +225,11 @@ export class StorageManager extends EventEmitter {
     this.net = net;
     this.store = store;
     this.localKeys = localKeys;
+  }
+
+  /** Wire the archive query used to confirm announcements actually landed. */
+  setArchiveProbe(probe: (cid: string) => Promise<{ present: boolean; removed: boolean }>): void {
+    this.archiveProbe = probe;
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -480,6 +498,21 @@ export class StorageManager extends EventEmitter {
    * nothing and cannot repair anything — what it can do is stop routing to a
    * source that just failed it, which is the other half of verifying on use.
    */
+  /**
+   * A read failed somewhere other than `retrieve()` — treat it as one.
+   *
+   * The UI checks availability BEFORE retrieving, and when that check comes
+   * back empty it renders "Content not found" and returns. That early exit is
+   * the exact moment repair is wanted — a read that found nothing is the
+   * cheapest possible evidence that every holder we knew is unreachable — and
+   * because it never reached `retrieve()`, repair was never triggered. The
+   * owner was left looking at "not found" while the one node able to re-place
+   * the content did nothing about it.
+   */
+  reportReadFailure(cid: string): void {
+    this.repairOnReadFailure(cid);
+  }
+
   private repairOnReadFailure(cid: string): void {
     this.cidToSmokeAddrs.delete(cid);        // every known source failed; re-learn them
 
@@ -938,7 +971,12 @@ export class StorageManager extends EventEmitter {
       const ts = Date.now();
       const payload = `cache:${cid}:${tracked.ownerPub}:${ts}`;
       const sig = this.signMsg(payload, keys);
-      const uploaderSmokeAddr = await this.store.getSmokeHostname();
+      // Once our copy is released we are not a source, and saying otherwise
+      // makes every provider try us first and time out before reaching a real
+      // holder.
+      const uploaderSmokeAddr = this.releasedCids.has(cid)
+        ? undefined
+        : await this.store.getSmokeHostname();
       // Include ALL registered provider smoke addresses, not just confirmed ones.
       // This lets providers pull from any peer that already cached the content even
       // if that peer's receipt hasn't reached us yet (e.g. due to relay instability).
@@ -1013,7 +1051,11 @@ export class StorageManager extends EventEmitter {
     const payload = `cache:${cid}:${uploaderPub}:${ts}`;
     const signature = this.signMsg(payload, keys);
 
-    const uploaderSmokeAddr = await this.store.getSmokeHostname();
+    // Once our copy is released we are not a source: offering ourselves makes
+    // every provider try us first and time out before reaching a real holder,
+    // and pushing blocks we no longer have is a guaranteed failure.
+    const released = this.releasedCids.has(cid);
+    const uploaderSmokeAddr = released ? undefined : await this.store.getSmokeHostname();
     console.log(`[StorageManager] distributeContent: uploaderSmokeAddr=${uploaderSmokeAddr ?? '(none)'} publishing CacheRequest to ${providers.length} providers: ${providers.map(p => p.pub.slice(0, 12)).join(', ')}`);
 
     const confirmedSmokeAddrs = this.buildFallbackAddrs(cid, uploaderSmokeAddr);
@@ -1036,7 +1078,9 @@ export class StorageManager extends EventEmitter {
     // Outbound WebRTC (uploader→provider) works even from mobile behind strict NAT;
     // the pull model (provider→uploader) fails when the uploader is behind a relay
     // that drops before the WebRTC data channel is established.
-    this.pushBlocksToProviders(cid, additionalCids, providers, uploaderPub).catch(() => {});
+    if (!released) {
+      this.pushBlocksToProviders(cid, additionalCids, providers, uploaderPub).catch(() => {});
+    }
 
     // Preserve existing confirmed providers — don't reset them on re-distribution.
     const entry = existing ?? { ownerPub: uploaderPub, confirmedProviders: new Set<string>(), additionalCids, lastDistributed: Date.now() };
@@ -1084,6 +1128,54 @@ export class StorageManager extends EventEmitter {
     const tracked = this.trackedCids.get(cid);
     if (!tracked) return false;
     return this.liveHolderCount(tracked.confirmedProviders) >= MIN_REPLICAS;
+  }
+
+  /**
+   * Delete our own copy once the network has taken custody of it.
+   *
+   * This is what "the publisher keeps no copy by default" actually means. Until
+   * this ran, handoff logged `safe to close` and changed nothing on disk: the
+   * publisher stopped being COUNTED as a replica while still storing every byte
+   * it had ever uploaded, forever. Two consequences, one visible and one not —
+   * a publisher's disk grew without bound, and repair-on-read could never fire
+   * for the only node allowed to trigger it (`repairOnReadFailure` returns early
+   * unless the node owns the cid, and the owner always had the bytes), which is
+   * why TESTPLAN T9 step 3 was unreachable.
+   *
+   * Local-only. It must NEVER go through the withdrawal path: a delete request
+   * is a signed instruction to every holder to drop the content, and using it
+   * here would erase the file from the network at the exact moment the network
+   * took responsibility for it.
+   *
+   * Liveness is re-checked at the moment of deletion rather than trusted from
+   * the caller: between the receipt that triggered this and the delete, a lease
+   * can lapse, and releasing against a stale count drops the last real copy.
+   */
+  private async releasePublisherCopy(cid: string): Promise<void> {
+    const tracked = this.trackedCids.get(cid);
+    if (!tracked) return;
+    if (!this.localKeys.has(tracked.ownerPub)) return;   // not ours to release
+    if (this.releasedCids.has(cid)) return;
+
+    const live = this.liveHolderCount(tracked.confirmedProviders);
+    if (!mayReleasePublisherCopy(live)) return;
+
+    this.releasedCids.add(cid);
+    try {
+      // The root cascades to chunks via the chunk index; the bundled CIDs are
+      // the envelope and content block, which are deleted alongside it.
+      for (const c of [cid, ...tracked.additionalCids]) {
+        await this.store.deleteBlock(c).catch(() => { /* already gone */ });
+      }
+      console.log(`[StorageManager] Released own copy of ${cid.slice(0, 16)}… `
+        + `— ${live} live holder(s) have custody (authorship is not custody)`);
+      this.emit('storage:publisher-released', { cid, live });
+    } catch (err) {
+      // Keeping the bytes is the safe failure: the content is still held here
+      // and still held by the network, so nothing is lost — only disk.
+      this.releasedCids.delete(cid);
+      console.warn(`[StorageManager] Could not release own copy of ${cid.slice(0, 16)}… — ${String(err)}`);
+    }
   }
 
   /** CIDs this node owns that the network has not taken custody of yet. */
@@ -1466,6 +1558,8 @@ export class StorageManager extends EventEmitter {
         if (!wasHandedOff && live >= MIN_REPLICAS) {
           console.log(`[StorageManager] Handoff complete for ${receipt.cid.slice(0, 16)}… (${live} live holders) — safe to close`);
           this.emit('storage:handoff-complete', { cid: receipt.cid, live });
+          // Authorship is not custody: hand the bytes over for real.
+          void this.releasePublisherCopy(receipt.cid);
         }
         // If still under-replicated, reset lastDistributed so the next retry interval
         // fires quickly instead of waiting a full 30s cycle from the original send time.
@@ -1721,8 +1815,46 @@ export class StorageManager extends EventEmitter {
     await this.net.saveFileIndexRecord(record);
     this.net.publishFileAnnouncement({ ...record, signature });
     this.emit('file:index-updated');
+    void this.confirmAnnouncement(cid, false, () =>
+      this.net.publishFileAnnouncement({ ...record, signature }));
     // Gossip updated storage stats immediately so free-space reflects the new file on all nodes.
     this.broadcastStorageStats(uploaderPub, keys).catch(() => {});
+  }
+
+  /**
+   * Publish, then CHECK, then publish again — because one fire-and-forget
+   * gossip message is never enough.
+   *
+   * A file announcement published into a mesh with no subscriber is silently
+   * dropped. The only recovery was the periodic re-announce, which runs every
+   * five minutes, so a freshly uploaded file could be invisible to every
+   * archive for a full interval — long enough that "the archive never got it"
+   * and "the archive has not got it yet" are indistinguishable, which is
+   * exactly the ambiguity that costs a day of debugging.
+   *
+   * So the announcement is verified the same way every other cross-node claim
+   * in this codebase is: by ASKING an archive and checking the answer. Bounded
+   * — four attempts over ~3 minutes, then it gives up and says so, leaving the
+   * 5-minute loop as the backstop. `O(own files)`, and only while unconfirmed.
+   */
+  private async confirmAnnouncement(
+    cid: string, expectRemoved: boolean, republish: () => void,
+  ): Promise<void> {
+    if (!this.archiveProbe) return;                 // no archives wired (tests)
+    const what = expectRemoved ? 'withdrawal' : 'announcement';
+    for (const delayMs of [5_000, 15_000, 45_000, 120_000]) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      if (!this.net.isRunning()) return;
+      const seen = await this.archiveProbe(cid).catch(() => null);
+      if (seen?.present && seen.removed === expectRemoved) {
+        console.log(`[StorageManager] ${what} confirmed by an archive for ${cid.slice(0, 16)}…`);
+        return;
+      }
+      console.warn(`[StorageManager] ${what} for ${cid.slice(0, 16)}… not in any archive yet — re-publishing`);
+      republish();
+    }
+    console.warn(`[StorageManager] ${what} for ${cid.slice(0, 16)}… still unconfirmed after 4 attempts — `
+      + `leaving it to the 5-minute re-announce`);
   }
 
   async removeFileAnnouncement(cid: string, ownerPub: string, keys: KeyPair): Promise<void> {
@@ -1735,8 +1867,14 @@ export class StorageManager extends EventEmitter {
     this.net.deleteTrackedCid(cid);
     this.cidToSmokeAddrs.delete(cid);
     this.signals.forget(cid);
-    this.net.publishFileAnnouncement({ cid, uploaderPub: ownerPub, sizeBytes: 0, timestamp, removed: true, signature });
+    const tombstone = { cid, uploaderPub: ownerPub, sizeBytes: 0, timestamp, removed: true, signature };
+    this.net.publishFileAnnouncement(tombstone);
     this.emit('file:index-updated');
+    // A withdrawal has to be LEARNABLE, so it matters even more than the
+    // announcement that it reached an archive: an absent record is
+    // indistinguishable from one that never arrived, and a holder that misses
+    // the tombstone keeps serving content its owner withdrew.
+    void this.confirmAnnouncement(cid, true, () => this.net.publishFileAnnouncement(tombstone));
     this.broadcastStorageStats(ownerPub, keys).catch(() => {});
   }
 

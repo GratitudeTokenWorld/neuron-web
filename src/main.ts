@@ -4716,7 +4716,16 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
   }
 
   if (!avail.available && !avail.meta) {
-    resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is online.</span>`;
+    // A read that found nothing is the cheapest evidence there is that every
+    // holder we knew is unreachable, so it triggers repair rather than only
+    // reporting. Harmless for content we do not own: repairOnReadFailure drops
+    // the stale source hints and then returns, because only the owner can
+    // re-place a file.
+    node.storage.reportReadFailure(cid);
+    const owned = node.storage.getFileIndex().has(cid);
+    resultEl.innerHTML = owned
+      ? `<span style="color:var(--warning)">No holder answered. Re-placing it on the network now — try again shortly.</span>`
+      : `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is online.</span>`;
     return;
   }
 

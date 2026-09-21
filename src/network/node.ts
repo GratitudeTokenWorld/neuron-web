@@ -144,6 +144,14 @@ export class NeuronNode extends EventEmitter {
     this.net = new Libp2pNetwork(network);
     this.store = new SmokeStore();
     this.storage = new StorageManager(this.ledger, this.net, this.store, this.localKeys);
+    // The archives are the only place a file announcement can be CONFIRMED to
+    // have landed. StorageManager owns no relay bases, so the query is injected
+    // rather than reached for.
+    this.storage.setArchiveProbe(async (cid: string) => {
+      const { records } = await this.lookupFiles({ cid, limit: 1 });
+      const hit = records.find((r) => r.cid === cid);
+      return { present: !!hit, removed: !!(hit as { removed?: boolean } | undefined)?.removed };
+    });
   }
 
   private eventsWired = false;
@@ -920,8 +928,19 @@ export class NeuronNode extends EventEmitter {
       // also kills the stale-anchor risk (re-publishing a frozen copy could
       // revert the owner's key/PIN rotations) outright.
       if (!keys) continue;
+      // NO balance/nonce. The record is a DIRECTORY entry — username → pub, keys,
+      // faceMapHash — and the `_sig` covers only pub/username/createdAt/
+      // faceMapHash, so anything else in it is unsigned and unverifiable. It was
+      // also rebuilt from this in-memory map every 20 s and stamped with a
+      // monotonically higher `_version`, while relays resolve conflicts by
+      // highest version: a tick that ran before the chain had replayed the mint
+      // republished `balance: 0` and made it authoritative. Observed on two
+      // accounts created seconds apart — one settled at `_version=1,
+      // balance=1000000`, the other at `_version=3, balance=0`, the later record
+      // carrying LESS state. Balance is chain state; it is derived from blocks,
+      // never from the directory.
       const accData: Record<string, unknown> = {
-        username: acc.username, pub: acc.pub, balance: acc.balance, nonce: acc.nonce,
+        username: acc.username, pub: acc.pub,
         createdAt: acc.createdAt, faceMapHash: acc.faceMapHash,
         linkedAnchor: acc.linkedAnchor ?? undefined,
         pqPub: acc.pqPub ?? undefined,
@@ -1376,7 +1395,14 @@ export class NeuronNode extends EventEmitter {
     // Same registration path the old gossip handler used — merge into the ledger…
     const account: LedgerAccount & Record<string, unknown> = {
       username: String(rec.username), pub: String(rec.pub),
-      balance: Number(rec.balance || 0), nonce: Number(rec.nonce || 0),
+      // Zero because a directory record does not KNOW the balance, not because
+      // the account is empty. These fields are outside the `_sig` payload, so
+      // taking them from a relay-served record let an unsigned, stale number
+      // into ledger state. A counterparty's real balance comes from their chain
+      // — in practice from a verified `/head-proof` packet (G2), never here.
+      // `registerAccount` is insert-only, so this cannot overwrite an account
+      // whose balance we already learned properly.
+      balance: 0, nonce: 0,
       createdAt: Number(rec.createdAt || 0), faceMapHash: String(rec.faceMapHash || ''),
       linkedAnchor: rec.linkedAnchor ? String(rec.linkedAnchor) : undefined,
       pqPub: rec.pqPub ? String(rec.pqPub) : undefined,

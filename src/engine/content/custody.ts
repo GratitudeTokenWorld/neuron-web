@@ -176,6 +176,29 @@ function fmtSpan(ms: number): string {
   return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`;
 }
 
+/**
+ * May the publisher delete its own copy now?
+ *
+ * **Authorship is not custody.** Published content is handed to the network;
+ * the publisher is not automatically a replica and keeps no copy by default —
+ * only for as long as the network has not finished taking custody
+ * (ARCHITECTURE.md → Subsystem 4). Until this returns true the publisher's copy
+ * is the only one in existence and the content is *staging*.
+ *
+ * The threshold is `MIN_REPLICAS`, not `REDUNDANCY_TARGET`, because that is
+ * exactly what `MIN_REPLICAS` means: the point at which losing the uploader
+ * stops destroying the content. Waiting for the full target before releasing
+ * would pin every publisher's disk to a fleet that may simply not be that large
+ * yet, and re-replication from the minimum up to the target is repair's job —
+ * it pulls from the holders, not from the author.
+ *
+ * `live` must be LIVE holders, never "confirmed ever": releasing against a
+ * remembered confirmation deletes the last real copy.
+ */
+export function mayReleasePublisherCopy(live: number): boolean {
+  return live >= MIN_REPLICAS;
+}
+
 // ── Rejoin ───────────────────────────────────────────────────────────────────
 
 export interface RejoinPlan {

@@ -8,6 +8,7 @@ import {
   replicaTarget,
   planRepair,
   planRejoin,
+  mayReleasePublisherCopy,
   pollIntervalMs,
   CustodySignals,
 } from './custody.js';
@@ -178,6 +179,27 @@ describe('planRejoin', () => {
   it('still reads in hours at production timing', () => {
     const reason = planRejoin({ offlineMs: MAX_OFFLINE_MS, held }).reason;
     expect(reason).toMatch(/lapsed 12h ago \(max 12h\)/);
+  });
+});
+
+describe('mayReleasePublisherCopy', () => {
+  it('holds the copy until the network has taken custody', () => {
+    // Below MIN_REPLICAS the publisher's copy is the only one in existence.
+    for (let live = 0; live < MIN_REPLICAS; live++) {
+      expect(mayReleasePublisherCopy(live), `live=${live}`).toBe(false);
+    }
+  });
+
+  it('releases at MIN_REPLICAS, not at the redundancy target', () => {
+    // Waiting for REDUNDANCY_TARGET would pin every publisher's disk to a fleet
+    // that may not be that large yet; getting from the minimum to the target is
+    // repair's job, and repair pulls from the holders, not from the author.
+    expect(mayReleasePublisherCopy(MIN_REPLICAS)).toBe(true);
+    expect(MIN_REPLICAS).toBeLessThan(REDUNDANCY_TARGET);
+  });
+
+  it('never releases on one holder — one copy plus a lease expiry is zero', () => {
+    expect(mayReleasePublisherCopy(1)).toBe(false);
   });
 });
 
