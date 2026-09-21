@@ -1010,7 +1010,7 @@ face), which is what turned three latent defects into findings:
 |---|---|
 | T9 step 1 — handoff completes on two live leases | **pass** (needs THREE accounts: MIN_REPLICAS is 2 and the uploader never counts itself) |
 | T9 step 2 — staging survives a reload, retried without re-upload | **pass** |
-| T9 steps 3+4 — repair on read failure | **re-runnable.** Was unreachable twice over: the publisher never dropped its copy (fixed — it now releases on *proven* custody), and the UI's availability check inherited a 10-minute deadline so the not-found branch that triggers repair was never reached (fixed — bounded to 20 s) |
+| T9 steps 3+4 — repair on read failure | **still not observable**, but three real blockers are fixed: the publisher never dropped its copy (now released on *proven* custody), the availability check inherited retrieve()'s 10-minute deadline (bounded to 20 s), and the repair trigger was keyed on "nothing came back at all" when the usual shape of a lost file is a readable manifest pointing at unservable content. What remains is that the read never returns to the UI when every holder is gone — next step is deciding whether an owner's read should ask the archives for current holders first |
 | T9 step 5 — rejoin past the lease discards | **pass** (run it isolated: `-g "steps 5"`) |
 | T9 step 6 — lapsed holders stop counting | **not asserted.** The rule is unit-tested; the *log line* that reports it sits behind an early return and a growing backoff. A rendered replica count would be the cheap way to close it |
 | T10 steps 1, 2, 3, 4 | **pass** — archives answer with their own `total`, a client holds only its own files, the one-time migration drops a planted foreign record once, and the chip reads `—` rather than a bare 0 |

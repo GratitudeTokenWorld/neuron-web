@@ -142,7 +142,7 @@ test.describe('T9 — repair', () => {
 
   test.afterAll(async () => { await Promise.all([a?.close(), b?.close(), c?.close()]); });
 
-  test('the publisher hands over for real — handoff releases its own copy', async () => {
+  test('handoff releases the publisher copy, on PROVEN custody', async () => {
     test.setTimeout(900_000);
     const cid = await uploadFile(a, `repair-${E2E_RUN}.bin`, 64 * 1024);
 
@@ -157,6 +157,29 @@ test.describe('T9 — repair', () => {
     // And it released against LIVE holders, never a remembered confirmation —
     // releasing on "confirmed ever" deletes the last real copy.
     expect(released).not.toMatch(/0 live holder/);
+
+    // STEP 3+4 are still NOT asserted, and the reason has moved twice.
+    //
+    // Fixed since this was written: the publisher used to keep its copy
+    // forever (so the only node that may repair always had the bytes); the
+    // UI's availability check inherited retrieve()'s 10-MINUTE deadline; and
+    // the repair trigger was keyed on "nothing came back at all" when the
+    // usual shape of a lost file is a readable manifest pointing at content
+    // nobody can serve.
+    //
+    // What remains: with every holder closed, the read never returns to the
+    // UI at all. `retrieve` logs `not local — trying 2 peer(s)` and retries,
+    // and the not-found branch that now reports the failure is never reached,
+    // so nothing is logged. The peers it dials are the relay, not the closed
+    // providers, which suggests the 20 s bound is not being applied on every
+    // path into retrieve.
+    //
+    // Next step is a decision, not a guess: whether an owner's read should ask
+    // the archives for current holders (`GET /providers`) before concluding
+    // the content is gone — which would also make the failure honest rather
+    // than a timeout. Until then the repair POLICY stays covered where it is
+    // testable: custody.test.ts (live-only counting, two-strike eviction,
+    // rejoin discard) and engine/sim/repair.ts (repair-vs-churn, measured).
   });
 
   // STEP 3+4 — repair on read failure — remain UNVERIFIED end to end, and the

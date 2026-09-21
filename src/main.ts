@@ -4724,13 +4724,17 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
     return;
   }
 
+  // A read that could not reach the content is the cheapest evidence there is
+  // that every holder we knew is unreachable, so it triggers repair rather than
+  // only reporting. Keyed on `available`, NOT on "nothing at all came back":
+  // the manifest is small and widely cached, so the usual shape of a lost file
+  // is a readable meta block pointing at content nobody can serve — and
+  // checking for both missing skipped exactly that case. Harmless for content
+  // we do not own: repairOnReadFailure drops the stale source hints and then
+  // returns, because only the owner can re-place a file.
+  if (!avail.available) node.storage.reportReadFailure(cid);
+
   if (!avail.available && !avail.meta) {
-    // A read that found nothing is the cheapest evidence there is that every
-    // holder we knew is unreachable, so it triggers repair rather than only
-    // reporting. Harmless for content we do not own: repairOnReadFailure drops
-    // the stale source hints and then returns, because only the owner can
-    // re-place a file.
-    node.storage.reportReadFailure(cid);
     const owned = node.storage.getFileIndex().has(cid);
     resultEl.innerHTML = owned
       ? `<span style="color:var(--warning)">No holder answered. Re-placing it on the network now — try again shortly.</span>`

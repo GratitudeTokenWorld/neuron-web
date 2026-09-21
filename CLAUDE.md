@@ -194,10 +194,12 @@ shipped this session. What is NOT done is verifying them on the live network.
 
 **Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
-1. **Re-run T9 steps 3+4.** Both blockers are fixed (the publisher now releases
-   its copy on *proven* custody, and `checkAvailability` is bounded to 20 s), so
-   repair-on-read should be reachable for the first time. `npx playwright test
-   e2e/custody.spec.ts`.
+1. **T9 steps 3+4 — one decision away.** Three blockers are fixed (publisher
+   releases on proven custody; `checkAvailability` bounded to 20 s; the repair
+   trigger keyed on *unavailable* rather than *nothing at all*), but with every
+   holder gone the read still never returns to the UI. Decide whether an
+   owner's read should ask the archives for current holders (`GET /providers`)
+   before concluding the content is gone — the spec records the evidence.
 2. **Phase 4 — scale hardening.** This is where the remaining engineering is:
    archive backfill between relays (**demand-driven on a miss, never a
    sync-on-rejoin**, which would be `O(archive)`), custody-proven incentive
