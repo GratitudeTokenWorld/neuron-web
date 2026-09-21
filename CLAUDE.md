@@ -194,16 +194,17 @@ shipped this session. What is NOT done is verifying them on the live network.
 
 **Pick up here** (full handoff in [docs/HANDOFF.md](docs/HANDOFF.md)):
 
-1. **Run T9 + T10.** Both are written as Playwright specs
-   (`e2e/custody.spec.ts`, `e2e/file-index.spec.ts`) and skip without a captured
-   session. **T10 is NOT blocked** — `GET /files` shipped in `2f66a4c`, which is
-   an ancestor of the deployed `e51cae0`, and both cloud boxes answer it (step 1
-   passes today). What is still needed is the manual part: `npm run e2e:capture`
-   for **three** accounts, and a stack on `STORAGE_TIMING=fast`.
-   **Three, not two:** `MIN_REPLICAS` is 2 and the uploader never counts itself,
-   so `Handoff complete` is unreachable with two accounts — T9's "two devices"
-   header predates that decision. Steps 3–6 need only two.
-2. Then **Phase 4**, paying down the migration seam per caller.
+1. **Re-run T9 steps 3+4.** Both blockers are fixed (the publisher now releases
+   its copy on *proven* custody, and `checkAvailability` is bounded to 20 s), so
+   repair-on-read should be reachable for the first time. `npx playwright test
+   e2e/custody.spec.ts`.
+2. **Phase 4 — scale hardening.** This is where the remaining engineering is:
+   archive backfill between relays (**demand-driven on a miss, never a
+   sync-on-rejoin**, which would be `O(archive)`), custody-proven incentive
+   payouts, adaptive limits, security bounds, and the sustained load test.
+3. **Multi-device custody** (decided, unbuilt): per-device chains with an
+   account-signed delegation. Settle the pseudonymous device-group tag first.
+4. **The migration seam**, per caller — 121 app-layer type errors.
 
 `storage-manager.ts` (~1500 lines) has more callers than the ledger did —
 enumerate them before changing what it broadcasts (see the free-rider trap

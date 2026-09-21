@@ -972,7 +972,7 @@ Phase status against the plan below, and what a new session should pick up.
 | 1 — Partial replication + discovery | **done** | `src/engine/node` — delta sync, archival tiering, snapshots; live on both cloud relays |
 | 2 — Sharded consensus + identity | **done** | `src/engine/consensus` (11 modules / 12 test files); 2-of-2 attester quorum exercised in TESTPLAN T1 |
 | 3 — Storage CDN + tiered nodes | **STARTED 2026-08-10; parity 2026-08-15; repair, handoff, file index and S3 2026-08-15** | backend seam: `BlockBackend` + `MemoryBackend` (engine), a filesystem adapter and an **opt-in S3-compatible** one (`src/storage`, zero-dependency SigV4 pinned to AWS's published vectors). Provider economy on-chain: four `storage-*` engine block types, `provider-ledger.ts` (registry + **lease liveness** + reward evidence), reward minting guarded by balance conservation *and* an on-chain evidence ceiling, provider **discovery** by verified archive query (`GET /providers`). Custody policy in `content/custody.ts` — live-only replica counting, lapsed-holder repair, rejoin discard, population-scaled jittered cadences, demand-scaled serving capacity. Publish **handoff** (`awaitHandoff`/`stagingCids`, staging persisted). File index off the global topic → `GET /files` + `file-index.ts`. Repair-vs-churn **measured** in `sim/repair.ts`. Remaining: none of the Phase-3 list — see *Where this stands* |
-| 4 — Scale hardening | **barely started** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only; no incentives, adaptive limits or load test |
+| 4 — Scale hardening | **barely started — the bulk of what is left** | relay federation (`engine/net`) and capped inflation (`engine/economy`) only. Missing: archive backfill between relays (demand-driven, never sync-on-rejoin), custody-proven incentive payouts, adaptive limits/compression, security bounds, and the sustained load test |
 | Verification (below) | **RUN 2026-08-09** | full measured baseline + 10B projection — see *Measured baseline* under Verification |
 | G1 / G2 (the two live `O(N)` violations) | **CLOSED 2026-08-10** | on-demand `/resolve` + `/pending-sends` + `/block`; proof-packet claims via `/head-proof` + `/token` (payments **and** NFTs); archive-side fork detection. Deployed on both cloud relays, manual matrix green, live probe 55/55 |
 | G3 (a third `O(N)` violation, found later) | **CLOSED 2026-08-15** | the global `keyblobs` topic broadcast every account's encrypted-key blob to every node — G1's shape, hidden behind a security rationale. Replaced by targeted `POST`/`GET /keyblob`. See *Scale-invariant gaps* below |
@@ -1001,19 +1001,29 @@ mechanism:
 | Transfer routed to a destroyed account | stale pre-reset record survived locally and outranked the live one | generation filter at the cache boundary + relay-first username resolution + newest-registration ranking |
 | "Reset testnet" did nothing to the network | operator gate read only the same-origin relay | epoch/operator aggregation across relays + relay generation follower |
 
-Next — **Phase 3's build list is complete as of 2026-08-15**: backend seam,
-provider economy, provider discovery, lease + repair, publish handoff, file index
-off the global topic, repair-vs-churn measured, and an opt-in S3 adapter. What it
-is NOT yet is *verified on the live network*: the repair loop, the handoff and
-`GET /files` are covered by unit tests and a local relay run, and the manual
-matrix rows for them (TESTPLAN T9, T10) are written and unrun. **T10 needs a
-relay deploy** — `GET /files` does not exist on the cloud boxes yet. TESTPLAN T8
-step 5 (the reward) still waits on a decision about the day boundary.
+Next — **Phase 3's build list has been complete since 2026-08-15**, and as of
+2026-09-21 it is **partly verified on the live network**. T9 and T10 now run
+unattended (the specs create their own accounts via the dev-only synthetic
+face), which is what turned three latent defects into findings:
 
-Then **Phase 4**. The migration seam (~123 app-layer type errors; see CLAUDE.md)
-can be paid down alongside, per caller, as each one is moved off the `DAGLedger`
-compatibility surface — `storage-manager.ts` was moved this way and took the
-count from 182 to 123.
+| Row | State |
+|---|---|
+| T9 step 1 — handoff completes on two live leases | **pass** (needs THREE accounts: MIN_REPLICAS is 2 and the uploader never counts itself) |
+| T9 step 2 — staging survives a reload, retried without re-upload | **pass** |
+| T9 steps 3+4 — repair on read failure | **re-runnable.** Was unreachable twice over: the publisher never dropped its copy (fixed — it now releases on *proven* custody), and the UI's availability check inherited a 10-minute deadline so the not-found branch that triggers repair was never reached (fixed — bounded to 20 s) |
+| T9 step 5 — rejoin past the lease discards | **pass** (run it isolated: `-g "steps 5"`) |
+| T9 step 6 — lapsed holders stop counting | **not asserted.** The rule is unit-tested; the *log line* that reports it sits behind an early return and a growing backoff. A rendered replica count would be the cheap way to close it |
+| T10 steps 1, 2, 3, 4 | **pass** — archives answer with their own `total`, a client holds only its own files, the one-time migration drops a planted foreign record once, and the chip reads `—` rather than a bare 0 |
+| T10 2b + 5 — archive receipt, withdrawal tombstone | **flaky.** Delivery is confirmed within 5 s single-device; two devices under load can still miss for minutes. An announcement is now *verified* against an archive and re-published if absent, so a miss says so instead of being silent |
+
+`GET /files` was never blocked on a relay deploy — it shipped in `2f66a4c`, an
+ancestor of the deployed `e51cae0`. T8 step 5's day-boundary question is closed
+by `STORAGE_TIMING=fast`.
+
+Then **Phase 4**, which is where the remaining engineering is. The migration
+seam (~121 app-layer type errors; see CLAUDE.md) can be paid down alongside, per
+caller, as each is moved off the `DAGLedger` compatibility surface —
+`storage-manager.ts` was moved this way and took the count from 182 to 123.
 
 ---
 
