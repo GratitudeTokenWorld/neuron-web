@@ -959,6 +959,76 @@ measured it. Holder serving capacity is assumed too, and Principle 1 guarantees
 a long low tail of small devices. **Both must be measured before the curve is
 tuned further** — tuning it now would be fitting a constant to an assumption.
 
+### Compressing manifests, screened (proposed by Lucian 2026-09-22)
+
+**Verdict: do not compress. Fix the encoding instead** — it is smaller than the
+compressed form *and* free to read, so compression is a worse version of a
+change worth making anyway. Measured in `sim/manifest-encoding.ts`.
+
+Measured, for a 4 GB file at the 8 MB chunk size (512 chunks):
+
+| Encoding | Bytes | Share of file | Cost to read |
+|---|---|---|---|
+| Hex-JSON (ships today) | 46,130 | 0.00107% | `JSON.parse` 0.12 ms |
+| gzip -9 of that JSON | 18,895 | 0.00044% | gunzip 0.16 ms |
+| brotli | 17,020 | 0.00040% | 0.25 ms |
+| **Raw 32-byte hashes, sizes derived** | **16,400** | **0.00038%** | **decode 0.06 ms** |
+| Information-theoretic floor | 16,384 | — | — |
+
+**Lucian's question — does decompression cost more than downloading what it
+saves?** Against today's JSON, no: gunzip is 0.16 ms and the 27 KB saved takes
+21.8 ms at 10 Mbit/s, 2.2 ms at 100 Mbit/s. Break-even is around **1.4 Gbit/s**,
+so compressing *would* win on every consumer link.
+
+That comparison is the wrong one, and this is the finding: **the binary encoding
+is smaller than the gzip and costs nothing to decompress**, so it dominates on
+both axes at every link speed and there is no crossover to reason about.
+
+**Why compression gains so little.** A SHA-256 is incompressible by
+construction — gzipping raw digests makes them *larger*. Everything gzip
+recovers is the hex expansion (64 characters to carry 32 bytes) and the repeated
+JSON scaffolding. Both are encoding defects with a direct fix, and the second
+one is pure redundancy: every chunk's `size` is derivable from `size` and
+`chunkSize`, so the field never needed to be sent at all.
+
+#### The trinity, on compression specifically
+
+- **Security — the decisive objection.** The manifest CID is
+  `hashJson({size, chunkSize, chunks})` and `verifyManifest` recomputes it. If
+  the compressed bytes were what got hashed, **the CID would depend on the
+  compressor's version, level and implementation**, so the same file would
+  address differently on different clients and content addressing would break.
+  Any compression must therefore sit strictly below the canonical form, at
+  transport only. A compressor also adds a decoder to a path that parses
+  untrusted input, and with it decompression bombs — bounded here by the fact
+  that `size` and `chunkSize` predict the chunk count before decoding, so the
+  output length can be checked first. All of that is real work for 0.0004% of a file.
+- **Performance.** ~27 KB saved on a 4 GB transfer. The binary encoding saves
+  more, for less.
+- **Decentralisation.** A compression format is a compatibility surface every
+  node must agree on — effectively consensus-visible, needing the operator vote
+  that does not exist yet. The binary encoding has the same property, which is
+  why it is worth doing **once**, deliberately, rather than adding a format now
+  and a second one later.
+
+#### Scaling: where manifests actually matter
+
+A manifest is one hash per chunk, so it is a **fixed share of the content it
+describes** — flat within 2× from 100 MB to 1 TB. No file size makes a manifest
+significant relative to its own file.
+
+It bites in exactly one place: a node that holds **manifests without chunks** —
+an index, a browser, a search tier. At a million 4 GB files that is 43 GB as
+JSON against 15 GB binary, and there the 2.8× is the whole cost rather than a
+rounding error on a transfer. That is the case to encode for, and it is also the
+case to check the invariant against: `file-index.ts` keeps own-file records only,
+so a heavy user with 10,000 large files pays ~160 MB of manifest against ~39 TB
+of content — `O(own)`, as required.
+
+**Not scheduled.** Nothing here is urgent at 0.001%; it is recorded so that when
+the file-record format is next opened, it is opened once and with the numbers
+already known.
+
 ### Saturation-driven replication, screened (proposed by Lucian 2026-09-22)
 
 **The proposal.** Give each node a concurrent-read limit set by what kind of
