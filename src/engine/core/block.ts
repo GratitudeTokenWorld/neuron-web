@@ -41,7 +41,6 @@ export type BlockType =
   // daily reward metered by that evidence. See engine/content/provider-ledger.
   | 'storage-register'
   | 'storage-deregister'
-  | 'storage-heartbeat'
   | 'storage-settle';
 
 /**
@@ -73,12 +72,6 @@ export interface StoragePayload {
    */
   deviceClass?: string;
   declaredConcurrency?: number;
-  /** heartbeat: current smoke/WebRTC address peers fetch blocks from. */
-  smokeAddr?: string;
-  /** heartbeat: bytes actually held right now — what the reward is metered on. */
-  storedBytes?: number;
-  /** heartbeat: ISO 3166-1 alpha-2, self-reported; feeds geographic diversity. */
-  countryCode?: string;
   /**
    * settle: the reader-signed receipts the payout is derived from.
    *
@@ -191,7 +184,7 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
   } else if (c.type === 'nft-burn') {
     out.tokenId = c.tokenId;
   } else if (
-    c.type === 'storage-register' || c.type === 'storage-deregister' || c.type === 'storage-heartbeat'
+    c.type === 'storage-register' || c.type === 'storage-deregister'
   ) {
     out.storage = c.storage;
   } else if (c.type === 'storage-settle') {

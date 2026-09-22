@@ -716,7 +716,6 @@ function showAccountDetail(pub: string) {
       <div class="stats-grid">
         <div class="stat-item"><div class="stat-label">Capacity</div><div class="stat-value">${provider.capacityGB} GB</div></div>
         <div class="stat-item"><div class="stat-label">Score</div><div class="stat-value">${provider.score.toFixed(2)}</div></div>
-        <div class="stat-item" title="Liveness only — earnings are metered by reader-signed receipts, not by uptime."><div class="stat-label">Uptime (liveness)</div><div class="stat-value">${node.storage.getUptimePct(pub)}%</div></div>
         <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '-'}</div></div>
       </div>
     </div>` : '';
@@ -2068,7 +2067,6 @@ async function startNode() {
       }
     }, 6_000);
     // Keys are now loaded — reschedule the heartbeat timer with accurate lastHeartbeat timing.
-    node.storage.rescheduleHeartbeat();
     // Heal share custody once the relay set is actually reachable. Delayed so
     // relay discovery has settled: probing too early would see a thin fleet,
     // and the expand-only rule would (correctly) decline the repair we want.
@@ -3595,11 +3593,6 @@ function wireNodeEvents() {
     addLog(`Rejected: ${block.type ?? 'block'} ${trunc(block.hash, 12)}`, 'error');
     debouncedRefreshTab();
   });
-  node.on('storage:heartbeat-sent', (d: unknown) => {
-    const { pub } = d as { pub: string };
-    addLog(`Heartbeat sent for ${resolveNamePlain(pub)}`, 'info');
-    refreshStorage();
-  });
   node.on('storage:settled', (d: unknown) => {
     const { pub, amount, readers } = d as { pub: string; amount: number; readers: number };
     addLog(`Settled: +${formatUNIT(amount)} UNIT for ${resolveNamePlain(pub)}`
@@ -3713,7 +3706,6 @@ function wireNodeEvents() {
     void node.broadcastLocalState().catch(() => {});
     // A missed heartbeat window is a lapsed lease; re-arm against the real
     // on-chain timing rather than whatever the throttled timer thinks.
-    node.storage.rescheduleHeartbeat();
     void node.refreshStorageProviders();
   });
 
@@ -4022,19 +4014,6 @@ function refreshStorage() {
     // Populate my stats row
     const p = node.ledger.storageProviders.get(servingAccount.pub);
     if (p) {
-      const uptimeFraction = node.ledger.providerUptime(p);
-      const uptime = uptimeFraction === undefined ? '—' : `${Math.round(uptimeFraction * 100)}%`;
-      const due = node.ledger.expectedHeartbeats(p);
-      // Derived FROM the percentage, never counted independently. The raw count
-      // is taken over a window half an interval wider than one epoch (that slack
-      // is what stops a perfect provider flickering to 83% — see
-      // countHeartbeatsLast24h), so printing it against `due` produced "7/6
-      // heartbeats due", which is impossible on its face. Reported by Lucian,
-      // 2026-08-16, minutes after the fix that caused it.
-      //
-      // Restating the same measurement in renewal terms cannot contradict it.
-      // The unrounded evidence stays in the tooltip for debugging.
-      const shown = uptimeFraction === undefined ? 0 : Math.round(uptimeFraction * due);
       const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
       // An epoch index times a HARDCODED 24h — which stopped being the epoch
       // length the moment a timing profile existed, so under `fast` this
@@ -4049,8 +4028,6 @@ function refreshStorage() {
         : '<div style="font-size:10px;color:var(--text-muted)">empty — declared capacity earns nothing</div>';
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB${myUsed}</td>
-        <td title="Liveness only — ${p.heartbeatsLast24h} renewal block(s) in the counting window. Does NOT determine earnings.">${
-          uptime}${uptimeFraction === undefined ? '' : ` (${shown}/${due} renewals)`}</td>
         <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
       </tr>`;
@@ -4094,7 +4071,6 @@ function refreshStorage() {
     const measured = active.filter(p => p.discovered !== true);
     const avg = (pick: (p: typeof measured[number]) => number) =>
       measured.length ? measured.reduce((sum, p) => sum + pick(p), 0) / measured.length : undefined;
-    const avgUptime = avg(p => node.ledger.providerUptime(p, now) ?? 0);
     const avgScore = avg(p => p.score);
     const sampleNote = measured.length === 0 ? 'none measured'
       : measured.length === 1 ? '1 measured'
@@ -4123,8 +4099,6 @@ function refreshStorage() {
         fileCount ? 'var(--success)' : 'var(--text-muted)'),
       chip('Total Capacity', fmtGB(totalCapGB)),
       chip('Free Space', fmtGB(freeGB), freeGB > 1 ? 'var(--success)' : 'var(--warning)'),
-      chip(`Uptime (${sampleNote})`,
-        avgUptime === undefined ? '—' : `${Math.round(avgUptime * 100)}%`, band(avgUptime)),
       chip(`Score (${sampleNote})`,
         avgScore === undefined ? '—' : avgScore.toFixed(3), band(avgScore)),
       timingChip,
@@ -4153,14 +4127,11 @@ function refreshStorage() {
       // was the default value, not a result.
       const measuredPerf = node.storage.getReceipts(p.pub).length > 0;
       const noProbe = dash('not measured — no content has been fetched from this provider yet');
-      // One definition, shared with the SCORE column beside it and with
-      // getUptimePct. These used to divide by a flat 6 while the score divided by
-      // heartbeats-since-registration, so the two columns disagreed about the
-      // same provider — 17% next to a score that had priced it far higher.
-      const uptimeFraction = node.ledger.providerUptime(p);
-      const uptime = uptimeFraction === undefined
-        ? noChain
-        : `${Math.round(uptimeFraction * 100)}%`;
+      // Uptime is gone with the heartbeat: it was counted from heartbeat
+      // blocks, and an announcement was never evidence of holding anything.
+      // What a reader actually needs to know is whether this provider is
+      // currently serving, which the lease answers from observed service.
+      const uptime = node.ledger.isProviderLive(p.pub) ? 'serving' : noChain;
       // We cannot know a discovered provider's uptime HISTORY — that is the
       // deliberately-abandoned network-wide record (ARCHITECTURE.md → Fan-IN).
       // But its latest signed heartbeat came with the discovery record, and
@@ -4354,19 +4325,21 @@ $('#btnServeStorage')?.addEventListener('click', async () => {
     const statusEl = document.getElementById('serveStorageStatus');
     const DELAY = 8;
     let remaining = DELAY;
-    if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Sending first heartbeat in ${remaining}s…`;
+    if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Announcing presence in ${remaining}s…`;
     const ticker = setInterval(() => {
       remaining--;
       if (remaining > 0) {
         if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Sending first heartbeat in ${remaining}s…`;
       } else {
         clearInterval(ticker);
-        node.storage.broadcastHeartbeat(pub, acc.keys).then(r => {
-          if (statusEl) statusEl.innerHTML = r.success
-            ? `<span style="color:var(--success)">&#10003; Heartbeat sent — you are now discoverable to peers.</span>`
-            : `<span style="color:var(--warning)">Heartbeat skipped: ${r.error}</span>`;
-          addLog(`First heartbeat ${r.success ? 'sent' : 'failed: ' + r.error} for ${acc.username}`, r.success ? 'success' : 'warn');
+        node.storage.broadcastStorageStats(pub, acc.keys).then(() => {
+          if (statusEl) statusEl.innerHTML =
+            `<span style="color:var(--success)">&#10003; Announced — you are now discoverable to peers.</span>`;
+          addLog(`Presence announced for ${acc.username}`, 'success');
           setTimeout(() => { if (statusEl) statusEl.innerHTML = ''; }, 5000);
+        }).catch((e: unknown) => {
+          if (statusEl) statusEl.innerHTML =
+            `<span style="color:var(--warning)">Announcement failed: ${String(e)}</span>`;
         });
       }
     }, 1000);
@@ -4396,14 +4369,6 @@ $('#btnStopServing')?.addEventListener('click', async () => {
   else { toast(`Error: ${result.error}`, 'error'); }
 });
 
-$('#btnManualHeartbeat')?.addEventListener('click', async () => {
-  const servingAcc = localAccounts.find(a => node.storage.isServing(a.pub));
-  if (!servingAcc) { toast('Not currently serving storage', 'error'); return; }
-
-  const result = await node.storage.broadcastHeartbeat(servingAcc.pub, servingAcc.keys);
-  if (result.success) { toast('Heartbeat sent', 'success'); refreshStorage(); }
-  else { toast(`${result.error}`, 'error'); }
-});
 
 
 $('#btnClearCache')?.addEventListener('click', () => {

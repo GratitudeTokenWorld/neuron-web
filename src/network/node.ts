@@ -746,7 +746,6 @@ export class NeuronNode extends EventEmitter {
     }
     // A7: faceAccountCount is maintained incrementally by addBlock - no rebuild needed
     // Sync heartbeat counts to the current rolling window (uses Date.now() as reference).
-    this.ledger.refreshHeartbeatCounts();
 
     // Seed peer fallbacks from heartbeat-recorded smoke addresses. Providers that have
     // been online recently will have their current (or last known) smoke address on-chain.

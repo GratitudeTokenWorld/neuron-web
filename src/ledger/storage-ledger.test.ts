@@ -96,25 +96,6 @@ async function provider(capacityGB = 10) {
   return { ledger, keys, chain };
 }
 
-/**
- * A full day of heartbeats on epoch `TODAY - 2`, each reporting `storedGB` held.
- *
- * Also records reader attestation for the same volume. Since 2026-09-22 a
- * reward is payable only against reader-signed evidence and this path fails
- * closed without it, so a test about the REWARD arithmetic has to supply the
- * attestation the network would. `attest: false` exercises the fail-closed
- * rule itself.
- */
-function fullDayOfHeartbeats(ledger: EngineLedger, chain: Chain, storedGB: number): void {
-  for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-    const { result } = chain.push(
-      ledger, 'storage-heartbeat', DAY1 + i * HEARTBEAT_INTERVAL_MS,
-      { storedBytes: storedGB * GB_BYTES, smokeAddr: 'p1.example' },
-    );
-    expect(result.success).toBe(true);
-  }
-}
-
 afterEach(() => { vi.useRealTimers(); });
 
 describe('storage blocks on the engine', () => {
@@ -127,25 +108,18 @@ describe('storage blocks on the engine', () => {
     expect(ledger.getStorageProviders().map(x => x.pub)).toEqual([keys.pub]);
   });
 
-  it('reports address, geo and bytes held — but does NOT renew the lease', async () => {
-    // A heartbeat still carries the routing details peers need. Since
-    // 2026-09-22 it no longer renews the lease: that is decided by observed
-    // service (`content/custody-sampling.ts`), because announcing presence is
-    // not evidence of holding anything.
-    const { ledger, keys, chain } = await provider();
-    chain.push(ledger, 'storage-heartbeat', DAY1, {
-      smokeAddr: 'p1.example', storedBytes: 3 * GB_BYTES, countryCode: 'DE',
-    });
+  it('no longer carries routing details on the chain at all', async () => {
+    // Address, country and bytes held used to ride in heartbeat blocks. They
+    // are ephemeral and never belonged on a permanent chain, so they travel as
+    // a signed off-chain presence beacon now (`content/presence.ts`). What the
+    // chain keeps is the durable half: who registered, with how much capacity.
+    const { ledger, keys } = await provider();
     const p = ledger.storageProviders.get(keys.pub)!;
-    expect(p.smokeAddr).toBe('p1.example');
-    expect(p.countryCode).toBe('DE');
-    expect(p.lastActualStoredBytes).toBe(3 * GB_BYTES);
-    // Past the joining grace with nothing observed, the announcement bought
-    // nothing.
+    expect(p.capacityGB).toBeGreaterThan(0);
+    // And the lease is decided by observed service, not by anything announced.
     expect(ledger.isProviderLive(keys.pub, DAY0 + MAX_OFFLINE_MS + 1)).toBe(false);
     ledger.providerLedger.liveness.record(keys.pub, true, DAY1);
-    expect(ledger.isProviderLive(keys.pub, DAY1 + MAX_OFFLINE_MS - 1)).toBe(true);
-    expect(ledger.isProviderLive(keys.pub, DAY1 + MAX_OFFLINE_MS)).toBe(false);
+    expect(ledger.isProviderLive(keys.pub, DAY1 + 1000)).toBe(true);
   });
 
   it('drops the provider on deregister', async () => {
@@ -163,36 +137,8 @@ describe('storage blocks on the engine', () => {
     const keys = generateKeyPair();
     const open = await openAcct(ledger, keys, 'human-x');
     const chain = new Chain(keys, open);
-    expect(chain.push(ledger, 'storage-heartbeat', DAY0, {}).result.error).toMatch(/not a registered/);
+    expect(chain.push(ledger, 'storage-deregister', DAY0, {}).result.error).toMatch(/not a registered/);
     expect(chain.push(ledger, 'storage-register', DAY0, { capacityGB: 0 }).result.error).toMatch(/positive/);
-  });
-});
-
-describe('an early heartbeat must not truncate the chain', () => {
-  it('accepts it, does not count it, and keeps accepting later blocks', async () => {
-    const { ledger, keys, chain } = await provider(10);
-    chain.push(ledger, 'storage-heartbeat', DAY1, { storedBytes: GB_BYTES });
-
-    // A provider spamming heartbeats a minute apart: every one is a valid,
-    // signed, correctly-linked block. Rejecting them would strand the rest of
-    // the chain as non-sequential — the failure that once made NFTs vanish on
-    // reload. So they apply, and earn nothing.
-    for (let i = 1; i <= 10; i++) {
-      const { result } = chain.push(ledger, 'storage-heartbeat', DAY1 + i * 60_000, {});
-      expect(result.success).toBe(true);
-    }
-    expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + 60_000 * 11)).toBe(1);
-
-    // The chain is intact: the next legitimate block still applies.
-    const { result } = chain.push(ledger, 'storage-heartbeat', DAY1 + HEARTBEAT_INTERVAL_MS, {});
-    expect(result.success).toBe(true);
-    expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
-
-    // And the spam bought nothing: only two renewals counted, which is what
-    // the LEASE is measured on. (The reward path this used to assert against
-    // was deleted on 2026-09-22 — storage no longer mints from self-reported
-    // volume at all.)
-    expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
   });
 });
 
@@ -212,10 +158,7 @@ describe('publish feasibility follows the lease, not the declaration', () => {
 
     // Only one keeps renewing. The other's lease lapses and it stops counting —
     // its 10GB declaration is still on-chain and still worthless for custody.
-    // (The clock moves first: a heartbeat dated in the future is refused.)
     vi.setSystemTime(DAY0 + HEARTBEAT_INTERVAL_MS);
-    const renew = chain.push(ledger, 'storage-heartbeat', DAY0 + HEARTBEAT_INTERVAL_MS, { storedBytes: 0 });
-    expect(renew.result.success).toBe(true);
     // The lease is renewed by SERVICE now, not by the announcement above.
     ledger.providerLedger.liveness.record(chain.keys.pub, true, DAY0 + HEARTBEAT_INTERVAL_MS);
     vi.setSystemTime(DAY0 + MAX_OFFLINE_MS + 1);

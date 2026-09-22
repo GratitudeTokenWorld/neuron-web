@@ -36,200 +36,6 @@ function signed(
 
 const DAY = 100 * 24 * 60 * 60 * 1000;
 
-describe('foldProviderBlocks', () => {
-  it('learns capacity, address and liveness from a provider it has never met', () => {
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 50, deviceId: 'dev-x' });
-    const hb = signed(p, 'storage-heartbeat', 2, DAY + 1000, {
-      smokeAddr: 'x.example', storedBytes: 5 * GB_BYTES, countryCode: 'RO',
-    });
-    const [rec] = foldProviderBlocks([reg, hb]);
-    expect(rec!.pub).toBe(p.pub);
-    expect(rec!.capacityGB).toBe(50);
-    expect(rec!.smokeAddr).toBe('x.example');
-    expect(rec!.countryCode).toBe('RO');
-    expect(rec!.lastActualStoredBytes).toBe(5 * GB_BYTES);
-    expect(rec!.lastHeartbeat).toBe(DAY + 1000);
-    expect(rec!.discovered).toBe(true);
-  });
-
-  it('refuses a block whose signature does not hold', () => {
-    // The whole trust argument: a relay cannot invent a provider or inflate a
-    // capacity, because the client checks the provider's own signature.
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 50 });
-    const tampered = { ...reg, storage: { capacityGB: 500_000 } } as Block;
-    expect(foldProviderBlocks([tampered])).toEqual([]);
-    // ...and a forged signer is likewise rejected.
-    const impostor = { ...reg, accountId: generateKeyPair().pub } as Block;
-    expect(foldProviderBlocks([impostor])).toEqual([]);
-  });
-
-  it('ignores non-storage blocks entirely', () => {
-    const p = generateKeyPair();
-    const send = signed(p, 'send', 1, DAY, {});
-    expect(foldProviderBlocks([send])).toEqual([]);
-  });
-
-  it('drops a provider whose latest registration is a deregistration', () => {
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 50 });
-    // A deregister is a different block type, so the newest REGISTER still
-    // stands — a relay serving only the register would keep it visible. Guard
-    // the malformed/zero case too.
-    const zero = signed(p, 'storage-register', 3, DAY + 2000, { capacityGB: 0 });
-    expect(foldProviderBlocks([reg, zero])).toEqual([]);
-  });
-
-  it('takes the newest record by chain INDEX, not by self-reported timestamp', () => {
-    // Timestamps are self-reported and could be backdated; index is monotonic
-    // within a signed chain.
-    const p = generateKeyPair();
-    const older = signed(p, 'storage-register', 1, DAY + 9_000_000, { capacityGB: 10 });
-    const newer = signed(p, 'storage-register', 4, DAY, { capacityGB: 99 });
-    const [rec] = foldProviderBlocks([older, newer]);
-    expect(rec!.capacityGB).toBe(99);
-  });
-
-  it('will not count a heartbeat from a previous registration as liveness', () => {
-    // Re-registering ends the old lease. Crediting the earlier heartbeat would
-    // let a provider look live on the strength of a previous life.
-    const p = generateKeyPair();
-    const oldHb = signed(p, 'storage-heartbeat', 1, DAY, { smokeAddr: 'stale.example' });
-    const reg = signed(p, 'storage-register', 2, DAY + 1000, { capacityGB: 10 });
-    const [rec] = foldProviderBlocks([oldHb, reg]);
-    expect(rec!.lastHeartbeat).toBe(0);
-    expect(rec!.smokeAddr).toBeUndefined();
-  });
-
-  it('survives a batch containing junk', () => {
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 7 });
-    const junk = { type: 'storage-register', accountId: 'nope', index: 0 } as unknown as Block;
-    expect(foldProviderBlocks([junk, reg])).toHaveLength(1);
-  });
-});
-
-describe('scoring the unknown', () => {
-  it('does NOT score a provider it has no history for as perfect', () => {
-    // Score weights provider selection (capacity × score). Scoring the unknown
-    // at 1.0 ranked every stranger above every provider we had real evidence
-    // about — including ourselves — and put "0% uptime, score 1.000" on screen.
-    const p = generateKeyPair();
-    const [rec] = foldProviderBlocks([signed(p, 'storage-register', 1, DAY, { capacityGB: 10 })]);
-    expect(rec!.score).toBe(UNKNOWN_SCORE);
-    expect(rec!.score).toBeLessThan(1);
-    expect(rec!.discovered).toBe(true);       // so the UI can render it as "—"
-  });
-
-  it('lets a provider we have actually watched outrank the unknown', () => {
-    const pl = new ProviderLedger();
-    const good = generateKeyPair();
-    pl.apply(signed(good, 'storage-register', 1, DAY, { capacityGB: 10 }), DAY);
-    pl.apply(signed(good, 'storage-heartbeat', 2, DAY, {}), DAY);
-    pl.refresh(DAY + 1000);
-    pl.setDiscovered(foldProviderBlocks([
-      signed(generateKeyPair(), 'storage-register', 1, DAY, { capacityGB: 10 }),
-    ]));
-    const ranked = pl.allProviders();
-    expect(ranked[0]!.pub).toBe(good.pub);            // measured reliability wins
-    expect(ranked[0]!.score).toBeGreaterThan(UNKNOWN_SCORE);
-  });
-
-  it('does not punish a provider for having only just registered', () => {
-    // One heartbeat an hour after registering is a PERFECT record — only one was
-    // due. Dividing by a flat 6/day scored it 0.167 and made every healthy new
-    // provider look broken for its first day.
-    const pl = new ProviderLedger();
-    const p = generateKeyPair();
-    pl.apply(signed(p, 'storage-register', 1, DAY, { capacityGB: 10 }), DAY);
-    pl.apply(signed(p, 'storage-heartbeat', 2, DAY, {}), DAY);
-    pl.refresh(DAY + 60 * 60 * 1000);                 // one hour in
-    expect(pl.get(p.pub)!.score).toBe(1);
-
-    // A day later with still only that one heartbeat, it IS unreliable.
-    pl.refresh(DAY + 24 * 60 * 60 * 1000);
-    expect(pl.get(p.pub)!.score).toBeCloseTo(1 / 6, 3);
-  });
-});
-
-describe('discovered providers in the ledger', () => {
-  it('widens the selection pool without becoming authoritative', () => {
-    const pl = new ProviderLedger();
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 10 });
-    const hb = signed(p, 'storage-heartbeat', 2, DAY, { storedBytes: 0 });
-    pl.setDiscovered(foldProviderBlocks([reg, hb]));
-
-    expect(pl.allProviders().map(x => x.pub)).toEqual([p.pub]);
-    expect(pl.isLive(p.pub, DAY + 1000)).toBe(true);
-    expect(pl.freeBytes(p.pub)).toBe(10 * GB_BYTES);
-    // Known, but not a chain we hold — so it can never be treated as verified
-    // chain state, only as a routing hint.
-    expect(pl.isAuthoritative(p.pub)).toBe(false);
-  });
-
-  it('lets a discovered lease expire like any other', () => {
-    const pl = new ProviderLedger();
-    const p = generateKeyPair();
-    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 10 });
-    const hb = signed(p, 'storage-heartbeat', 2, DAY, {});
-    pl.setDiscovered(foldProviderBlocks([reg, hb]));
-    expect(pl.isLive(p.pub, DAY + MAX_OFFLINE_MS - 1)).toBe(true);
-    expect(pl.isLive(p.pub, DAY + MAX_OFFLINE_MS)).toBe(false);
-  });
-
-  it('replaces the discovered set so a departed provider disappears', () => {
-    const pl = new ProviderLedger();
-    const p = generateKeyPair();
-    pl.setDiscovered(foldProviderBlocks([signed(p, 'storage-register', 1, DAY, { capacityGB: 10 })]));
-    expect(pl.allProviders()).toHaveLength(1);
-    pl.setDiscovered([]);          // next poll no longer lists it
-    expect(pl.allProviders()).toHaveLength(0);
-  });
-
-  it('prefers the chain we hold over anything discovery says', () => {
-    const pl = new ProviderLedger();
-    const p = generateKeyPair();
-    // Authoritative: 10GB, applied from a block we hold.
-    pl.apply(signed(p, 'storage-register', 1, DAY, { capacityGB: 10 }), DAY);
-    // Discovery claims 999GB for the same account.
-    pl.setDiscovered(foldProviderBlocks([signed(p, 'storage-register', 2, DAY, { capacityGB: 999 })]));
-    expect(pl.allProviders()).toHaveLength(1);
-    expect(pl.get(p.pub)!.capacityGB).toBe(10);
-  });
-});
-
-describe('selectDiscoveryBlocks (what an archive serves)', () => {
-  it('serves the newest register + heartbeat per provider', () => {
-    const a = generateKeyPair();
-    const blocks = [
-      signed(a, 'storage-register', 1, DAY, { capacityGB: 5 }),
-      signed(a, 'storage-heartbeat', 2, DAY + 10, {}),
-      signed(a, 'storage-heartbeat', 3, DAY + 20, {}),
-    ];
-    const out = selectDiscoveryBlocks(blocks, 10);
-    expect(out).toHaveLength(2);
-    expect(out.map(b => b.index).sort()).toEqual([1, 3]);
-  });
-
-  it('bounds the answer — an unbounded reply is the firehose again', () => {
-    const blocks: Block[] = [];
-    for (let i = 0; i < 30; i++) {
-      blocks.push(signed(generateKeyPair(), 'storage-register', 1, DAY + i, { capacityGB: 5 }));
-    }
-    expect(selectDiscoveryBlocks(blocks, 5)).toHaveLength(5);   // 5 providers, no heartbeats
-    expect(selectDiscoveryBlocks(blocks, 0)).toHaveLength(0);
-  });
-
-  it('omits providers that have declared zero capacity', () => {
-    const a = generateKeyPair();
-    expect(selectDiscoveryBlocks([signed(a, 'storage-register', 1, DAY, { capacityGB: 0 })], 10)).toEqual([]);
-  });
-});
-
-// ── Departures ───────────────────────────────────────────────────────────────
-
 describe('deregistration must reach every node', () => {
   const T0 = 1_000 * 24 * 60 * 60 * 1000;
 
@@ -256,10 +62,9 @@ describe('deregistration must reach every node', () => {
   it('the fold drops a provider whose newest block is a departure', () => {
     const k = generateKeyPair();
     const reg = signed(k, 'storage-register', 1, T0, { capacityGB: 10, deviceId: 'd' });
-    const hb = signed(k, 'storage-heartbeat', 2, T0 + 100, { storedBytes: GB_BYTES });
     const dr = signed(k, 'storage-deregister', 3, T0 + 200, {});
-    expect(foldProviderBlocks([reg, hb])).toHaveLength(1);       // still serving
-    expect(foldProviderBlocks([reg, hb, dr])).toHaveLength(0);   // gone
+    expect(foldProviderBlocks([reg])).toHaveLength(1);       // still serving
+    expect(foldProviderBlocks([reg, dr])).toHaveLength(0);   // gone
   });
 
   it('survives the union: one relay\'s stale register plus another\'s departure', () => {
@@ -302,5 +107,74 @@ describe('deregistration must reach every node', () => {
     const page = selectDiscoveryBlocks([...live, reg, dr], 3, T0 + 2_000);
     expect(page.filter(b => b.type === 'storage-register')).toHaveLength(3);
     expect(page.filter(b => b.type === 'storage-deregister')).toHaveLength(1);
+  });
+});
+
+describe('discovery after the heartbeat was removed (2026-09-22)', () => {
+  it('learns capacity and identity from a register block alone', () => {
+    // Discovery answers the DURABLE half — who registered, with how much — and
+    // a caller merges presence over it for the address.
+    const p = generateKeyPair();
+    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 10, deviceId: 'dev-a' });
+    const [found] = foldProviderBlocks([reg]);
+    expect(found!.pub).toBe(p.pub);
+    expect(found!.capacityGB).toBe(10);
+    expect(found!.deviceId).toBe('dev-a');
+    expect(found!.discovered).toBe(true);
+  });
+
+  it('reports routing details as UNKNOWN rather than guessing', () => {
+    // These used to come from the latest heartbeat. With that gone, a relay has
+    // nothing durable to say about them, and saying nothing is the honest
+    // answer — the alternative is rendering the unmeasured as fact.
+    const p = generateKeyPair();
+    const [found] = foldProviderBlocks(
+      [signed(p, 'storage-register', 1, DAY, { capacityGB: 10, deviceId: 'd' })]);
+    expect(found!.smokeAddr).toBeUndefined();
+    expect(found!.countryCode).toBeUndefined();
+    expect(found!.lastActualStoredBytes).toBe(0);
+    expect(found!.lastHeartbeat).toBe(0);
+  });
+
+  it('scores a discovered provider as UNKNOWN, never as good', () => {
+    // We hold no history for it, so its score is a neutral prior rather than a
+    // number we invented.
+    const p = generateKeyPair();
+    const [found] = foldProviderBlocks(
+      [signed(p, 'storage-register', 1, DAY, { capacityGB: 10, deviceId: 'd' })]);
+    expect(found!.score).toBe(UNKNOWN_SCORE);
+    expect(found!.heartbeatsLast24h).toBe(0);
+  });
+
+  it('refuses a forged register block', () => {
+    // The whole security claim: a relay may choose what to show and cannot
+    // invent it. A block whose signature does not verify contributes nothing.
+    const p = generateKeyPair();
+    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 10, deviceId: 'd' });
+    const forged = { ...reg, signature: 'ff'.repeat(64) } as Block;
+    expect(foldProviderBlocks([forged])).toHaveLength(0);
+  });
+
+  it('cannot be inflated past what the provider itself signed', () => {
+    const p = generateKeyPair();
+    const reg = signed(p, 'storage-register', 1, DAY, { capacityGB: 10, deviceId: 'd' });
+    // Tampering with the payload breaks the signature over it.
+    const inflated = { ...reg, storage: { ...reg.storage, capacityGB: 1_000_000 } } as Block;
+    expect(foldProviderBlocks([inflated])).toHaveLength(0);
+  });
+
+  it('serves the newest registration per provider, bounded by the limit', () => {
+    const a = generateKeyPair();
+    const b = generateKeyPair();
+    const blocks = [
+      signed(a, 'storage-register', 1, DAY, { capacityGB: 5, deviceId: 'a' }),
+      signed(a, 'storage-register', 2, DAY + 1000, { capacityGB: 9, deviceId: 'a' }),
+      signed(b, 'storage-register', 1, DAY + 2000, { capacityGB: 7, deviceId: 'b' }),
+    ];
+    const served = selectDiscoveryBlocks(blocks, 10, DAY + 3000);
+    // One per provider — an unbounded answer is the firehose over HTTP.
+    expect(served.filter(x => x.accountId === a.pub)).toHaveLength(1);
+    expect(served.filter(x => x.accountId === a.pub)[0]!.storage?.capacityGB).toBe(9);
+    expect(selectDiscoveryBlocks(blocks, 1, DAY + 3000).length).toBeLessThanOrEqual(1);
   });
 });

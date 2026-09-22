@@ -1771,7 +1771,7 @@ export class Libp2pNetwork extends EventEmitter {
 
   private static readonly VALID_BLOCK_TYPES = new Set([
     'open', 'send', 'receive', 'deploy', 'call',
-    'storage-register', 'storage-deregister', 'storage-heartbeat', 'storage-reward',
+    'storage-register', 'storage-deregister', 'storage-settle',
     'update',
   ]);
 

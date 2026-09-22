@@ -649,35 +649,7 @@ export class EngineLedger extends EventEmitter {
     });
   }
 
-  /**
-   * Renew the custody lease: the periodic proof this provider is still here and
-   * still holding what it says it holds.
-   *
-   * Refuses to build one early. `addBlock` deliberately *accepts* an early
-   * heartbeat from a peer (rejecting mid-chain would truncate their chain) and
-   * simply doesn't count it — but there is no reason for us to emit one, and the
-   * error tells the caller when to come back.
-   */
-  async createStorageHeartbeat(
-    pub: string, keys: SignerKeys, smokeAddr?: string, storedBytes?: number, countryCode?: string,
-  ): Promise<{ block?: Block; error?: string }> {
-    const head = this.getAccountHead(pub);
-    if (!head) return { error: 'Account not opened' };
-    const provider = this.providerLedger.providers.get(pub);
-    if (!provider || provider.capacityGB <= 0) return { error: 'Not a registered storage provider' };
-    const now = Date.now();
-    if (!this.providerLedger.countsAsRenewal(pub, now)) {
-      const dueIn = provider.lastHeartbeat + HEARTBEAT_INTERVAL_MS - HEARTBEAT_GRACE_MS - now;
-      return { error: `Heartbeat interval not reached (next in ${Math.ceil(dueIn / 60_000)}min)` };
-    }
-    return this.appendStorageBlock(pub, keys, 'storage-heartbeat', head.balance, {
-      ...(smokeAddr ? { smokeAddr } : {}),
-      ...(typeof storedBytes === 'number' ? { storedBytes } : {}),
-      ...(countryCode ? { countryCode } : {}),
-    });
-  }
-
-  /**
+    /**
    * Settle reader-attested service into a minted payout.
    *
    * The receipts go IN the block, so every peer re-derives the same figure
@@ -746,9 +718,6 @@ export class EngineLedger extends EventEmitter {
         break;
       case 'storage-deregister':
         this.emit('storage:deregistered', { pub: block.accountId });
-        break;
-      case 'storage-heartbeat':
-        this.emit('storage:heartbeat', { pub: block.accountId, timestamp: block.timestamp });
         break;
       case 'storage-settle':
         this.emit('storage:settled', {
@@ -890,7 +859,7 @@ export class EngineLedger extends EventEmitter {
       // without this arithmetic a validly-signed reward block could name any
       // balance it liked. Nothing else in the stack catches it — the chain is
       // single and valid, so neither fraud proofs nor committees ever look.
-      if (block.type === 'storage-register' || block.type === 'storage-deregister' || block.type === 'storage-heartbeat') {
+      if (block.type === 'storage-register' || block.type === 'storage-deregister') {
         if (block.balance !== head.balance) return { success: false, error: `${block.type} must preserve balance` };
       }
       if (block.type === 'storage-settle') {
@@ -1329,12 +1298,6 @@ export class EngineLedger extends EventEmitter {
   estimateBlockchainSizeBytes(): number {
     return this.allBlocks.size * 600;
   }
-  countHeartbeatsLast24h(pub: string, refTime = Date.now()): number {
-    return this.providerLedger.countHeartbeatsLast24h(pub, refTime);
-  }
-  getBlocksSince(): Block[] {
-    return [];
-  }
   /**
    * Can the network actually take custody of a file of this size right now?
    *
@@ -1366,27 +1329,7 @@ export class EngineLedger extends EventEmitter {
     /* optimistic confirmation — no fork voting in this slice */
   }
   processConflicts(): void {}
-  /** Recompute 24h heartbeat counts against the wall clock. Call after a chain replay. */
-  refreshHeartbeatCounts(): void {
-    this.providerLedger.refresh(Date.now());
-  }
-  updateProviderScore(provider: StorageProviderState): void {
-    this.providerLedger.updateScore(provider);
-  }
-  /**
-   * A provider's uptime as a 0..1 fraction, or `undefined` when we hold none of
-   * its chain and therefore measured nothing. The single definition — the UI,
-   * the score and `StorageManager.getUptimePct` all read it, because they used
-   * to compute it three different ways and disagree.
-   */
-  providerUptime(provider: StorageProviderState, now = Date.now()): number | undefined {
-    return this.providerLedger.uptimeFraction(provider, now);
-  }
-  /** Heartbeats this provider could have sent so far — the uptime denominator. */
-  expectedHeartbeats(provider: StorageProviderState, now = Date.now()): number {
-    return this.providerLedger.expectedHeartbeats(provider, now);
-  }
-  purgeAccount(pub: string): void {
+      purgeAccount(pub: string): void {
     this.held.delete(pub);
     this.providerLedger.providers.delete(pub);
     const acc = this.accountsByPub.get(pub);
@@ -1415,7 +1358,8 @@ export class EngineLedger extends EventEmitter {
     this.epochWeightSnapshots.clear();
     this.committee = this.makeCommittee();
   }
-  private deferred(feature: string): { error: string } {
+
+    private deferred(feature: string): { error: string } {
     return { error: `${feature} is not available in the engine slice (dApp phase)` };
   }
   createDeploy(): { error: string } {

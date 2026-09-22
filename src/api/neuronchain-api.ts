@@ -433,11 +433,6 @@ export class NeuronChainAPI extends EventEmitter {
     return this.node.distributeContent(cids, uploaderPub, keys);
   }
 
-  /** Manually trigger a heartbeat for a local provider account (normally automatic). */
-  async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    return this.node.storage.broadcastHeartbeat(pub, keys);
-  }
-
   // ── Block explorer ────────────────────────────────────────────────────────
 
   getBlock(hash: string): AccountBlock | undefined { return this.node.ledger.getBlock(hash); }

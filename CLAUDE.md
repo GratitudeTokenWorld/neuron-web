@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **826 tests / 91 files passing**, `npm run build` clean.
+Current baseline: **797 tests / 92 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -133,16 +133,18 @@ legacy `DAGLedger`** — it takes an `EngineLedger` and gossips storage blocks o
 the engine topic. Three things there are load-bearing and were decided, not
 inherited:
 
-- **The lease is renewed by OBSERVED SERVICE, not by the heartbeat** (changed
-  2026-09-22). `providerLedger.liveness` (`content/custody-sampling.ts` →
-  `CustodyLiveness`) is fed by spot checks, reads and sampled challenges —
-  evidence the network generates anyway. A heartbeat still carries routing
-  details (`smokeAddr`, country) but renews nothing: announcing presence is not
-  evidence of holding anything. A newly registered provider nobody has probed
-  is live for one window so joining is possible (Principle 1), and not after,
-  so being unobserved is not a free pass. `isLive()` / `liveStorageProviders()`
-  still answer custody questions; `getStorageProviders()` still answers routing
-  ones.
+- **The heartbeat is GONE (deleted 2026-09-22)** — block type, scheduling,
+  epoch counters, uptime scoring and UI. It did three jobs and all three moved:
+  payment to reader-signed receipts (`content/read-receipts.ts`), the lease to
+  observed service (`content/custody-sampling.ts` → `CustodyLiveness`, fed by
+  spot checks and reads), and routing to a signed **off-chain presence beacon**
+  (`content/presence.ts`). The beacon carries what an address needs and never
+  touches the chain, because an address is ephemeral and was costing 2,555
+  blocks per provider per year to distribute a string that changes. A newly
+  registered provider is live for one window so joining works (Principle 1),
+  and not after. Provider discovery now serves the durable half — who
+  registered, with how much capacity — and a caller merges presence over it.
+  ⚠ Consensus-visible: wipe before running against an old chain.
 - **An early heartbeat is accepted and not counted; only a flood is rejected.**
   Rejecting a validly-signed block mid-chain truncates it and strands every later
   block as non-sequential — the failure that made NFTs vanish on reload — so

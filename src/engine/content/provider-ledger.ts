@@ -9,7 +9,8 @@ import type { Block } from '../core/block.js';
  * Four block types drive it, all on the provider's OWN account chain:
  *   - `storage-register`   declare capacity (the upper bound offered to the network)
  *   - `storage-deregister` release the lease and leave
- *   - `storage-heartbeat`  the periodic liveness proof — **this is the lease renewal**
+ *   (The heartbeat and reward block types were removed 2026-09-22: liveness is
+ *   observed service, payment is reader-signed receipts settled in bulk.)
  *
  * The custody model this implements (decided 2026-08-10, see CLAUDE.md):
  * **durability is a flow property.** Content survives because the network
@@ -424,22 +425,7 @@ export class ProviderLedger {
 
   // ── Validation (shared by block creation and block application) ─────────────
 
-  /**
-   * Would this heartbeat renew the lease, or is it early? Heartbeats are how uptime
-   * is metered, so an unthrottled provider could mint a full day's reward in a
-   * minute. Returns false for one that arrives inside the interval.
-   */
-  countsAsRenewal(pub: string, timestamp: number): boolean {
-    if (!this.providers.has(pub)) return false;
-    // Read the clock from the DURABLE record, never the live profile: the
-    // profile is destroyed by a deregister, and a provider that can destroy its
-    // own interval clock has no interval. See `durable`.
-    const last = this.durable.get(pub)?.lastHeartbeat ?? 0;
-    if (last === 0) return true;
-    return timestamp - last >= HEARTBEAT_INTERVAL_MS - HEARTBEAT_GRACE_MS;
-  }
-
-  /**
+    /**
    * The reward terms an epoch supports — the single source of truth for both
    * *issuing* a reward and *validating* someone else's. Legacy kept two copies of
    * this arithmetic in sync by comment ("compute the effective GB the same way
@@ -494,24 +480,6 @@ export class ProviderLedger {
         if (!p || p.capacityGB <= 0) return 'storage-deregister: not a registered storage provider';
         return null;
       }
-      case 'storage-heartbeat': {
-        const p = this.providers.get(block.accountId);
-        if (!p || p.capacityGB <= 0) return 'storage-heartbeat: not a registered storage provider';
-        // A future-dated heartbeat would extend a lease the provider has not earned
-        // and inflate a not-yet-started epoch. Past-dated ones are fine — replaying
-        // an old chain from disk must not reject its own history.
-        if (block.timestamp > now + 10 * 60 * 1000) {
-          return 'storage-heartbeat: timestamp too far in the future';
-        }
-        // The flood ceiling — the only mid-chain rejection here, deliberately set
-        // 4× above the honest rate so only a padding chain reaches it. Counted off
-        // the chain itself, so every node draws the line at the same block.
-        const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
-        if (this.submittedInEpoch(block.accountId, epochDay) >= MAX_HEARTBEATS_PER_EPOCH_HARD) {
-          return `storage-heartbeat: more than ${MAX_HEARTBEATS_PER_EPOCH_HARD} heartbeats in one epoch`;
-        }
-        return null;
-      }
       case 'storage-settle': {
         const st = block.storage;
         if (!st) return 'storage-settle: missing storage payload';
@@ -553,7 +521,6 @@ export class ProviderLedger {
     switch (block.type) {
       case 'storage-register': return this.applyRegister(block);
       case 'storage-deregister': return this.applyDeregister(block);
-      case 'storage-heartbeat': return this.applyHeartbeat(block, now);
       case 'storage-settle': return this.applySettle(block);
       default: return;
     }
@@ -625,172 +592,27 @@ export class ProviderLedger {
     if (p) p.lastSettledPeriod = st.periodIndex;
   }
 
-  private applyHeartbeat(block: Block, now: number): void {
-    const pub = block.accountId;
-    const p = this.providers.get(pub);
-    if (!p) return;
-
-    // Address/geo/usage travel on every heartbeat, counted or not — they are
-    // reports, not earnings, and stale routing data helps nobody.
-    const s = block.storage;
-    if (s?.smokeAddr) p.smokeAddr = s.smokeAddr;
-    if (typeof s?.storedBytes === 'number' && s.storedBytes >= 0) p.lastActualStoredBytes = s.storedBytes;
-    if (s?.countryCode && /^[A-Z]{2}$/.test(s.countryCode)) p.countryCode = s.countryCode;
-
-    // Every heartbeat counts toward the flood ceiling, even one worth no uptime —
-    // otherwise padding the chain with early blocks costs nothing at all.
-    const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
-    const rec = this.epochRecord(pub, epochDay);
-    rec.submitted += 1;
-
-    // Only a heartbeat that satisfies the interval renews the lease or earns uptime.
-    if (this.countsAsRenewal(pub, block.timestamp)) {
-      p.lastHeartbeat = block.timestamp;
-      const d = this.durable.get(pub);
-      if (d) d.lastHeartbeat = block.timestamp;   // survives a deregister
-      this.recordHeartbeatTime(pub, block.timestamp);
-      rec.heartbeats += 1;
-      if (typeof s?.storedBytes === 'number' && s.storedBytes >= 0 && block.timestamp >= rec.latestBytesAt) {
-        rec.latestBytes = s.storedBytes;
-        rec.latestBytesAt = block.timestamp;
-      }
-    }
-    this.pruneEpochs(pub, epochDay);
-
-    // Count against *now*, not the block timestamp: a block can be up to an
-    // interval old, and a window anchored on it reads high, then drops on the next
-    // restart when the count is recomputed against the wall clock.
-    p.heartbeatsLast24h = this.countHeartbeatsLast24h(pub, now);
-    this.updateScore(p, now);
-  }
-
-  /** Counted heartbeats inside a reward epoch — what the reward is priced on. */
-  heartbeatsInEpoch(pub: string, epochDay: number): number {
-    return this.epochs.get(pub)?.get(epochDay)?.heartbeats ?? 0;
-  }
-
-  /** Every heartbeat block seen in an epoch, counted or not — what the ceiling bounds. */
-  submittedInEpoch(pub: string, epochDay: number): number {
-    return this.epochs.get(pub)?.get(epochDay)?.submitted ?? 0;
-  }
-
-  /** Latest reported stored GB inside a reward epoch (0 = nothing reported). */
-  storedGBInEpoch(pub: string, epochDay: number): number {
-    const rec = this.epochs.get(pub)?.get(epochDay);
-    return rec ? rec.latestBytes / GB_BYTES : 0;
-  }
-
-  /** Declared capacity as it stood when an epoch began (0 = not registered then). */
-  capacityAtEpochStart(pub: string, epochDay: number): number {
-    const history = this.capacityHistory.get(pub);
-    if (!history) return 0;
-    const epochStart = epochDay * REWARD_EPOCH_MS;
-    let capacity = 0;
-    for (const entry of history) {
-      if (entry.ts >= epochStart) break;
-      capacity = entry.capacityGB;
-    }
-    return capacity;
-  }
-
-  /**
-   * Counted renewals in the trailing window ending at `refTime`.
-   *
-   * The window is one epoch **plus half a heartbeat interval**, and that slack is
-   * the whole point. The count is divided by `MAX_HEARTBEATS_PER_EPOCH`, so the
-   * two only agree if a perfect provider reliably has that many renewals inside
-   * the window — and it does not: a real timer fires at `interval + jitter`
-   * (never early, see `scheduleNextHeartbeat`), so six intervals span slightly
-   * MORE than one epoch. The oldest renewal therefore ages out of a
-   * one-epoch-wide window a few seconds before its replacement arrives, and a
-   * flawless provider reads 5/6 during the gap.
-   *
-   * Measured before the fix, on the compressed dev profile: a provider that
-   * never missed a beat displayed 83% for 6.3% of the time, and its score fell
-   * with it. Found by Lucian, 2026-08-16, who noticed the number oscillating.
-   *
-   * Half an interval is deliberately less than a whole one: it absorbs
-   * accumulated jitter (six intervals of it is a couple of percent) while a
-   * genuinely MISSED renewal leaves a gap of two full intervals, which the
-   * window still cannot hide.
-   */
-  countHeartbeatsLast24h(pub: string, refTime: number): number {
-    const times = this.heartbeatTimes.get(pub);
-    if (!times) return 0;
-    const cutoff = refTime - REWARD_EPOCH_MS - HEARTBEAT_INTERVAL_MS / 2;
-    return times.filter(t => t >= cutoff).length;
-  }
-
-  /**
-   * Recompute the 24h counts and scores against the wall clock. Call after a chain
-   * replay: the counts written during replay are relative to blocks that may be
-   * hours old.
-   */
-  refresh(now: number): void {
-    for (const p of this.providers.values()) {
-      p.heartbeatsLast24h = this.countHeartbeatsLast24h(p.pub, now);
-      this.updateScore(p, now);
-    }
-  }
-
   /**
    * Composite score: uptime × latency × spot-check, each floored at 0.1 so one bad
    * signal cannot zero a provider out entirely. Earning rate projects the daily
    * reward at the current score, metered on bytes actually held (capped by declared
    * capacity) — declared-but-empty capacity earns nothing.
    */
-  /**
-   * Heartbeats this provider could have sent inside the counting window.
-   *
-   * Bounded by how long it has been registered: a node registered one interval
-   * ago can only ever have sent one, so measuring it against a full epoch's
-   * worth reports a perfectly behaved new provider as mostly-down.
-   */
-  expectedHeartbeats(p: StorageProviderState, now: number): number {
-    const elapsed = Math.max(0, Math.min(now - p.registeredAt, REWARD_EPOCH_MS));
-    return Math.max(1, Math.min(
-      MAX_HEARTBEATS_PER_EPOCH,
-      Math.floor(elapsed / HEARTBEAT_INTERVAL_MS) + 1,
-    ));
-  }
-
-  /**
-   * **The** uptime number: counted renewals over renewals that were due, 0..1.
-   *
-   * There were three of these and they disagreed. `updateScore` divided by
-   * heartbeats-since-registration; `StorageManager.getUptimePct` and the two UI
-   * call sites divided by a flat 6. So the SCORE column and the UPTIME column
-   * beside it were computed from different denominators, and a provider could
-   * read 17% next to a score that had priced it far higher — the same
-   * "bar and test measuring different things" trap the face-capture code has
-   * now been bitten by three times, in its storage costume.
-   *
-   * Returns `undefined` when there is nothing to measure: a DISCOVERED provider
-   * is one whose chain we do not hold, so we know its latest heartbeat and
-   * nothing about the ones before it. That is not 0% — it is unknown, and must
-   * render as such.
-   */
-  uptimeFraction(p: StorageProviderState, now: number = Date.now()): number | undefined {
-    if (p.discovered) return undefined;
-    return Math.min(1, p.heartbeatsLast24h / this.expectedHeartbeats(p, now));
-  }
-
-  updateScore(p: StorageProviderState, now: number = Date.now()): void {
+      updateScore(p: StorageProviderState, now: number = Date.now()): void {
     // Uptime is scored against the heartbeats this provider could actually have
     // sent since it registered, not against a flat epoch's worth — see
     // `uptimeFraction`, which is the one definition every caller now shares.
     //
-    // NOTE this is deliberately NOT how the REWARD is metered. Pay is
-    // counted / MAX_HEARTBEATS_PER_EPOCH, because a fraction of an epoch's
-    // custody earns a fraction of an epoch's pay. Score answers a different
-    // question — how reliable is this provider — and that has to account for how
-    // long it has been around.
-    const uptimeFactor = Math.max(0.1, this.uptimeFraction(p, now) ?? UNKNOWN_UPTIME);
+    // Uptime is no longer a factor: it was counted from heartbeat blocks, and
+    // those are gone. What remains is observation — how fast a provider
+    // answered, and whether it passed its spot checks — which is what a score
+    // should have been built on anyway. A provider that is not live does not
+    // reach scoring at all, because `isLive` gates custody first.
     const latencyFactor = p.avgLatencyMs > 0
       ? Math.max(0.1, Math.min(1, 1_000 / p.avgLatencyMs))
       : 1;
     const spotFactor = Math.max(0.1, Math.min(1, p.spotCheckPassRate));
-    p.score = uptimeFactor * latencyFactor * spotFactor;
+    p.score = latencyFactor * spotFactor;
   }
 
   /** Drop all state (ledger reset). */

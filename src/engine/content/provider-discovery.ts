@@ -51,11 +51,9 @@ export function selectDiscoveryBlocks(
   now: number = Date.now(),
 ): Block[] {
   const registers = new Map<string, Block>();
-  const heartbeats = new Map<string, Block>();
   const deregisters = new Map<string, Block>();
   for (const b of blocks) {
     const into = b.type === 'storage-register' ? registers
-      : b.type === 'storage-heartbeat' ? heartbeats
       : b.type === 'storage-deregister' ? deregisters
       : undefined;
     if (!into) continue;
@@ -71,17 +69,17 @@ export function selectDiscoveryBlocks(
     return !reg || dr.index > reg.index;
   };
 
+  // Newest registrations first. This used to rank by last heartbeat, which is
+  // gone — and ranking by recency of REGISTRATION is the honest substitute,
+  // because a relay has no other durable signal about a provider it may never
+  // have read from. Liveness is the asker's job, from observed service.
   const ranked = [...registers.entries()]
     .filter(([pub, reg]) => (reg.storage?.capacityGB ?? 0) > 0 && !gone(pub))
-    .sort((a, b) => (heartbeats.get(b[0])?.timestamp ?? 0) - (heartbeats.get(a[0])?.timestamp ?? 0))
+    .sort((a, b) => b[1].timestamp - a[1].timestamp)
     .slice(0, Math.max(0, limit));
 
   const out: Block[] = [];
-  for (const [pub, reg] of ranked) {
-    out.push(reg);
-    const hb = heartbeats.get(pub);
-    if (hb && hb.index > reg.index) out.push(hb);
-  }
+  for (const [, reg] of ranked) out.push(reg);
 
   // Serve recent departures too — a TOMBSTONE, for the same reason the file
   // index serves withdrawals. Omitting the provider is not enough: a client asks
@@ -135,18 +133,14 @@ export const UNKNOWN_SCORE = 0.5;
  */
 export function foldProviderBlocks(blocks: readonly Block[]): DiscoveredProvider[] {
   const registers = new Map<string, Block>();
-  const heartbeats = new Map<string, Block>();
   const deregisters = new Map<string, Block>();
 
   for (const b of blocks) {
-    if (b.type !== 'storage-register' && b.type !== 'storage-heartbeat'
-      && b.type !== 'storage-deregister') continue;
+    if (b.type !== 'storage-register' && b.type !== 'storage-deregister') continue;
     let ok = false;
     try { ok = verifyBlock(b); } catch { ok = false; }
     if (!ok) continue;
-    const into = b.type === 'storage-register' ? registers
-      : b.type === 'storage-heartbeat' ? heartbeats
-      : deregisters;
+    const into = b.type === 'storage-register' ? registers : deregisters;
     const prev = into.get(b.accountId);
     if (!prev || b.index > prev.index) into.set(b.accountId, b);
   }
@@ -163,21 +157,22 @@ export function foldProviderBlocks(blocks: readonly Block[]): DiscoveredProvider
     if (dr && dr.index > reg.index) continue;
     const capacityGB = reg.storage?.capacityGB ?? 0;
     if (capacityGB <= 0) continue;                 // deregistered or malformed
-    const hb = heartbeats.get(pub);
-    // Only count a heartbeat that belongs to the CURRENT registration. An older
-    // one describes a lease that the re-registration already ended, and using it
-    // would make a provider look live on the strength of a previous life.
-    const live = hb && hb.index > reg.index ? hb : undefined;
+    // Routing details (smoke address, country, bytes held) used to ride in
+    // heartbeat blocks. Those are gone: an address is ephemeral and never
+    // belonged on a permanent chain, so it travels as a signed off-chain
+    // presence beacon instead (`content/presence.ts`). Discovery therefore
+    // answers the durable half — who registered, with how much capacity — and
+    // a caller merges presence over it.
     out.push({
       pub,
       deviceId: reg.storage?.deviceId ?? '',
       registeredAt: reg.timestamp,
       capacityGB,
-      lastActualStoredBytes: live?.storage?.storedBytes ?? 0,
-      lastHeartbeat: live?.timestamp ?? 0,
+      lastActualStoredBytes: 0,
+      lastHeartbeat: 0,
       heartbeatsLast24h: 0,        // no history without the chain — shown as "—"
-      smokeAddr: live?.storage?.smokeAddr,
-      countryCode: live?.storage?.countryCode,
+      smokeAddr: undefined,
+      countryCode: undefined,
       avgLatencyMs: 0,
       spotCheckPassRate: 1,
       score: UNKNOWN_SCORE,

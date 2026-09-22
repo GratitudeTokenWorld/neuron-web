@@ -4,7 +4,7 @@
  * Manages the lifecycle of NeuronChain's built-in storage ledger:
  *
  *   Providers register with a capacity (GB) via a storage-register block.
- *   Every heartbeat interval, active providers broadcast a storage-heartbeat block
+ *   Active providers announce a signed, OFF-CHAIN presence beacon
  *   (proof of uptime). Once per reward epoch, providers self-issue a storage-reward
  *   block that mints new UNIT:
  *     reward = BASE_RATE × storedGB × (heartbeatCount / MAX_HEARTBEATS_PER_EPOCH)
@@ -51,6 +51,7 @@ import { readCredit, DEFAULT_TAPER } from '../engine/content/read-credit';
 import {
   settlementDue, settlementPeriodMs, publishRecordRoot, serviceRecordRoot,
 } from '../engine/content/storage-settlement';
+import { PresenceStore, presencePayload, type SignedPresence } from '../engine/content/presence';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 // Every cadence here is a FRACTION of the timing profile, not a wall-clock
@@ -160,8 +161,6 @@ export class StorageManager extends EventEmitter {
   private net: Libp2pNetwork;
   private store: SmokeStore;
   private localKeys: Map<string, KeyPair>;
-
-  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private spotCheckTimer: ReturnType<typeof setTimeout> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private statsRefreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -229,6 +228,12 @@ export class StorageManager extends EventEmitter {
    * Verified on arrival, so nothing unsigned is ever stored, and bounded by
    * distinct readers rather than by reads.
    */
+  /**
+   * Where providers say they can be reached — off-chain, replacing the
+   * heartbeat block's only remaining job (`content/presence.ts`).
+   */
+  private readonly presence = new PresenceStore();
+
   private readonly inboundReceipts = new ReceiptLedger();
   private readonly pendingEnvelopes = new Map<string, SignedReceipt>();
   /**
@@ -472,6 +477,63 @@ export class StorageManager extends EventEmitter {
     return [...this.pendingEnvelopes.values()].slice(0, MAX_RECEIPTS_PER_SETTLEMENT);
   }
 
+  /**
+   * Announce where this provider can be reached.
+   *
+   * Replaces the heartbeat block's last remaining job, and the old "stats"
+   * message that abused the receipt shape (`cid: pub, providerPub: pub,
+   * requesterPub: pub`) to carry something that was not a receipt.
+   *
+   * Off-chain by design: an address is ephemeral and wrong the moment a
+   * provider reconnects, so putting it on a permanent chain cost 2,555 blocks
+   * a year to distribute a string that changes.
+   */
+  async broadcastStorageStats(pub: string, keys: KeyPair): Promise<void> {
+    if (!this.store.isStarted() || !this.net.running) return;
+    const actualBytes = await this.store.storageUsedBytes();
+    const provider = this.ledger.storageProviders.get(pub);
+    if (provider) provider.lastActualStoredBytes = actualBytes;
+    const beacon = {
+      pub,
+      smokeAddr: await this.store.getSmokeHostname(),
+      countryCode: provider?.countryCode,
+      capacityGB: provider?.capacityGB,
+      storedBytes: actualBytes,
+      ts: Date.now(),
+    };
+    const envelope: SignedPresence = { beacon, signature: this.signMsg(presencePayload(beacon), keys) };
+    this.net.publishStorageReceipt(envelope as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * A provider announced itself. Verify, store, apply the routing details.
+   *
+   * Nothing here touches custody or payment: a beacon says "I am reachable",
+   * which is exactly what a provider holding nothing would also say.
+   */
+  private acceptPresence(raw: unknown): boolean {
+    const env = raw as SignedPresence | undefined;
+    if (!env?.beacon?.pub || typeof env.signature !== 'string') return false;
+    const err = this.presence.record(
+      env,
+      (payload, sig, pub) => this.verifyMsg(sig, payload, pub),
+      Date.now(),
+      60_000,
+    );
+    if (err) {
+      console.warn(`[StorageManager] ${err}`);
+      return true;   // handled, just refused
+    }
+    const p = this.ledger.storageProviders.get(env.beacon.pub);
+    if (p) {
+      if (env.beacon.smokeAddr) p.smokeAddr = env.beacon.smokeAddr;
+      if (env.beacon.countryCode) p.countryCode = env.beacon.countryCode;
+      // Self-reported, kept for display only — it meters nothing.
+      if (typeof env.beacon.storedBytes === 'number') p.lastActualStoredBytes = env.beacon.storedBytes;
+    }
+    return true;
+  }
+
   /** Record one probe of a provider — the prober side of calibration. */
   private recordProbe(pub: string, level: number, ok: boolean, latencyMs: number): void {
     let run = this.calibrations.get(pub);
@@ -645,7 +707,12 @@ export class StorageManager extends EventEmitter {
     // Watch for retrieval receipts from peers
     // Read receipts arrive point to point on the smoke channel, not by gossip.
     this.store.onReadReceipt = (env) => this.acceptReadReceipt(env);
-    this.net.watchStorageReceipts((receipt) => { this.handleReceipt(receipt as unknown as StorageReceipt).catch(() => {}); });
+    this.net.watchStorageReceipts((msg) => {
+      // Presence beacons and cache receipts share this channel. Presence is
+      // tried first and claims the message if it is one.
+      if (this.acceptPresence(msg)) return;
+      this.handleReceipt(msg as unknown as StorageReceipt).catch(() => {});
+    });
 
     // Watch for content delete requests - any node that holds the blocks drops them
     this.net.watchDeleteRequests(async (req) => {
@@ -734,7 +801,6 @@ export class StorageManager extends EventEmitter {
     this.retryInterval = setInterval(() => this.retryUnconfirmedDistributions(), 30_000);
 
     // Schedule the first heartbeat with jitter, then repeat
-    this.scheduleNextHeartbeat();
 
     // Check daily reward eligibility every 30 min
     // Also check immediately on start (catches missed day-boundary events)
@@ -746,7 +812,6 @@ export class StorageManager extends EventEmitter {
     // Refresh heartbeat counts and scores every 30 min so uptime % stays live as the
     // 24h rolling window moves, without waiting for a new heartbeat block to arrive.
     this.statsRefreshInterval = setInterval(() => {
-      this.ledger.refreshHeartbeatCounts();
       this.emit('storage:providers-updated');
     }, statsRefreshMs());
 
@@ -760,7 +825,6 @@ export class StorageManager extends EventEmitter {
   stop(): void {
     if (!this.started) return;
     this.started = false;
-    if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (this.spotCheckTimer) { clearTimeout(this.spotCheckTimer); this.spotCheckTimer = null; }
     if (this.statsRefreshInterval) { clearInterval(this.statsRefreshInterval); this.statsRefreshInterval = null; }
     if (this.reannounceInterval) { clearInterval(this.reannounceInterval); this.reannounceInterval = null; }
@@ -1100,151 +1164,6 @@ export class StorageManager extends EventEmitter {
       if (!provider || provider.capacityGB === 0) continue;
       await this.broadcastStorageStats(pub, keys).catch(() => {});
     }
-  }
-
-  // ── Heartbeats ────────────────────────────────────────────────────────────
-
-  private scheduleNextHeartbeat(): void {
-    if (!this.started) return;
-    let minDueIn = HEARTBEAT_INTERVAL_MS;
-
-    for (const [pub] of this.localKeys) {
-      const provider = this.ledger.storageProviders.get(pub);
-      if (!provider || provider.capacityGB === 0) continue;
-      if (!this.servesFromThisDevice(pub)) continue;   // fails closed — see servesFromThisDevice
-      if (provider.lastHeartbeat === 0) {
-        minDueIn = 0; // first-ever heartbeat — fire promptly
-      } else {
-        const elapsed = Date.now() - provider.lastHeartbeat;
-        const dueIn = Math.max(0, HEARTBEAT_INTERVAL_MS - elapsed);
-        minDueIn = Math.min(minDueIn, dueIn);
-      }
-    }
-
-    const jitter = Math.random() * jitterMs();
-
-    if (minDueIn === 0) {
-      // Past-due or first-ever heartbeat: wait for the first peer to connect before firing.
-      // This gives any un-persisted heartbeat block time to sync back from peers,
-      // preventing a conflict with a block that was sent but not yet written to IDB.
-      // Hard cap of 45s in case the node stays offline.
-      let fired = false;
-      const fire = async () => {
-        if (fired || !this.started) return;
-        fired = true;
-        this.net.off('peer:connected', fire);
-        if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
-        try {
-          await this.broadcastHeartbeatsForAll();
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[StorageManager] Heartbeat broadcast failed: ${msg}`);
-        }
-        this.scheduleNextHeartbeat();
-      };
-      this.net.on('peer:connected', fire);
-      this.heartbeatTimer = setTimeout(fire, Math.min(45_000, HEARTBEAT_INTERVAL_MS / 4));
-    } else {
-      this.heartbeatTimer = setTimeout(async () => {
-        try {
-          await this.broadcastHeartbeatsForAll();
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[StorageManager] Heartbeat broadcast failed: ${msg}`);
-        }
-        this.scheduleNextHeartbeat();
-      }, minDueIn + jitter);
-    }
-  }
-
-  /** Cancel the current heartbeat timer and reschedule based on current lastHeartbeat values.
-   *  Call after chain replay so the timer reflects actual on-chain timing, not startup time. */
-  rescheduleHeartbeat(): void {
-    if (!this.started) return;
-    if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
-    // Called once keys are registered, which is the first moment this is
-    // answerable — and the last moment before a user starts wondering why
-    // nothing is happening.
-    for (const [pub] of this.localKeys) {
-      if (!this.registeredOnAnotherDevice(pub)) continue;
-      const p = this.ledger.storageProviders.get(pub);
-      console.warn(`[StorageManager] ${pub.slice(0, 12)}… is registered as a provider on a DIFFERENT device `
-        + `(${p?.deviceId?.slice(0, 8)}… vs ${getDeviceId().slice(0, 8)}…) — it will not heartbeat, earn or `
-        + `cache from here. Re-register on this device to take over custody.`);
-      this.emit('storage:other-device', { pub });
-    }
-    this.scheduleNextHeartbeat();
-  }
-
-  private async broadcastHeartbeatsForAll(): Promise<void> {
-    for (const [pub, keys] of this.localKeys) {
-      const provider = this.ledger.storageProviders.get(pub);
-      if (!provider || provider.capacityGB === 0) continue;
-      if (!this.servesFromThisDevice(pub)) continue;   // fails closed — see servesFromThisDevice
-      await this.broadcastHeartbeat(pub, keys);
-    }
-  }
-
-  async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    // The automatic path skips a provider registered on another device; the
-    // manual button did not, so it could append to a chain another device is
-    // actively extending. Nothing forked in practice only because the interval
-    // check refused it — had the other device been quiet for one interval, this
-    // would have built on a possibly-stale head and forked the account, which is
-    // indistinguishable from a deliberate double-sign and freezes it network-wide.
-    //
-    // Refusing here also makes the per-device rule discoverable at the exact
-    // moment someone tries to work around it.
-    if (this.registeredOnAnotherDevice(pub)) {
-      return {
-        success: false,
-        error: 'This account is registered as a provider on another device. '
-          + 'Storage custody is per-device — re-register here to take it over.',
-      };
-    }
-    const smokeAddr = await this.store.getSmokeHostname();
-    const actualStoredBytes = this.store.isStarted() ? await this.store.storageUsedBytes() : 0;
-    const countryCode = await getCountryCode();
-    // localKeys holds app (WebCrypto JWK) keys; the engine signs with its own.
-    const result = await this.ledger.createStorageHeartbeat(
-      pub, engineKeysFromAppPrivate(keys.priv), smokeAddr, actualStoredBytes, countryCode,
-    );
-    if (!result.block) return { success: false, error: result.error };
-    const submitResult = await this.submitBlock(result.block);
-    if (submitResult.success) {
-      console.log(`[StorageManager] Heartbeat broadcast for ${pub.slice(0, 12)}...`);
-      this.emit('storage:heartbeat-sent', { pub });
-    }
-    return submitResult;
-  }
-
-  /**
-   * Gossip the current actual storage bytes to all peers without creating a heartbeat block.
-   * Does not affect scoring or rewards — purely a stat update so free-space stays accurate
-   * after restarts, registrations, and uploads.
-   */
-  async broadcastStorageStats(pub: string, keys: KeyPair): Promise<void> {
-    if (!this.store.isStarted() || !this.net.running) return;
-    const actualBytes = await this.store.storageUsedBytes();
-    const provider = this.ledger.storageProviders.get(pub);
-    if (provider) provider.lastActualStoredBytes = actualBytes;
-    const ts = Date.now();
-    const sig = this.signMsg(`stats:${pub}:${actualBytes}:${ts}`, keys);
-    this.net.publishStorageReceipt({
-      cid: pub, providerPub: pub, requesterPub: pub,
-      latencyMs: 0, success: true, timestamp: ts, signature: sig,
-      actualStoredBytes: actualBytes,
-    });
-  }
-
-    /** Say why a reward was not issued, once per (provider, reason). */
-  private rewardSkipLog = new Map<string, string>();
-  private logRewardSkip(pub: string, epochDay: number, reason: string): void {
-    const key = pub;
-    const line = `${epochDay}:${reason}`;
-    if (this.rewardSkipLog.get(key) === line) return;
-    this.rewardSkipLog.set(key, line);
-    console.log(`[StorageManager] No reward for ${pub.slice(0, 12)}… (epoch ${epochDay}): ${reason}`);
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -2205,7 +2124,6 @@ export class StorageManager extends EventEmitter {
         });
         provider.avgLatencyMs = adjustedLatencies.reduce((s, v) => s + v, 0) / adjustedLatencies.length;
       }
-      this.ledger.updateProviderScore(provider);
     }
   }
 
@@ -2592,18 +2510,4 @@ export class StorageManager extends EventEmitter {
     return !!local && !!provider.deviceId && provider.deviceId === local;
   }
 
-  /**
-   * Uptime percentage, or `undefined` when it is not something we measured.
-   *
-   * Delegates to `ProviderLedger.uptimeFraction` — the single definition. This
-   * used to divide by a flat `MAX_HEARTBEATS_PER_DAY` while the SCORE beside it
-   * divided by heartbeats-since-registration, so the two columns disagreed about
-   * the same provider.
-   */
-  getUptimePct(pub: string): number | undefined {
-    const p = this.ledger.storageProviders.get(pub);
-    if (!p) return undefined;
-    const fraction = this.ledger.providerUptime(p);
-    return fraction === undefined ? undefined : Math.round(fraction * 100);
   }
-}
