@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **576 tests / 76 files passing**, `npm run build` clean.
+Current baseline: **596 tests / 77 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -242,6 +242,22 @@ below).
   tidiness beating durability — it deleted redundancy the network had already
   paid bandwidth to create. Over-replication is cheap; under-replication is the
   risk (PRINCIPLES.md → 3, CUSTODY-PROOFS.md → Reframe).
+- **Every file keeps at least `REDUNDANCY_TARGET` (10) copies, and popular
+  files get more — then give them back.** Demand is a **sliding-window read
+  rate**, never a lifetime counter (fixed 2026-09-22: a lifetime counter only
+  rises, so the target could never come down). `planRepair` returns `release`
+  for the surplus; a released holder keeps the bytes as an **uncounted spare**,
+  so re-leasing costs no transfer. Never releases below 10. Growth is capped
+  (`MAX_REPLICA_TARGET` 30) because the target rides in an attacker-written
+  `CacheRequest` — measured comparison of the growth curves in
+  `sim/demand-replication.ts`, and the finding there is that the **cap and the
+  cache hit rate decide performance, not the curve**.
+- **A copy means a distinct FAILURE DOMAIN, not a distinct key.** Two accounts
+  on one machine are one replica (Lucian, 2026-09-22). `planRepair` takes
+  `domainOf`, `selectProviders` will not offer two keys sharing a `deviceId`,
+  and `liveHolderCount` counts domains — all three must agree or the health
+  number reports redundancy the placement rule knows is fictional. Ceiling: one
+  operator on many machines still looks independent.
 - **Authorship is not custody.** Published content is handed to the network;
   the publisher keeps no copy by default and is not automatically a replica
   (except while the network finishes replicating it). Ownership is on-chain,

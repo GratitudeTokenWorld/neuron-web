@@ -188,11 +188,18 @@ is a smaller attack surface:
   node performed itself, verified by content-address before credit is granted.
   No claim to forge, because no claim is made.
 
-Measured in `sim/reciprocity.ts` (H-P2, falsifier: free-riders obtaining what
-contributors get, or a newcomer starving). Contributors are served **~8× better
-than free-riders**, an honest newcomer joining with no history overtakes a
-free-rider within the run, and the floor holds. Three failure modes were found
-by *running* it, and each is kept as a control:
+**Simulated, not measured** — and the distinction is the whole of Principle 5.
+`sim/reciprocity.ts` models 65 nodes with assumed request rates, capacities,
+decay and topology; not one of those inputs comes from a real network. What it
+establishes is a **feasibility result**: there exist parameters under which
+locally-metered reciprocity separates contributors from free-riders (~8×), an
+honest newcomer with no history overtakes a free-rider, and the access floor
+holds. What it does NOT establish is that those parameters resemble reality, or
+that the result survives at 10B, under one-sided demand, or against an attacker
+who adapts. Read the table below as "here is how this design fails", which is
+what it genuinely shows, and not as "here is how it will perform".
+
+Three failure modes were found by *running* it, and each is kept as a control:
 
 | Variant | Contributor | Free-rider | Why it fails |
 |---|---|---|---|
@@ -235,7 +242,9 @@ per-stranger grant; the table above is what the per-stranger form costs.
    partly refreshed; no peer may become a sole source.
 
 **Recommendation: remove payment for now**, as Lucian suggested, and build the
-throttle. It is strictly less attack surface than any payment design, it removes
+throttle. Stated at the strength the evidence supports: this is an argument from
+attack surface plus a feasibility simulation, not a demonstration that
+reciprocity works at scale. It is strictly less attack surface than any payment design, it removes
 2,555 blocks/provider/year, and it can be replaced by the receipt design later
 if reciprocity proves insufficient — whereas a minted currency is very hard to
 take back. What is NOT yet measured: whether reciprocity holds when demand is

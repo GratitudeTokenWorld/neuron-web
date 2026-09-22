@@ -900,6 +900,77 @@ predicted:
   for a scale it does not have. Applied to the provider poll and the spot-check
   sweep — the two fixed cadences this section warned about.
 
+### Demand-scaled replication: up AND down (2026-09-22)
+
+**The rule** (Lucian): every file keeps a minimum of `REDUNDANCY_TARGET` = 10
+copies; files read by many get more; and when reads fall the surplus is given
+back. Optimising for performance, since people abandon an image at three
+seconds.
+
+The first half already shipped. **The second half did not, and could not**: the
+input to `replicaTarget` was a lifetime read counter, so it only ever rose. A
+CID that went viral once held conscripted capacity for the rest of its
+existence. It was also the sustained half of the invariant failing inside a
+cache — a value growing with history that nothing ever reduced.
+
+**What changed.** `CustodySignals` now measures reads over a **sliding window**
+(six buckets, one hour at production timing, scaling with `STORAGE_TIMING` like
+every other storage duration). The sum is a real rate, so the target falls on
+its own when reading stops, and `planRepair` returns a `release` list for the
+surplus. Released holders **keep the bytes as uncounted spares** — the lease
+obligation ends, the data does not — so if demand returns the copy is usually
+still there and costs no transfer to re-lease. Same rule as a lapsed rejoin, and
+the same reason: over-replication is cheap, under-replication is the risk.
+Release never goes below `REDUNDANCY_TARGET`, and a one-holder hysteresis band
+stops the target oscillating around a bucket boundary and paying bandwidth to
+hold the same count.
+
+**How fast should the copy count rise?** Lucian proposed one more copy per 10
+reads an hour — linear, which is the textbook control law because it holds
+reads-per-holder constant. Measured over a Zipf workload
+(`sim/demand-replication.ts`), the comparison is not what either of us expected:
+
+| Policy | Fleet storage | Copies for the hottest object | Cache hit rate it needs |
+|---|---|---|---|
+| Fixed 10 | 1.00× | 10 | 94.6% |
+| **Log (ships)** | 1.17× | 27 | **85.3%** |
+| **Linear, capped at 30** | 1.30× | 30 | **83.7%** |
+| Linear, uncapped | 1.95× | **82,721** | 0% |
+
+Three findings, in order of how much they changed the picture:
+
+1. **"Linear would consume the fleet" is wrong about aggregate cost.** The Zipf
+   tail is enormous and sits at the floor, so uncapped linear costs ~2× total,
+   not 100×. The real objection is **concentration**: one viral object demanding
+   82,721 copies, more than most networks have providers. That is also the
+   attack, since demand is observed and reported by the owner.
+2. **The cap does the work, not the curve.** Once both are capped at 30, log and
+   linear need almost the same help from caches — 85.3% versus 83.7% — and
+   differ by ~11% in fleet storage. The curve is nearly irrelevant; what matters
+   is the cap and the opportunistic cache layer.
+3. **The difference that is real: linear reaches the cap far sooner** (200
+   reads/window versus ~5M for log), so it gives hot content its copies faster,
+   which is the entire point of demand-scaling. The cap is what keeps that safe.
+
+**What we do NOT know, and it is the number that decides this:** the
+opportunistic cache hit rate. Every policy above, including the one that ships,
+depends on caches absorbing 84–95% of reads on hot content, and we have never
+measured it. Holder serving capacity is assumed too, and Principle 1 guarantees
+a long low tail of small devices. **Both must be measured before the curve is
+tuned further** — tuning it now would be fitting a constant to an assumption.
+
+**A copy means a new NODE** (Lucian, 2026-09-22): "two accounts on one machine
+must not count as separate replicas". Distinctness is by **failure domain**, not
+by public key — with multi-device custody one account holds several keys, and
+two accounts can run in one browser. `planRepair` takes a `domainOf` mapper,
+counts live holders by distinct domain, and refuses to place a second copy in a
+domain already represented; `selectProviders` will not offer two keys from one
+`deviceId`; and `liveHolderCount` counts domains too, so the placement rule and
+the health number cannot disagree. **Known ceiling:** this catches two accounts
+on one machine. It does not catch one operator running many machines, or a
+hundred VMs in one datacentre — closing that needs evidence we do not collect
+(ASN, topology, attested hardware), so it stays a real residual risk.
+
 ### Fan-IN at a billion followers (measured 2026-09-21)
 
 Lucian's question: what happens to an account with 1B followers? The Fan-IN

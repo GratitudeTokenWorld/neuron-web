@@ -483,7 +483,35 @@ export class StorageManager extends EventEmitter {
    * met. See ARCHITECTURE.md → "Only verified-live replicas count toward the target".
    */
   private liveHolderCount(confirmed: Iterable<string>, now = Date.now()): number {
-    return liveHolders(confirmed, pub => this.ledger.isProviderLive(pub, now)).length;
+    const live = liveHolders(confirmed, pub => this.ledger.isProviderLive(pub, now));
+    // Counted by FAILURE DOMAIN, not by key (Lucian, 2026-09-22): "two accounts
+    // on one machine must not count as separate replicas". Counting keys here
+    // while `planRepair` counts domains would be the classic split — two things
+    // measuring different things, one of them reporting a redundancy the other
+    // knows is fictional.
+    return new Set(live.map(pub => this.providerDomain(pub))).size;
+  }
+
+  /**
+   * The independent-failure domain a provider belongs to.
+   *
+   * `deviceId` is what we can observe today: it already distinguishes machines
+   * for heartbeat and reward purposes, so two accounts registered from one
+   * browser share it. Falls back to the pub when a provider registered without
+   * one — old registrations carry no deviceId, and treating an absent id as a
+   * shared domain would collapse every legacy provider into a single slot and
+   * destroy real redundancy.
+   *
+   * **Known ceiling, stated rather than implied:** this catches two accounts on
+   * one machine. It does NOT catch one operator running many machines, nor a
+   * hundred VMs in one datacentre — those are the same failure domain and look
+   * entirely independent from here. Closing that needs evidence we do not
+   * collect (ASN, network topology, attested hardware), so it is a real residual
+   * risk, not a solved problem.
+   */
+  private providerDomain(pub: string): string {
+    const p = this.ledger.getStorageProviders().find(x => x.pub === pub);
+    return p?.deviceId ? `dev:${p.deviceId}` : `pub:${pub}`;
   }
 
   /**
@@ -914,10 +942,15 @@ export class StorageManager extends EventEmitter {
       byCountry.set(cc, group);
     }
 
-    // Weighted-random pick from a group, skipping already-selected pubs.
+    // Weighted-random pick from a group, skipping already-selected pubs AND
+    // any machine already represented: a second copy has to be a second NODE,
+    // so offering two keys from one device would hand repair a candidate that
+    // adds a name and no redundancy.
     const usedPubs = new Set<string>();
+    const usedDomains = new Set<string>();
     const pickWeighted = (group: StorageProvider[]): StorageProvider | undefined => {
-      const pool = group.filter(p => !usedPubs.has(p.pub));
+      const pool = group.filter(p => !usedPubs.has(p.pub)
+        && !usedDomains.has(p.deviceId ? `dev:${p.deviceId}` : `pub:${p.pub}`));
       if (pool.length === 0) return undefined;
       const weights = pool.map(p => Math.max(0.01, Math.min(p.capacityGB, 100) * Math.max(0.1, p.score)));
       const total = weights.reduce((a, b) => a + b, 0);
@@ -936,7 +969,12 @@ export class StorageManager extends EventEmitter {
       for (const group of byCountry.values()) {
         if (selected.length >= take) break;
         const picked = pickWeighted(group);
-        if (picked) { selected.push(picked); usedPubs.add(picked.pub); addedThisRound++; }
+        if (picked) {
+          selected.push(picked);
+          usedPubs.add(picked.pub);
+          usedDomains.add(picked.deviceId ? `dev:${picked.deviceId}` : `pub:${picked.pub}`);
+          addedThisRound++;
+        }
       }
       if (addedThisRound === 0) break; // all candidates exhausted
     }
@@ -964,6 +1002,10 @@ export class StorageManager extends EventEmitter {
 
   /** Resend cache requests for CIDs that have no confirmed provider yet, or are under-replicated. */
   private async retryUnconfirmedDistributions(): Promise<void> {
+    // Demand is a sliding window, so CIDs nobody reads any more fall to zero
+    // and their entries are dropped here. Doing it in a loop that already runs
+    // avoids a timer whose only job is to prevent a leak (SCREENING.md → 1).
+    this.signals.sweepDemand();
     if (this.trackedCids.size === 0) return;
     if (this.selectProviders(1).length === 0) return;
     const now = Date.now();
@@ -974,7 +1016,41 @@ export class StorageManager extends EventEmitter {
       // one honest failure away from loss while looking healthy.
       const target = Math.min(this.signals.targetFor(cid), MAX_REPLICA_TARGET);
       const live = this.liveHolderCount(tracked.confirmedProviders, now);
-      if (live >= target) continue;
+
+      if (live >= target) {
+        // Demand fell, so the surplus this CID's popularity conscripted goes
+        // back (custody.ts → `planRepair.release`). Releasing is the cheap
+        // direction and re-placing is not, hence the hysteresis band; nothing
+        // is released below `REDUNDANCY_TARGET`, because that is durability
+        // rather than bandwidth.
+        //
+        // What release does NOT do is delete anything. The lease obligation
+        // ends and the holder keeps the bytes as an uncounted spare, evictable
+        // only under real space pressure — the same rule as a lapsed rejoin
+        // (CLAUDE.md → Storage custody rules). So if demand returns, the copy
+        // is usually still there and costs no transfer to re-lease.
+        const shed = planRepair({
+          holders: tracked.confirmedProviders,
+          isLive: pub => this.ledger.isProviderLive(pub, now),
+          candidates: [],
+          target,
+          domainOf: pub => this.providerDomain(pub),
+        }).release;
+        if (shed.length > 0) {
+          for (const pub of shed) tracked.confirmedProviders.delete(pub);
+          this.net.saveTrackedCid({
+            cid, ownerPub: tracked.ownerPub,
+            confirmedProviders: Array.from(tracked.confirmedProviders),
+            additionalCids: tracked.additionalCids,
+            lastDistributed: tracked.lastDistributed,
+          });
+          console.log(`[StorageManager] Demand fell for ${cid.slice(0, 16)}… — releasing `
+            + `${shed.length} surplus holder(s), now ${live - shed.length}/${target} `
+            + `(reads/window=${this.signals.reads(cid, now)}); bytes stay as spare redundancy`);
+          this.emit('storage:providers-updated', { cid, count: tracked.confirmedProviders.size });
+        }
+        continue;
+      }
 
       // Exponential backoff: each cycle without new confirmations doubles the wait,
       // capping at 5 min. This prevents flooding providers that consistently fail.
@@ -997,6 +1073,7 @@ export class StorageManager extends EventEmitter {
         isLive: pub => this.ledger.isProviderLive(pub, now),
         candidates: offered.map(p => p.pub),
         target,
+        domainOf: pub => this.providerDomain(pub),
       });
       for (const gone of plan.drop) tracked.confirmedProviders.delete(gone);
       if (plan.drop.length > 0) {

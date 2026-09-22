@@ -3,6 +3,10 @@ import {
   REDUNDANCY_TARGET,
   MIN_REPLICAS,
   MAX_REPLICA_TARGET,
+  POPULARITY_FLOOR,
+  RELEASE_HYSTERESIS,
+  demandWindowMs,
+  DEMAND_BUCKETS,
   FAILURES_BEFORE_EVICTION,
   liveHolders,
   replicaTarget,
@@ -31,7 +35,15 @@ describe('liveHolders', () => {
 describe('replicaTarget', () => {
   it('does not move for ordinary content', () => {
     expect(replicaTarget(0)).toBe(REDUNDANCY_TARGET);
-    expect(replicaTarget(100)).toBe(REDUNDANCY_TARGET);
+    expect(replicaTarget(POPULARITY_FLOOR)).toBe(REDUNDANCY_TARGET);
+  });
+
+  it('guarantees the durability floor however unpopular the file', () => {
+    // "Minimum copies is 10 for any file" — Lucian, 2026-09-22. There is no
+    // read rate, including zero, at which this drops.
+    for (const rate of [0, 1, 5, POPULARITY_FLOOR, 1e6]) {
+      expect(replicaTarget(rate)).toBeGreaterThanOrEqual(REDUNDANCY_TARGET);
+    }
   });
 
   it('grows logarithmically with demand, never linearly', () => {
@@ -329,6 +341,54 @@ describe('CustodySignals', () => {
     expect(s.targetFor('cid')).toBeGreaterThan(REDUNDANCY_TARGET);
   });
 
+  it('measures a RATE, so the target comes back down when reading stops', () => {
+    // The defect this replaced: `reads` was a lifetime counter, so a CID that
+    // went viral once held conscripted capacity forever and the target could
+    // only ever rise. Demand has to be able to fall or "drop copies when reads
+    // decrease" is unimplementable.
+    const s = new CustodySignals();
+    const t0 = 1_000_000_000;
+    for (let i = 0; i < 400; i++) s.recordRead('cid', t0);
+    const hot = s.targetFor('cid', t0);
+    expect(hot).toBeGreaterThan(REDUNDANCY_TARGET);
+
+    // Half a window later the early reads are still inside it.
+    expect(s.reads('cid', t0 + demandWindowMs() / 2)).toBe(400);
+    // A full window of silence and demand is gone — back to the durability floor.
+    const cold = t0 + demandWindowMs() + 1;
+    expect(s.reads('cid', cold)).toBe(0);
+    expect(s.targetFor('cid', cold)).toBe(REDUNDANCY_TARGET);
+  });
+
+  it('decays gradually rather than all at once', () => {
+    // A cliff would release every surplus holder in one tick. Buckets age out
+    // one at a time, so the target walks down instead of falling off.
+    const s = new CustodySignals();
+    const t0 = 1_000_000_000;
+    const bucket = demandWindowMs() / DEMAND_BUCKETS;
+    for (let b = 0; b < DEMAND_BUCKETS; b++) {
+      for (let i = 0; i < 100; i++) s.recordRead('cid', t0 + b * bucket);
+    }
+    const full = s.reads('cid', t0 + (DEMAND_BUCKETS - 1) * bucket);
+    expect(full).toBe(600);
+    // Each further bucket of silence drops exactly one bucket's worth.
+    const after1 = s.reads('cid', t0 + DEMAND_BUCKETS * bucket);
+    expect(after1).toBe(500);
+    const after2 = s.reads('cid', t0 + (DEMAND_BUCKETS + 1) * bucket);
+    expect(after2).toBe(400);
+  });
+
+  it('sweeps CIDs whose demand reached zero — the map has a remover', () => {
+    const s = new CustodySignals();
+    const t0 = 1_000_000_000;
+    s.recordRead('cold', t0);
+    s.recordRead('hot', t0);
+    const later = t0 + demandWindowMs() + 1;
+    s.recordRead('hot', later);
+    expect(s.sweepDemand(later)).toBe(1);
+    expect(s.reads('hot', later)).toBe(1);
+  });
+
   it('does not evict on a single failure — one flaky dial is not evidence of loss', () => {
     const s = new CustodySignals();
     s.recordFailure('cid', 'p');
@@ -377,5 +437,92 @@ describe('CustodySignals', () => {
     s.recordFailure('cidLONGER', 'p');
     s.forget('cid');
     expect(s.recordFailure('cidLONGER', 'p')).toBe(2);
+  });
+});
+
+describe('a new copy means a new NODE (2026-09-22)', () => {
+  // Lucian: "making another copy means a new node, not the same node" — and
+  // "two accounts on one machine must not count as separate replicas".
+  // A distinct public key does not establish an independent machine: with
+  // multi-device custody one account holds several keys, and two accounts can
+  // run on one box. Ten copies in one failure domain is one copy with ten
+  // names, and it fails exactly when redundancy is supposed to save you.
+  const alive = () => true;
+  // Four keys, two machines.
+  const domain: Record<string, string> = { a1: 'boxA', a2: 'boxA', b1: 'boxB', b2: 'boxB' };
+  const domainOf = (p: string) => domain[p] ?? p;
+
+  it('never places a second copy in a domain it already holds', () => {
+    const plan = planRepair({
+      holders: ['a1'],
+      isLive: alive,
+      candidates: ['a2', 'b1', 'b2'],
+      target: 3,
+      domainOf,
+    });
+    // a2 shares boxA with the existing holder; b2 shares boxB with b1.
+    expect(plan.add).toEqual(['b1']);
+    // And it says so: two of the three slots cannot be filled by these
+    // candidates, rather than being filled with fiction.
+    expect(plan.shortfall).toBe(1);
+  });
+
+  it('counts existing holders by machine, so redundancy is not double-counted', () => {
+    const plan = planRepair({
+      holders: ['a1', 'a2', 'b1'],
+      isLive: alive,
+      candidates: [],
+      target: 3,
+      domainOf,
+    });
+    // Three keys, two machines: live is 2, not 3.
+    expect(plan.live).toBe(2);
+    expect(plan.shortfall).toBe(1);
+  });
+
+  it('without domainOf it degrades to per-key, which is the old behaviour', () => {
+    const plan = planRepair({ holders: ['a1', 'a2'], isLive: alive, candidates: [], target: 3 });
+    expect(plan.live).toBe(2);
+  });
+});
+
+describe('planRepair releases surplus when demand falls', () => {
+  const alive = () => true;
+  const many = Array.from({ length: 20 }, (_, i) => `p${i}`);
+
+  it('sheds holders above the target, newest first', () => {
+    const plan = planRepair({ holders: many, isLive: alive, candidates: [], target: 15 });
+    // 20 live, target 15, hysteresis 1 → release 4, taken from the tail.
+    expect(plan.release).toHaveLength(20 - 15 - RELEASE_HYSTERESIS);
+    expect(plan.release).toEqual(['p16', 'p17', 'p18', 'p19']);
+  });
+
+  it('never releases below the durability floor', () => {
+    // Even at zero demand the target is REDUNDANCY_TARGET, and release must
+    // respect it: shedding bandwidth copies must never touch durability.
+    const plan = planRepair({
+      holders: many,
+      isLive: alive,
+      candidates: [],
+      target: replicaTarget(0),
+    });
+    expect(many.length - plan.release.length).toBeGreaterThanOrEqual(REDUNDANCY_TARGET);
+  });
+
+  it('does nothing inside the hysteresis band, so the target may oscillate', () => {
+    // log2 growth crosses a bucket boundary constantly; releasing and
+    // re-placing on each crossing would spend bandwidth to hold the same count.
+    const atTarget = planRepair({ holders: many.slice(0, 10), isLive: alive, candidates: [], target: 10 });
+    expect(atTarget.release).toEqual([]);
+    const oneOver = planRepair({ holders: many.slice(0, 11), isLive: alive, candidates: [], target: 10 });
+    expect(oneOver.release).toEqual([]);
+    const twoOver = planRepair({ holders: many.slice(0, 12), isLive: alive, candidates: [], target: 10 });
+    expect(twoOver.release).toHaveLength(1);
+  });
+
+  it('repairs and releases are mutually exclusive for one CID', () => {
+    const under = planRepair({ holders: ['p0'], isLive: alive, candidates: ['p1', 'p2'], target: 10 });
+    expect(under.release).toEqual([]);
+    expect(under.add.length).toBeGreaterThan(0);
   });
 });

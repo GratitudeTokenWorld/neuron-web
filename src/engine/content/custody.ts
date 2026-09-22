@@ -1,4 +1,4 @@
-import { MAX_OFFLINE_MS } from './provider-ledger.js';
+import { MAX_OFFLINE_MS, HEARTBEAT_INTERVAL_MS } from './provider-ledger.js';
 
 /**
  * Custody policy: what counts as a replica, when to repair, and what a returning
@@ -55,10 +55,53 @@ export const MIN_REPLICAS = 2;
 export const MAX_REPLICA_TARGET = 30;
 
 /**
- * Reads at which popularity starts adding assigned holders. Below this a CID is
- * ordinary and `REDUNDANCY_TARGET` is the whole answer.
+ * Reads **per demand window** at which popularity starts adding assigned
+ * holders. Below this a CID is ordinary and `REDUNDANCY_TARGET` is the whole
+ * answer.
+ *
+ * A RATE, not a lifetime total (changed 2026-09-22, Lucian). The distinction is
+ * the whole of demand-scaled replication: a lifetime counter only ever rises,
+ * so a CID that went viral once would hold conscripted capacity for the rest of
+ * its existence and the target could never come back down. It is also the
+ * sustained half of the invariant failing in a cache — a value that grows with
+ * history and never shrinks (ARCHITECTURE.md → *The invariant has two
+ * dimensions*).
  */
-export const POPULARITY_FLOOR = 100;
+export const POPULARITY_FLOOR = 10;
+
+/**
+ * The window demand is measured over: one hour at production timing.
+ *
+ * Derived from the heartbeat rather than hardcoded, so it compresses with
+ * `STORAGE_TIMING=fast` (30 s) exactly like every other storage duration. A
+ * fixed hour here would make demand-scaling untestable in a sitting, which is
+ * the trap `fmtSpan` was written for — a fixed unit against a clock that moves.
+ *
+ * A function, not a constant, because `HEARTBEAT_INTERVAL_MS` is an `export
+ * let` reassigned by `applyStorageTiming`; capturing it at module load is the
+ * "two things measuring different things" failure this codebase keeps paying
+ * for.
+ */
+export function demandWindowMs(): number {
+  return HEARTBEAT_INTERVAL_MS / 4;
+}
+
+/**
+ * Buckets the demand window is divided into. Six gives 10-minute granularity at
+ * production timing: fine enough that the rate tracks a spike within the hour,
+ * coarse enough that the per-CID cost is six numbers.
+ */
+export const DEMAND_BUCKETS = 6;
+
+/**
+ * Extra holders tolerated above target before any are released.
+ *
+ * Without it a target oscillating by one — which log2 growth does constantly
+ * around a bucket boundary — would release and re-place a replica forever,
+ * spending bandwidth to hold the same number of copies. Releasing is cheap and
+ * re-placing is not, so the asymmetry is deliberate: drift up fast, shed slowly.
+ */
+export const RELEASE_HYSTERESIS = 1;
 
 /**
  * Consecutive failed reads from one holder before its assignment is dropped.
@@ -86,24 +129,41 @@ export function liveHolders(holders: Iterable<string>, isLive: LivePredicate): s
 }
 
 /**
- * How many assigned holders a CID should have, given how much it is read.
+ * How many assigned holders a CID should have, given its CURRENT read rate.
  *
- * The base is durability and never moves. The surplus is fan-in: a CID with a
- * large audience must not turn its holders into a bottleneck, and *popularity
- * has to add serving capacity rather than only load* (ARCHITECTURE.md → Fan-IN,
- * principle 2). Growth is logarithmic — a hundred reads buys one more holder, a
- * thousand buys three — because demand is unbounded and capacity is not; a
- * linear response would let one viral object consume the fleet.
+ * `readsPerWindow` is reads in the last `demandWindowMs()` — an hour at
+ * production timing — so this number falls again when demand falls. That is the
+ * half that was missing until 2026-09-22: the input was a lifetime counter, so
+ * the target could only ever rise.
  *
- * Note what this is NOT doing: opportunistic caches (anyone who fetched the CID
- * and will serve it) already absorb most of a popularity spike for free, and
- * they are never counted here, because a cache is bandwidth and a lease is
- * durability. This function only raises the number of holders the network holds
- * *responsible*.
+ * The base is durability and never moves: **every file has at least
+ * `REDUNDANCY_TARGET` copies**, however unpopular. The surplus is fan-in: a CID
+ * with a large audience must not turn its holders into a bottleneck, and
+ * *popularity has to add serving capacity rather than only load*
+ * (ARCHITECTURE.md → Fan-IN, principle 2).
+ *
+ * **Why growth is logarithmic rather than linear** (the "one more copy per 10
+ * reads an hour" rule, considered 2026-09-22): linear is the correct control law
+ * if assigned holders were the only servers, because it holds reads-per-holder
+ * constant. They are not. Anyone who fetched a CID can serve it, so serving
+ * capacity already grows with the audience at no cost, and the assigned set only
+ * has to cover what caches miss. Linear growth would let one viral object
+ * conscript the fleet: at a copy per 10 reads/hour, a million reads an hour
+ * demands 100,000 leased copies. Measured comparison over a Zipf workload:
+ * `sim/demand-replication.ts`.
+ *
+ * The cap is not a tuning choice. This target travels inside a `CacheRequest`,
+ * so it is a number an ATTACKER writes; `MAX_REPLICA_TARGET` is what stops a
+ * publisher claiming unbounded capacity, and receivers clamp it again on
+ * arrival.
+ *
+ * Note what this is NOT doing: opportunistic caches are never counted here,
+ * because a cache is bandwidth and a lease is durability. This function only
+ * raises the number of holders the network holds *responsible*.
  */
-export function replicaTarget(reads: number): number {
-  if (!(reads > POPULARITY_FLOOR)) return REDUNDANCY_TARGET;
-  const surplus = Math.floor(Math.log2(reads / POPULARITY_FLOOR)) + 1;
+export function replicaTarget(readsPerWindow: number): number {
+  if (!(readsPerWindow > POPULARITY_FLOOR)) return REDUNDANCY_TARGET;
+  const surplus = Math.floor(Math.log2(readsPerWindow / POPULARITY_FLOOR)) + 1;
   return Math.min(MAX_REPLICA_TARGET, REDUNDANCY_TARGET + surplus);
 }
 
@@ -114,10 +174,16 @@ export interface RepairPlan {
   drop: string[];
   /** Candidates to hand the content to, in the order given. */
   add: string[];
-  /** Holders that still count right now. */
+  /** Holders that still count right now — counted by distinct failure domain. */
   live: number;
   /** Holders still missing after `add` is placed (0 = the plan restores the target). */
   shortfall: number;
+  /**
+   * Assignments to hand back because demand fell: the lease obligation ends,
+   * the BYTES stay as an uncounted spare (see `planEviction`). Never takes the
+   * object below `REDUNDANCY_TARGET`.
+   */
+  release: string[];
 }
 
 /**
@@ -139,23 +205,56 @@ export function planRepair(args: {
   isLive: LivePredicate;
   candidates: readonly string[];
   target?: number;
+  /**
+   * The failure domain a provider belongs to. **A replica is only a replica if
+   * it is on an independent machine** (Lucian, 2026-09-22), and a distinct
+   * public key does not establish that: multi-device custody gives one account
+   * several keys, and two accounts can run on one box. Ten copies inside one
+   * failure domain is one copy wearing ten names, and the redundancy is
+   * fictional in exactly the situation redundancy exists for.
+   *
+   * Defaults to the pub itself, which is the old behaviour, so a caller that
+   * has no domain information is no worse off than before. Callers that do —
+   * `storage-manager.ts` has `deviceId` today — should pass it.
+   */
+  domainOf?: (pub: string) => string;
 }): RepairPlan {
   const { holders, isLive, candidates, target = REDUNDANCY_TARGET } = args;
+  const domainOf = args.domainOf ?? ((pub: string) => pub);
   const all = [...holders];
   const live = all.filter(isLive);
   const drop = all.filter(p => !isLive(p));
-  const need = Math.max(0, target - live.length);
+
+  // Count by DOMAIN, not by holder: two keys on one machine satisfy one slot.
+  const liveDomains = new Set(live.map(domainOf));
+  const need = Math.max(0, target - liveDomains.size);
 
   const held = new Set(all);
+  const claimedDomains = new Set(liveDomains);
   const add: string[] = [];
   for (const c of candidates) {
     if (add.length >= need) break;
     if (held.has(c)) continue;
+    const d = domainOf(c);
+    // A new copy must be a new NODE. Skipping a candidate whose domain is
+    // already represented is what makes "another copy" mean another machine.
+    if (claimedDomains.has(d)) continue;
     held.add(c);
+    claimedDomains.add(d);
     add.push(c);
   }
 
-  return { drop, add, live: live.length, shortfall: need - add.length };
+  // Shedding surplus when demand falls. Released newest-first: the holders
+  // added for a popularity spike are the ones the spike conscripted, and the
+  // long-standing ones have proven they serve. Never below REDUNDANCY_TARGET,
+  // and never within the hysteresis band.
+  const floor = Math.max(REDUNDANCY_TARGET, target);
+  const surplus = liveDomains.size - floor;
+  const release = surplus > RELEASE_HYSTERESIS
+    ? live.slice(-(surplus - RELEASE_HYSTERESIS))
+    : [];
+
+  return { drop, add, live: liveDomains.size, shortfall: need - add.length, release };
 }
 
 /**
@@ -396,25 +495,90 @@ export function pollIntervalMs(
  * stale local opinion as a network fact.
  */
 export class CustodySignals {
-  private readonly readCounts = new Map<string, number>();
+  /**
+   * Reads per CID as a SLIDING WINDOW, not a lifetime total.
+   *
+   * A ring of `DEMAND_BUCKETS` counters plus the bucket index they start at.
+   * Advancing zeroes whatever the clock has passed, so the sum is always "reads
+   * in the last `demandWindowMs()`" and it falls on its own when reading stops.
+   * No timer is involved: buckets are advanced lazily whenever the CID is
+   * touched, which costs O(1) and cannot leak a callback.
+   *
+   * An exponential decay would have been fewer lines, but its value is not a
+   * quantity anyone can state — a decayed count under constant load settles at
+   * `rate / ln 2`, which is a number you have to apologise for in the UI. This
+   * sums to a real measured rate, which matters because it is rendered.
+   */
+  private readonly demand = new Map<string, { buckets: number[]; startBucket: number }>();
   private readonly failures = new Map<string, number>();
+
+  /** Which absolute bucket `now` falls in. */
+  private bucketIndex(now: number): number {
+    return Math.floor(now / (demandWindowMs() / DEMAND_BUCKETS));
+  }
+
+  /**
+   * Roll the ring forward to `now`, zeroing every bucket the clock passed.
+   * Returns the entry, or undefined if the CID was never read.
+   */
+  private advance(cid: string, now: number): { buckets: number[]; startBucket: number } | undefined {
+    const e = this.demand.get(cid);
+    if (!e) return undefined;
+    const idx = this.bucketIndex(now);
+    const elapsed = idx - e.startBucket;
+    if (elapsed <= 0) return e;
+    if (elapsed >= DEMAND_BUCKETS) {
+      e.buckets.fill(0);
+    } else {
+      for (let k = 1; k <= elapsed; k++) e.buckets[(e.startBucket + k) % DEMAND_BUCKETS] = 0;
+    }
+    e.startBucket = idx;
+    return e;
+  }
 
   private key(cid: string, pub: string): string {
     return `${cid} ${pub}`;
   }
 
   /** A successful read of this CID — demand, which feeds `replicaTarget`. */
-  recordRead(cid: string): void {
-    this.readCounts.set(cid, (this.readCounts.get(cid) ?? 0) + 1);
+  recordRead(cid: string, now: number = Date.now()): void {
+    const idx = this.bucketIndex(now);
+    let e = this.advance(cid, now);
+    if (!e) {
+      e = { buckets: new Array(DEMAND_BUCKETS).fill(0), startBucket: idx };
+      this.demand.set(cid, e);
+    }
+    e.buckets[idx % DEMAND_BUCKETS]! += 1;
   }
 
-  reads(cid: string): number {
-    return this.readCounts.get(cid) ?? 0;
+  /** Reads in the last `demandWindowMs()` — a rate, and it falls again. */
+  reads(cid: string, now: number = Date.now()): number {
+    const e = this.advance(cid, now);
+    if (!e) return 0;
+    let sum = 0;
+    for (const b of e.buckets) sum += b;
+    return sum;
   }
 
-  /** This CID's current assigned-holder target, given the demand seen so far. */
-  targetFor(cid: string): number {
-    return replicaTarget(this.reads(cid));
+  /** This CID's current assigned-holder target, given its current read rate. */
+  targetFor(cid: string, now: number = Date.now()): number {
+    return replicaTarget(this.reads(cid, now));
+  }
+
+  /**
+   * Drop CIDs whose demand has fallen to zero. Returns how many went.
+   *
+   * The map is keyed by a CID any peer can cause us to read, so *something* has
+   * to remove an entry or this is unbounded state keyed by an outsider's choice
+   * (SCREENING.md → 1). Cheap and idempotent — call it from whatever loop is
+   * already running.
+   */
+  sweepDemand(now: number = Date.now()): number {
+    let removed = 0;
+    for (const cid of [...this.demand.keys()]) {
+      if (this.reads(cid, now) === 0) { this.demand.delete(cid); removed++; }
+    }
+    return removed;
   }
 
   /**
@@ -441,13 +605,13 @@ export class CustodySignals {
 
   /** Drop every signal for a CID (deleted, replaced, or no longer tracked). */
   forget(cid: string): void {
-    this.readCounts.delete(cid);
+    this.demand.delete(cid);
     const prefix = `${cid} `;
     for (const k of this.failures.keys()) if (k.startsWith(prefix)) this.failures.delete(k);
   }
 
   clear(): void {
-    this.readCounts.clear();
+    this.demand.clear();
     this.failures.clear();
   }
 }
