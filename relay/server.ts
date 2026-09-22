@@ -1127,7 +1127,14 @@ async function main() {
           // but storage blocks postdate it entirely, so a missing type means
           // "not a storage block" and skipping is correct — and avoids decoding
           // the whole archive on every request.
-          if (!String(row.type || '').startsWith('storage-')) continue;
+          // Only the two types discovery actually folds. Matching the whole
+          // `storage-` prefix used to be free; since 2026-09-22 it is not,
+          // because `storage-settle` blocks carry reader receipts and can run
+          // to tens of kilobytes — decoding every one of them on every
+          // /providers request turns a cheap question into expensive work,
+          // which is the amplification shape this file has to avoid.
+          const rowType = String(row.type || '');
+          if (rowType !== 'storage-register' && rowType !== 'storage-deregister') continue;
           try { blocks.push(decodeBlock(hexToBytes(row.blockHex))); } catch { /* skip bad row */ }
         }
         const selected = selectDiscoveryBlocks(blocks, limit, Date.now());

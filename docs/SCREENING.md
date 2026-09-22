@@ -299,10 +299,20 @@ Ordered by what would hurt most, not by ease.
    pick a target worth attacking, write the attacker's goal in one sentence,
    and BUILD the attack rather than arguing about it. Dev mode is the window:
    data is disposable and there is no real money yet.
-1. **Sustained write load over time** — the one still unbuilt. Not "is per-node
-   cost bounded now?" but "does any per-node structure grow monotonically over
-   hours at target write rates?". This is the test that would have found both
-   limiter leaks by construction.
+1. **Sustained write load over time** — **BUILT 2026-09-22**,
+   `sim/sustained-load.ts`. Drives the shipping structures through a simulated
+   month (360,000 operations, 200 peers plus 5 new an hour) and asserts that
+   late growth — after everything has been seen — stays within fluctuation
+   rather than tracking work done. The harness proves it can fail: a planted
+   leaking map is detected.
+
+   It found three real defects on its first runs, all of which had survived
+   hand review: `ReceiptLedger` kept every pair that owed anything, so a
+   provider serving thousands of readers never released one and settlement
+   could not drain it; `FailureCorrelation` pruned only the holder being
+   recorded, so departed peers kept their buckets forever; and its retention
+   constant read as "168 hours" while a bucket is four hours, making the real
+   window 28 days instead of 7 (item 8 below, again).
 2. **Scan traffic from many distinct source addresses.** An IPv6 /64 against
    every keyed endpoint: `/resolve`, `/files`, `/pending-sends`, `/head-proof`,
    `/face-verify/*`. Watch relay RSS, not just response codes.

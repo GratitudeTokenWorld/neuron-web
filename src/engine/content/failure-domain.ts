@@ -116,11 +116,29 @@ export interface PairEvidence {
  * outsider chooses is precisely the shape that has leaked twice already
  * (SCREENING.md → 1).
  */
+/**
+ * How long co-failure history is kept, as a DURATION rather than a count.
+ *
+ * It was `168` buckets, which reads as "hours in a week" and is not: a bucket
+ * is `observationBucketMs()` — one heartbeat interval, four hours at
+ * production timing — so the real retention was 28 days, four times the
+ * evident intent. A fixed count against a configurable clock, which is
+ * SCREENING.md → 8, and it surfaced only when the sustained-load harness ran
+ * for a simulated month and found the structure still growing at the end.
+ *
+ * Expressed in milliseconds and converted, so the unit follows the profile.
+ */
+export const CORRELATION_RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+
 export class FailureCorrelation {
   private readonly up = new Map<string, Set<number>>();
   private readonly down = new Map<string, Set<number>>();
+  private readonly retainBuckets: number;
 
-  constructor(private readonly retainBuckets = 168) {}
+  constructor(retainBuckets?: number) {
+    this.retainBuckets = retainBuckets
+      ?? Math.max(1, Math.ceil(CORRELATION_RETAIN_MS / observationBucketMs()));
+  }
 
   private bucketOf(now: number): number {
     return Math.floor(now / observationBucketMs());
@@ -155,6 +173,30 @@ export class FailureCorrelation {
   forget(holder: string): void {
     this.up.delete(holder);
     this.down.delete(holder);
+  }
+
+  /**
+   * Drop holders that have stopped being observed entirely.
+   *
+   * `prune` only trims the holder currently being recorded, so a peer that
+   * leaves keeps its buckets forever — bounded per holder, unbounded in the
+   * number of holders. Found by the sustained-load harness (1,795 holders
+   * accumulated over a simulated month of churn), which is exactly the class
+   * of defect it exists to find and the second time this shape has appeared in
+   * code I wrote while documenting it.
+   *
+   * Returns how many went.
+   */
+  sweep(now: number = Date.now(), retainBuckets = this.retainBuckets): number {
+    const cutoff = this.bucketOf(now) - retainBuckets;
+    let removed = 0;
+    for (const holder of this.holders()) {
+      const newest = Math.max(
+        ...[...(this.up.get(holder) ?? []), ...(this.down.get(holder) ?? []), -Infinity],
+      );
+      if (newest < cutoff) { this.forget(holder); removed++; }
+    }
+    return removed;
   }
 
   /** Holders with any history. */
