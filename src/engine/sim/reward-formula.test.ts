@@ -4,6 +4,7 @@ import {
   splittingGain, inequalityRatio, DEFAULT_FLEET,
   claimCost, claimDayFor, claimSlotFor, claimsUnderThreshold,
   fleetBreakEven, ASSUMED_ANNUAL_COST,
+  serviceWeight, bytesServedFrom, supplyForTargetEarning, earningForSupply,
 } from './reward-formula.js';
 
 /**
@@ -256,5 +257,104 @@ describe('can rewards cover the cost of RUNNING a node?', () => {
       annualEmissionUnits: 40_000, supplyUnits: SUPPLY,
     });
     expect(doubled.unitPrice).toBeCloseTo(424, 0);
+  });
+});
+
+describe('reward driven by SERVICE alone (Lucian, 2026-09-22)', () => {
+  const GB = 1024 ** 3;
+  const MB = 1024 ** 2;
+  /** The reference node Lucian specified. */
+  const ref = bytesServedFrom({ bytesHeld: 100 * GB, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: 3 });
+
+  it('pays nothing for storing content nobody reads', () => {
+    // "Storing alone does not pay anything." Bytes served is zero, so weight
+    // is zero, whatever is on the disk.
+    expect(serviceWeight(bytesServedFrom({
+      bytesHeld: 50 * 1024 ** 4, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: 0,
+    }).bytesServed)).toBe(0);
+  });
+
+  it('captures both halves of "file size + reads" in one number', () => {
+    // Ten reads of one 5 MB file and one read of ten 5 MB files are the same
+    // 50 MB of service, which is the correct equivalence.
+    const many = bytesServedFrom({ bytesHeld: 50 * MB, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: 1 });
+    const hot = bytesServedFrom({ bytesHeld: 5 * MB, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: 10 });
+    expect(many.bytesServed).toBe(hot.bytesServed);
+  });
+
+  it('models the reference node: 100 GB, 5 MB files, 3 reads each', () => {
+    expect(Math.round(ref.files)).toBe(20_480);
+    expect(Math.round(ref.reads)).toBe(61_440);
+    expect(ref.bytesServed / GB).toBeCloseTo(300, 0);
+  });
+});
+
+describe('what "1000 units per 30 days" actually requires', () => {
+  const GB = 1024 ** 3;
+  const MB = 1024 ** 2;
+  const ref = bytesServedFrom({ bytesHeld: 100 * GB, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: 3 });
+  const PERIODS = 365 / 30;
+
+  it('is set by the SUPPLY, not by any formula parameter', () => {
+    // Earnings are a share of a capped pool, so no custodyRate, serviceRate or
+    // alpha sets an absolute number - they only set relative shares.
+    const r = supplyForTargetEarning({
+      targetPerPeriod: 1000, periodsPerYear: PERIODS,
+      referenceWeight: ref.bytesServed, totalNetworkWeight: ref.bytesServed * 1_000_000,
+      inflationPpm: 20_000,
+    });
+    // ~608 billion UNIT of supply, for a million such nodes at 2% inflation.
+    expect(r.requiredSupply).toBeGreaterThan(5e11);
+    expect(r.requiredSupply).toBeLessThan(7e11);
+  });
+
+  it('is INDEPENDENT of the read rate — the counter-intuitive part', () => {
+    // If everyone's reads rise tenfold, everyone's share is unchanged. Reading
+    // more only helps a provider that reads more THAN OTHERS.
+    const supplies = [0.3, 3, 30].map(reads => {
+      const n = bytesServedFrom({ bytesHeld: 100 * GB, avgFileBytes: 5 * MB, avgReadsPerFilePerPeriod: reads });
+      return supplyForTargetEarning({
+        targetPerPeriod: 1000, periodsPerYear: PERIODS,
+        referenceWeight: n.bytesServed, totalNetworkWeight: n.bytesServed * 1_000_000,
+        inflationPpm: 20_000,
+      }).requiredSupply;
+    });
+    expect(supplies[0]).toBeCloseTo(supplies[1]!, -6);
+    expect(supplies[1]).toBeCloseTo(supplies[2]!, -6);
+  });
+
+  it('scales linearly with how many nodes share the pool', () => {
+    const at1M = supplyForTargetEarning({
+      targetPerPeriod: 1000, periodsPerYear: PERIODS, referenceWeight: 1,
+      totalNetworkWeight: 1_000_000, inflationPpm: 20_000,
+    }).requiredSupply;
+    const at100M = supplyForTargetEarning({
+      targetPerPeriod: 1000, periodsPerYear: PERIODS, referenceWeight: 1,
+      totalNetworkWeight: 100_000_000, inflationPpm: 20_000,
+    }).requiredSupply;
+    expect(at100M / at1M).toBeCloseTo(100, 0);
+  });
+
+  it('round-trips through the inverse — the two must agree', () => {
+    const required = supplyForTargetEarning({
+      targetPerPeriod: 1000, periodsPerYear: PERIODS, referenceWeight: 1,
+      totalNetworkWeight: 1_000_000, inflationPpm: 20_000,
+    }).requiredSupply;
+    const earned = earningForSupply({
+      supplyUnits: required, inflationPpm: 20_000, periodsPerYear: PERIODS,
+      referenceWeight: 1, totalNetworkWeight: 1_000_000,
+    });
+    expect(earned).toBeCloseTo(1000, 3);
+  });
+
+  it('shows what a 1-billion supply would actually pay', () => {
+    // For contrast: the same node in the same network earns ~1.6 units a month
+    // at a 1B supply. Identical economics, different denomination.
+    const earned = earningForSupply({
+      supplyUnits: 1e9, inflationPpm: 20_000, periodsPerYear: PERIODS,
+      referenceWeight: 1, totalNetworkWeight: 1_000_000,
+    });
+    expect(earned).toBeGreaterThan(1.5);
+    expect(earned).toBeLessThan(1.7);
   });
 });

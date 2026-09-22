@@ -376,3 +376,106 @@ export function fleetBreakEven(args: {
   const unitPrice = args.annualEmissionUnits > 0 ? cost / args.annualEmissionUnits : Infinity;
   return { annualFleetCost: cost, unitPrice, impliedMarketCap: unitPrice * args.supplyUnits };
 }
+
+// ── Calibrating the pool to a target earning ─────────────────────────────────
+
+/**
+ * Reward driven by SERVICE alone (Lucian, 2026-09-22).
+ *
+ * "A datacentre hosting a lot of content means nothing if that content is not
+ * read. Storing alone does not pay anything." So the weight is **bytes
+ * served**, which already contains both halves of "total file size + their
+ * reads": serving one 5 MB file ten times is 50 MB, and so is serving ten
+ * 5 MB files once.
+ *
+ * This is coherent — and it needs one condition stated, because without it the
+ * coverage result in `incentive-coverage.ts` bites. Paying only for service is
+ * safe when **custody is an assigned obligation rather than a free choice**: a
+ * provider takes a lease, must keep the bytes (verified by sampled challenges,
+ * `content/custody-sampling.ts`), and is paid when they are read. Cold content
+ * survives because dropping it breaks the lease and costs the provider its
+ * standing, not because holding it pays.
+ *
+ * The earlier objection assumed providers pick what to hold. Under assigned,
+ * sampling-enforced custody they do not, and it does not apply.
+ */
+export function serviceWeight(bytesServed: number): number {
+  return Math.max(0, bytesServed);
+}
+
+/**
+ * Bytes a provider serves in a period, from the shape of what it holds.
+ *
+ * `readsPerFile` is the average over the period, so this is
+ * `files × fileSize × reads` — the estimate Lucian asked for, with its inputs
+ * visible rather than folded into a constant.
+ */
+export function bytesServedFrom(args: {
+  bytesHeld: number;
+  avgFileBytes: number;
+  avgReadsPerFilePerPeriod: number;
+}): { files: number; reads: number; bytesServed: number } {
+  const files = args.avgFileBytes > 0 ? args.bytesHeld / args.avgFileBytes : 0;
+  const reads = files * args.avgReadsPerFilePerPeriod;
+  return { files, reads, bytesServed: reads * args.avgFileBytes };
+}
+
+/**
+ * What the network's supply and emission must be for a given node to earn a
+ * given amount.
+ *
+ * The question Lucian asked — "adjust the formula so a 100 GB node earns 1000
+ * units per 30 days" — has an answer the formula cannot give, and saying so is
+ * the point. Earnings are a **share of a capped pool**, so an individual's
+ * payout depends on everyone else's weight. No choice of `custodyRate`,
+ * `serviceRate` or `alpha` sets an absolute number; they only set *relative*
+ * shares.
+ *
+ * What DOES set the absolute number is the size of the pool. So this inverts
+ * the question: given a target earning and a fleet, how large must the annual
+ * emission — and therefore the supply — be?
+ */
+export function supplyForTargetEarning(args: {
+  /** What one reference node should earn per period. */
+  targetPerPeriod: number;
+  periodsPerYear: number;
+  /** Weight of the reference node. */
+  referenceWeight: number;
+  /** Total weight of the whole network, including the reference node. */
+  totalNetworkWeight: number;
+  /** Emission cap as parts-per-million of supply, per YEAR. */
+  inflationPpm: number;
+}): { emissionPerPeriod: number; annualEmission: number; requiredSupply: number } {
+  const share = args.totalNetworkWeight > 0 ? args.referenceWeight / args.totalNetworkWeight : 0;
+  if (share <= 0) return { emissionPerPeriod: Infinity, annualEmission: Infinity, requiredSupply: Infinity };
+  const emissionPerPeriod = args.targetPerPeriod / share;
+  const annualEmission = emissionPerPeriod * args.periodsPerYear;
+  return {
+    emissionPerPeriod,
+    annualEmission,
+    requiredSupply: (annualEmission * 1_000_000) / args.inflationPpm,
+  };
+}
+
+/**
+ * The inverse, and the one to reason with day to day: given a supply, what
+ * does the reference node actually earn?
+ *
+ * Pair this with `supplyForTargetEarning` and the pair says something blunt:
+ * **"1000 units per month" is a denomination choice, not an economic one.**
+ * What is economically real is the SHARE — one millionth of the pool, in a
+ * million-node network — and no formula parameter changes that. Picking the
+ * supply is picking whether that share is called 1 unit or 1000.
+ */
+export function earningForSupply(args: {
+  supplyUnits: number;
+  inflationPpm: number;
+  periodsPerYear: number;
+  referenceWeight: number;
+  totalNetworkWeight: number;
+}): number {
+  const annualEmission = (args.supplyUnits * args.inflationPpm) / 1_000_000;
+  const perPeriod = annualEmission / args.periodsPerYear;
+  const share = args.totalNetworkWeight > 0 ? args.referenceWeight / args.totalNetworkWeight : 0;
+  return perPeriod * share;
+}

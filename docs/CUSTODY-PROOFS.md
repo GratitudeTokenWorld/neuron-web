@@ -603,15 +603,71 @@ They never get personhood, their own attestation budget, or a vote
 for a sweep, because a delegation that stays effective until a timer runs is a
 window.
 
+#### C4 - Reward is SERVICE only, and B1 is withdrawn (Lucian, 2026-09-22)
+
+"A datacentre hosting a lot of content means nothing if that content is not
+read. Storing alone does not pay anything." Correct, and it dissolves the
+coverage objection rather than trading against it.
+
+The weight is **bytes served**, which already contains both halves of "total
+file size + their reads": ten reads of one 5 MB file and one read of ten 5 MB
+files are the same 50 MB of service, which is the right equivalence. No reads,
+no reward, whatever is on the disk.
+
+**The condition that makes this safe, stated because without it B1 does bite:**
+paying only for service works when **custody is an assigned obligation, not a
+free choice**. A provider takes a lease, must keep the bytes — verified by
+sampled challenges (B2) — and is paid when they are read. Cold content survives
+because *dropping it breaks the lease and costs the provider its standing*, not
+because holding it pays. The earlier objection assumed providers choose what to
+hold; under assigned, sampling-enforced custody they do not.
+
+So the device-size compensation question is also moot: one consistent rule
+across device types, no concavity, no `alpha`. A small device serving little
+earns little, which is correct rather than unfair.
+
+#### C5 - "1000 units per 30 days" is a DENOMINATION choice, not an economic one
+
+Lucian's calibration request, with the answer the formula cannot give.
+
+Reference node: 100 GB declared and full, 5 MB average file, 3 reads per file
+per 30 days = 20,480 files, **61,440 reads, 300 GB served**.
+
+Earnings are a **share of a capped pool**, so no `serviceRate` and no weighting
+sets an absolute payout — they only set *relative* shares. What sets the
+absolute number is the supply:
+
+| Identical nodes sharing the pool | Supply needed for 1000 UNIT/30 days @ 2% |
+|---|---|
+| 10,000 | 6.08e9 |
+| 1,000,000 | **6.08e11** |
+| 100,000,000 | 6.08e13 |
+
+**And it is completely independent of the read rate.** At 0.3, 3 or 30 reads
+per file the required supply is identical, because if everyone's reads rise
+tenfold everyone's share is unchanged. Reading more only helps a provider that
+serves more *than others do*.
+
+For contrast, the same node in the same network earns **~1.6 UNIT per 30 days**
+at a 1-billion supply. Identical economics; different denomination — the same
+choice as satoshis against bitcoin.
+
+So the practical conclusion: pick the supply so the numbers read comfortably,
+and stop treating the target as an economic parameter. What is economically
+real is that this node holds one millionth of the network's service weight, and
+that is true at every supply.
+
 #### Where this leaves the design
 
 Settled: reader-attested service, sampled custody, no failure attestation,
 capped proportional emission, bytes-held rather than replica count, auto-only
 claims spread by account id, sub-accounts collapsed to humans.
 
-Open and needing Lucian: the **alpha value** (0.9 recommended), the
-**custody:service ratio** (1:3 recommended), whether to accept 60-day evidence
-retention, and whether losing manual claims is an acceptable UX cost.
+Superseded by C4: the `alpha` concavity and the custody:service ratio are both
+gone — the weight is bytes served, one rule for every device class.
+
+Open and needing Lucian: the **supply/denomination** (C5), the **minimum claim
+threshold**, and whether losing manual claims is an acceptable UX cost.
 
 Unchanged and still load-bearing: **the identity gate prices every defence
 here**. Sub-accounts make that more true, not less.
