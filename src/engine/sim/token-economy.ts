@@ -11,10 +11,31 @@
  *   space should exceed stored data;
  * - every new account is issued **1,000,000 UNITS** at creation.
  *
- * A one-sided inflationary token has no equilibrium and no reason to hold
- * value. Adding a burn tied to real consumption gives it both: supply settles
- * where burn equals emission, and the settling point is a function of how much
- * the network actually stores rather than of anything anyone decrees.
+ * ## A correction to how this file was first written (Lucian, 2026-09-22)
+ *
+ * The first draft asserted that "a one-sided inflationary token has no
+ * equilibrium and no reason to hold value", and treated a settled, capped
+ * supply as the safe outcome. That is crypto orthodoxy imported as if it were
+ * physics, and it is wrong for this system.
+ *
+ * **A deflationary currency rewards holding and punishes using.** For a
+ * *utility* token whose entire purpose is to be spent on storage, that is
+ * anti-purpose: the rational move becomes hoarding rather than participating.
+ * It also makes late joiners pay more for the same service than early ones
+ * did, permanently - which is Principle 1's access commitment failing in the
+ * economics, and is the structural shape of a scheme where early holders are
+ * paid by late entrants rather than by utility.
+ *
+ * The abundance model is also the one this architecture already runs on.
+ * **Durability is a FLOW property** - content survives because the network
+ * continuously re-replicates it, not because copies are hoarded. A currency
+ * that must be hoarded to hold value would contradict the system it pays for.
+ * Units are minted by service, destroyed by consumption, and what matters is
+ * that the flow tracks real work. The total is not the interesting number.
+ *
+ * So: supply is unbounded by design, and that is not a risk to be mitigated.
+ * What still has to be true is narrower and is measured by `flowHealth` below -
+ * the mint:burn RATIO, not the supply level.
  *
  * ## Where the 10x comes from — it is physics, not economics
  *
@@ -88,8 +109,11 @@ export function economyStep(p: EconomyParams): EconomyStep {
  *
  * The consequence worth noticing: **equilibrium supply is set by how much the
  * network stores**, not by any monetary policy. Storage doubles, supply
- * doubles. That is a far better property than an inflationary token without a
- * sink, which has no fixed point at all.
+ * doubles.
+ *
+ * Kept for the record, but note it answers a question this design does not
+ * ask: reaching a fixed supply is not a goal here, and a token whose supply
+ * keeps growing is not thereby broken (see the correction at the top).
  */
 export function equilibriumSupply(args: {
   inflationPpm: number;
@@ -368,8 +392,9 @@ export function fixedRateStep(args: {
  * byte stored, per period. Equal to `costRatio` — which is the rule restated,
  * and worth having as a number because it is the one empirical question the
  * design rests on. **Does the network actually read ten times its stored volume
- * per period?** Below that it is deflationary, above it inflationary, and
- * Lucian is content with the inflationary side.
+ * per period?** Below it the supply shrinks, above it the supply grows. Neither
+ * is a failure - growth is the intended direction, since a regenerating system
+ * should regenerate its unit of account too.
  */
 export function balancedReadIntensity(costRatio = COST_RATIO): number {
   return costRatio;
@@ -413,4 +438,38 @@ export function capForWashYieldBelowFreeTier(args: {
   const ratio = args.costRatio ?? COST_RATIO;
   const perPeriodAllowance = args.freeBytes / (args.lifetimeYears * args.periodsPerYear);
   return perPeriodAllowance * ratio;
+}
+
+/**
+ * The number that actually matters under an abundance model.
+ *
+ * Not the supply level - that is unbounded by design and says nothing on its
+ * own. What has to stay true is that the FLOW keeps tracking real work, and
+ * the mint:burn ratio is that, in one number:
+ *
+ * - **around 1** - service and consumption are in step, and the unit is a
+ *   measure of work being done;
+ * - **persistently high** - units are created far faster than anything
+ *   consumes them, so each buys progressively less storage and the incentive
+ *   to serve erodes. This is the real failure mode, and it is about the RATIO,
+ *   not about the total;
+ * - **persistently low** - storage is consumed faster than service is
+ *   produced, so units get scarce, stored data gets expensive, and joining
+ *   gets harder over time. That is the failure the deflationary instinct is
+ *   actually afraid of, and the one Principle 1 cares about.
+ *
+ * The band is wide on purpose. Holding this at exactly 1 would be monetary
+ * policy, and monetary policy needs a policymaker - a required party this
+ * project does not get to have.
+ */
+export function flowHealth(args: {
+  mintedPerPeriod: number;
+  burnedPerPeriod: number;
+}): { ratio: number; verdict: 'balanced' | 'diluting' | 'tightening' } {
+  if (args.burnedPerPeriod <= 0) {
+    return { ratio: Infinity, verdict: args.mintedPerPeriod > 0 ? 'diluting' : 'balanced' };
+  }
+  const ratio = args.mintedPerPeriod / args.burnedPerPeriod;
+  const verdict = ratio > 3 ? 'diluting' : ratio < 1 / 3 ? 'tightening' : 'balanced';
+  return { ratio, verdict };
 }

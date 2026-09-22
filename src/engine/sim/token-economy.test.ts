@@ -4,7 +4,7 @@ import {
   breakEvenProvisionRatio, burnRateForSelfPayingAt, sybilValueOfAccount,
   grantLifetimeYears, simulateActivitySupply, balancedMintPerByteServed,
   signupIssuance, selfPayingServedBytes, fixedRateStep, balancedReadIntensity,
-  washReadStorageYield, capForWashYieldBelowFreeTier, COST_RATIO,
+  washReadStorageYield, capForWashYieldBelowFreeTier, COST_RATIO, flowHealth,
 } from './token-economy.js';
 import { REDUNDANCY_TARGET } from '../content/custody.js';
 
@@ -258,5 +258,45 @@ describe('a fixed rate reopens wash-reading — and the cap is now economic', ()
     });
     const providersAReaderUses = 60;
     expect((capPerPair * providersAReaderUses) / GB).toBeGreaterThan(9);
+  });
+});
+
+describe('abundance, not scarcity (Lucian, 2026-09-22)', () => {
+  it('judges the FLOW ratio, not the supply level', () => {
+    // Supply is unbounded by design and says nothing on its own. What has to
+    // stay true is that minting keeps tracking real work.
+    expect(flowHealth({ mintedPerPeriod: 100, burnedPerPeriod: 100 }).verdict).toBe('balanced');
+    expect(flowHealth({ mintedPerPeriod: 100, burnedPerPeriod: 50 }).verdict).toBe('balanced');
+    expect(flowHealth({ mintedPerPeriod: 1000, burnedPerPeriod: 10 }).verdict).toBe('diluting');
+    expect(flowHealth({ mintedPerPeriod: 1, burnedPerPeriod: 1000 }).verdict).toBe('tightening');
+  });
+
+  it('treats a growing supply as normal, not as a fault', () => {
+    // A regenerating system regenerates its unit of account too.
+    const growing = fixedRateStep({
+      bytesServedPerPeriod: 30 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-6,
+    });
+    expect(growing.inflationary).toBe(true);
+    expect(flowHealth({ mintedPerPeriod: growing.minted, burnedPerPeriod: growing.burned }).verdict)
+      .toBe('balanced');
+  });
+
+  it('names TIGHTENING as the failure Principle 1 cares about', () => {
+    // Deflation means late joiners pay more for the same storage than early
+    // ones did, permanently - an access barrier that grows with time, which is
+    // the shape the deflationary instinct mistakes for safety.
+    const scarce = flowHealth({ mintedPerPeriod: 1, burnedPerPeriod: 100 });
+    expect(scarce.verdict).toBe('tightening');
+    expect(scarce.ratio).toBeLessThan(1);
+  });
+
+  it('keeps the band wide, because narrowing it needs a policymaker', () => {
+    for (const ratio of [0.5, 1, 2]) {
+      expect(flowHealth({ mintedPerPeriod: ratio * 100, burnedPerPeriod: 100 }).verdict).toBe('balanced');
+    }
+  });
+
+  it('still flags minting with nothing consuming - the real dilution risk', () => {
+    expect(flowHealth({ mintedPerPeriod: 100, burnedPerPeriod: 0 }).verdict).toBe('diluting');
   });
 });
