@@ -43,6 +43,11 @@ import {
 import { FailureCorrelation, inferDomains } from '../engine/content/failure-domain';
 import { planBySaturation, DEFAULT_CONCURRENCY, type DeviceClass } from '../engine/content/device-capacity';
 import { CalibrationRun, effectiveCapacity, LADDER } from '../engine/content/calibration';
+import {
+  ReaderReceiptBook, ReceiptLedger, receiptPayload, MAX_RECEIPTS_PER_SETTLEMENT,
+  type SignedReceipt,
+} from '../engine/content/read-receipts';
+import { readCredit, DEFAULT_TAPER } from '../engine/content/read-credit';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 // Every cadence here is a FRACTION of the timing profile, not a wall-clock
@@ -203,6 +208,26 @@ export class StorageManager extends EventEmitter {
    * fail together can (failure-domain.ts).
    */
   private readonly failureCorrelation = new FailureCorrelation();
+
+  /**
+   * What this node has read from each provider — the attesting side.
+   *
+   * One book per local account, because a receipt is signed by a reader and
+   * this browser may hold several.
+   */
+  private readonly readerBooks = new Map<string, ReaderReceiptBook>();
+
+  /** Reads of each CID by this node, for the per-file taper. */
+  private readonly readsPerCid = new Map<string, number>();
+
+  /**
+   * Receipts OTHERS have handed us, waiting to be settled.
+   *
+   * Verified on arrival, so nothing unsigned is ever stored, and bounded by
+   * distinct readers rather than by reads.
+   */
+  private readonly inboundReceipts = new ReceiptLedger();
+  private readonly pendingEnvelopes = new Map<string, SignedReceipt>();
   /**
    * Per-provider calibration evidence, from probes WE performed.
    *
@@ -299,6 +324,82 @@ export class StorageManager extends EventEmitter {
       console.log(`[StorageManager] Swept calibration/co-failure history for ${dropped} departed provider(s)`);
       this.domainCache = undefined;
     }
+  }
+
+  /**
+   * Sign a read receipt for the peer that just served us, and hand it over.
+   *
+   * The per-file taper is applied HERE, by the reader, because the reader is
+   * the only party that knows how often it has fetched this file
+   * (`content/read-credit.ts`). A repeat inside the cache window credits
+   * nothing and produces no receipt at all.
+   */
+  private async creditServingPeer(cid: string, bytes: number, latencyMs: number): Promise<void> {
+    const peer = this.store.lastServedBy;
+    if (!peer) return;                              // served from our own disk
+    const provider = this.providerBySmokeAddr(peer);
+    if (!provider) return;                          // not a registered provider
+
+    const nth = (this.readsPerCid.get(cid) ?? 0) + 1;
+    this.readsPerCid.set(cid, nth);
+    const credited = Math.round(bytes * readCredit(nth, DEFAULT_TAPER));
+    if (credited <= 0) return;                      // tapered out — nothing owed
+
+    for (const [pub, keys] of this.localKeys) {
+      if (pub === provider) continue;               // never vouch for ourselves
+      let book = this.readerBooks.get(pub);
+      if (!book) { book = new ReaderReceiptBook(pub); this.readerBooks.set(pub, book); }
+      const receipt = book.record({ provider, creditedBytes: credited, latencyMs });
+      if (!receipt) continue;
+      const envelope: SignedReceipt = {
+        receipt,
+        signature: this.signMsg(receiptPayload(receipt), keys),
+      };
+      await this.store.sendReadReceipt(peer, envelope).catch(err => {
+        // Say why. A silent failure here is indistinguishable from a provider
+        // that never served anyone.
+        console.warn(`[StorageManager] read receipt to ${peer.slice(0, 12)}… not delivered:`,
+          err instanceof Error ? err.message : String(err));
+      });
+      break;                                        // one reader identity is enough
+    }
+  }
+
+  /** Which registered provider is behind a smoke address. */
+  private providerBySmokeAddr(addr: string): string | undefined {
+    for (const p of this.ledger.storageProviders.values()) {
+      if (p.smokeAddr === addr) return p.pub;
+    }
+    return undefined;
+  }
+
+  /**
+   * A reader handed us a receipt. Verify it now, store it if it supersedes.
+   *
+   * Verified on arrival rather than at settlement so nothing unsigned is ever
+   * held, and so a forged one is rejected while the sender is still around to
+   * be told.
+   */
+  private acceptReadReceipt(raw: unknown): void {
+    const env = raw as SignedReceipt | undefined;
+    if (!env?.receipt || typeof env.signature !== 'string') return;
+    const err = this.inboundReceipts.record(env.receipt, r =>
+      this.verifyMsg(env.signature, receiptPayload(r), r.reader));
+    if (err) {
+      console.warn(`[StorageManager] read receipt refused: ${err}`);
+      return;
+    }
+    this.pendingEnvelopes.set(`${env.receipt.reader}`, env);
+  }
+
+  /**
+   * The receipts to put in the next settlement block, newest per reader.
+   *
+   * Capped at `MAX_RECEIPTS_PER_SETTLEMENT`; the rest roll over, since a
+   * reader's baseline only moves when it is actually settled.
+   */
+  settlementReceipts(): SignedReceipt[] {
+    return [...this.pendingEnvelopes.values()].slice(0, MAX_RECEIPTS_PER_SETTLEMENT);
   }
 
   /** Record one probe of a provider — the prober side of calibration. */
@@ -472,6 +573,8 @@ export class StorageManager extends EventEmitter {
     });
 
     // Watch for retrieval receipts from peers
+    // Read receipts arrive point to point on the smoke channel, not by gossip.
+    this.store.onReadReceipt = (env) => this.acceptReadReceipt(env);
     this.net.watchStorageReceipts((receipt) => { this.handleReceipt(receipt as unknown as StorageReceipt).catch(() => {}); });
 
     // Watch for content delete requests - any node that holds the blocks drops them
@@ -2350,6 +2453,10 @@ export class StorageManager extends EventEmitter {
       // holders are loaded, and the two together give concurrency by Little's
       // Law (custody.ts → `concurrentReads`), which is what drives replication.
       this.signals.recordRead(cid, Date.now(), Date.now() - start);
+      // Credit whoever served it. Unawaited: a receipt is worth less than a
+      // millisecond on the read path, and losing one costs nothing because the
+      // next receipt supersedes it.
+      void this.creditServingPeer(cid, data.byteLength, Date.now() - start);
       return data;
     } catch (err) {
       this.repairOnReadFailure(cid);

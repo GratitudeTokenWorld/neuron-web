@@ -264,6 +264,19 @@ export class SmokeStore {
    * every peer we had ever seen. It is also what makes reader-caches findable
    * without announcing, so it is BOUNDED rather than removed.
    */
+  /**
+   * The peer that served the most recent peer-fetched block, or undefined when
+   * the read was satisfied locally.
+   *
+   * Read immediately after `retrieve()` by the caller that credits it. Kept as
+   * a field rather than widening the return type because `retrieve` has many
+   * callers and only one of them cares.
+   */
+  lastServedBy?: string;
+
+  /** Set by StorageManager to receive read receipts delivered by readers. */
+  onReadReceipt?: (envelope: unknown) => void;
+
   private peerFallbacks = new Set<string>();
 
   /** OPFS directory handle for large blocks — null if OPFS unavailable */
@@ -307,6 +320,32 @@ export class SmokeStore {
     // then OPFS (large chunks). Both support Range requests for spot-checks.
     this.network.Http.listen({ port: SMOKE_BLOCK_PORT }, async (req: Request) => {
       const pathname = new URL(req.url).pathname;
+
+      // ── Read receipts, delivered POINT TO POINT ──────────────────────────
+      //
+      // Deliberately not gossiped. The existing `storage/receipts` topic is a
+      // single network-wide topic, and putting a message per read on it would
+      // reintroduce exactly the O(N) firehose this project has removed three
+      // times. A read receipt has exactly one interested party — the provider
+      // that served the bytes — and the reader is already connected to it,
+      // having just fetched from it.
+      //
+      // Nothing is trusted here: the envelope carries the reader's signature
+      // and every consumer re-verifies it. This endpoint only moves bytes.
+      if (pathname === '/receipt' && req.method === 'POST') {
+        try {
+          const body = await req.text();
+          if (body.length > 4096) return new Response('Too Large', { status: 413 });
+          this.onReadReceipt?.(JSON.parse(body));
+          return new Response('OK');
+        } catch {
+          // Say why rather than returning a bare 400: a malformed receipt and
+          // one that never arrived must not look the same from either side.
+          console.warn('[SmokeStore] rejected a malformed read receipt');
+          return new Response('Bad Request', { status: 400 });
+        }
+      }
+
       const cid = pathname.startsWith('/block/') ? pathname.slice('/block/'.length) : '';
       if (!cid) return new Response('Not Found', { status: 404 });
 
@@ -406,6 +445,20 @@ export class SmokeStore {
 
   async getSmokeHostname(): Promise<string | undefined> {
     try { return await this.network.Hub.address(); } catch { return undefined; }
+  }
+
+  /**
+   * Hand a signed read receipt to the peer that served us.
+   *
+   * Best-effort and deliberately unawaited by callers: a lost receipt costs
+   * the provider a little credit it can recover from the reader's next one,
+   * since receipts are cumulative. Retrying here would put work on the read
+   * path, which is the one place this subsystem may not spend time.
+   */
+  async sendReadReceipt(peer: string, envelope: unknown): Promise<void> {
+    await this.network.Http.fetch(`http://${peer}:${SMOKE_BLOCK_PORT}/receipt`, {
+      method: 'POST', body: JSON.stringify(envelope),
+    });
   }
 
   addPeerFallback(addr: string): void {
@@ -532,6 +585,7 @@ export class SmokeStore {
     // Local smoke FS
     if (await this.fs.exists(path)) {
       console.log(`[SmokeStore] retrieve: smoke FS hit for ${shortCid}…`);
+      this.lastServedBy = undefined;   // served from our own disk — nobody to credit
       const t0 = performance.now();
       const data = await this.fs.read(path);
       console.log(`[SmokeStore] retrieve: read ${(data.byteLength / 1_048_576).toFixed(2)} MB in ${(performance.now() - t0).toFixed(0)} ms`);
@@ -542,6 +596,7 @@ export class SmokeStore {
     const opfsFile = await this.readFromOPFS(cidStr);
     if (opfsFile) {
       console.log(`[SmokeStore] retrieve: OPFS hit for ${shortCid}… (${(opfsFile.size / 1_048_576).toFixed(2)} MB)`);
+      this.lastServedBy = undefined;
       return new Uint8Array(await opfsFile.arrayBuffer());
     }
 
@@ -562,6 +617,9 @@ export class SmokeStore {
     const timeout = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error(`retrieve timeout after ${timeoutMs}ms`)), timeoutMs));
 
+    // Records who actually served, so the caller can credit them. Set by the
+    // winning branch of `Promise.any`; the losers never reach the assignment.
+    let servedBy: string | undefined;
     const fetchFromPeer = async (peer: string): Promise<Uint8Array> => {
       const url = `http://${peer}:${SMOKE_BLOCK_PORT}/block/${cidStr}`;
       console.log(`[SmokeStore] retrieve: fetching ${shortCid}… from ${peer.slice(0, 12)}`);
@@ -570,6 +628,7 @@ export class SmokeStore {
       if (!resp.ok) throw new Error(`peer ${peer.slice(0, 8)} returned ${resp.status}`);
       const data = new Uint8Array(await resp.arrayBuffer());
       this.touchPeerFallback(peer);
+      servedBy = peer;
       const mb = (data.byteLength / 1_048_576).toFixed(2);
       console.log(`[SmokeStore] retrieve: received ${mb} MB from ${peer.slice(0, 12)} in ${(performance.now() - t0).toFixed(0)} ms`);
       // Route to OPFS if large, smoke FS if small
@@ -586,7 +645,9 @@ export class SmokeStore {
       return data;
     };
 
-    return Promise.race([Promise.any(peers.map(fetchFromPeer)), timeout]);
+    const data = await Promise.race([Promise.any(peers.map(fetchFromPeer)), timeout]);
+    this.lastServedBy = servedBy;
+    return data;
   }
 
   async verifyBlockIntegrity(cidStr: string, data: Uint8Array): Promise<boolean> {

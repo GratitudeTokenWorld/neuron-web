@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   ReceiptLedger, collusionCeilingBytes,
   PER_READER_EPOCH_CAP_BYTES, MIN_DISTINCT_READERS,
+  ReaderReceiptBook,
   type ReadReceipt,
 } from './read-receipts.js';
 
@@ -236,5 +237,45 @@ describe('what it costs the chain, against the system it replaces', () => {
     expect(l.earnings('P').payable).toBe(false);
     expect(l.settle('P')).toBe(0);
     expect(l.size()).toBe(0);
+  });
+});
+
+describe('ReaderReceiptBook — the attesting side', () => {
+  it('produces a monotone cumulative receipt per provider', () => {
+    const book = new ReaderReceiptBook('reader-1');
+    const a = book.record({ provider: 'P', creditedBytes: 100, latencyMs: 10, now: 1 })!;
+    const b = book.record({ provider: 'P', creditedBytes: 250, latencyMs: 20, now: 2 })!;
+    expect(a.counter).toBe(1);
+    expect(b.counter).toBe(2);
+    expect(b.bytesTotal).toBe(350);
+    expect(b.readsTotal).toBe(2);
+  });
+
+  it('keeps ONE record per provider however many reads happen', () => {
+    const book = new ReaderReceiptBook('reader-1');
+    for (let i = 0; i < 5_000; i++) book.record({ provider: 'P', creditedBytes: 1, latencyMs: 1 });
+    expect(book.size()).toBe(1);
+    expect(book.latest('P')!.readsTotal).toBe(5_000);
+  });
+
+  it('refuses to vouch for itself', () => {
+    const book = new ReaderReceiptBook('me');
+    expect(book.record({ provider: 'me', creditedBytes: 100, latencyMs: 1 })).toBeNull();
+  });
+
+  it('emits nothing for a read the taper zeroed out', () => {
+    // A repeat fetch inside the cache window is worth nothing, so there is no
+    // receipt to send — the counter does not advance on it either.
+    const book = new ReaderReceiptBook('reader-1');
+    book.record({ provider: 'P', creditedBytes: 100, latencyMs: 1 });
+    expect(book.record({ provider: 'P', creditedBytes: 0, latencyMs: 1 })).toBeNull();
+    expect(book.latest('P')!.counter).toBe(1);
+  });
+
+  it('sweeps providers gone quiet', () => {
+    const book = new ReaderReceiptBook('reader-1');
+    book.record({ provider: 'P', creditedBytes: 1, latencyMs: 1, now: 1_000 });
+    expect(book.sweep(2_000, 500)).toBe(1);
+    expect(book.size()).toBe(0);
   });
 });

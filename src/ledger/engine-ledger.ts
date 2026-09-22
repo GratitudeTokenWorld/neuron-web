@@ -677,6 +677,44 @@ export class EngineLedger extends EventEmitter {
     });
   }
 
+  /**
+   * Settle reader-attested service into a minted payout.
+   *
+   * The receipts go IN the block, so every peer re-derives the same figure
+   * from the same bytes and none of them needs to have seen a receipt before
+   * (`content/provider-ledger.ts` → `settlementCredit`). The amount is not a
+   * claim — it is computed here from the same function validation will use, so
+   * issuing something a peer would reject is not possible by construction.
+   */
+  async createStorageSettle(
+    pub: string, keys: SignerKeys, receipts: ReadonlyArray<{ receipt: unknown; signature: string }>,
+    periodIndex: number, roots?: { publishRoot?: string; serviceRoot?: string },
+  ): Promise<{ block?: Block; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const provider = this.providerLedger.providers.get(pub);
+    if (!provider || provider.capacityGB <= 0) return { error: 'Not a registered storage provider' };
+    if (receipts.length === 0) return { error: 'No receipts to settle' };
+
+    const storage = {
+      periodIndex,
+      receipts: receipts as never,
+      ...(roots?.publishRoot ? { publishRoot: roots.publishRoot } : {}),
+      ...(roots?.serviceRoot ? { serviceRoot: roots.serviceRoot } : {}),
+    } as StoragePayload;
+
+    // Derive the amount with the validator's own function rather than trusting
+    // a caller's arithmetic: the two agreeing is the whole security argument.
+    const probe = { accountId: pub, storage } as unknown as Block;
+    const credit = this.providerLedger.settlementCredit(probe);
+    if (credit.payableBytes <= 0) return { error: `Nothing payable: ${credit.reason}` };
+
+    const amount = BigInt(Math.floor(credit.payableBytes));
+    return this.appendStorageBlock(
+      pub, keys, 'storage-settle', head.balance + amount, storage, amount,
+    );
+  }
+
     private appendStorageBlock(
     pub: string, keys: SignerKeys, type: Block['type'], balance: bigint,
     storage: StoragePayload, amount?: bigint, timestamp = Date.now(),
