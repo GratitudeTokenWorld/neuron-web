@@ -961,15 +961,50 @@ tuned further** — tuning it now would be fitting a constant to an assumption.
 
 **A copy means a new NODE** (Lucian, 2026-09-22): "two accounts on one machine
 must not count as separate replicas". Distinctness is by **failure domain**, not
-by public key — with multi-device custody one account holds several keys, and
-two accounts can run in one browser. `planRepair` takes a `domainOf` mapper,
-counts live holders by distinct domain, and refuses to place a second copy in a
-domain already represented; `selectProviders` will not offer two keys from one
-`deviceId`; and `liveHolderCount` counts domains too, so the placement rule and
-the health number cannot disagree. **Known ceiling:** this catches two accounts
-on one machine. It does not catch one operator running many machines, or a
-hundred VMs in one datacentre — closing that needs evidence we do not collect
-(ASN, topology, attested hardware), so it stays a real residual risk.
+by public key. `planRepair` takes a `domainOf` mapper, counts live holders by
+distinct domain, and refuses to place a second copy in a domain already
+represented; `selectProviders` will not offer two keys from one `deviceId`; and
+`liveHolderCount` counts domains too, so the placement rule and the health
+number cannot disagree.
+
+**How a domain is decided, and why `deviceId` alone was not good enough.** The
+first cut grouped by `deviceId`, and that is **not a security control**:
+`getDeviceId()` is `crypto.randomUUID()` in localStorage, so it is self-asserted
+and an attacker changes it by typing. It catches an honest user running two
+accounts in one browser, and nothing else.
+
+What replaces it is the rule the reciprocity work reached from the other
+direction — **observation replaces testimony**
+(`engine/content/failure-domain.ts`). Do not ask a node what machine it is on;
+watch when it fails. Two holders that go down together are one domain whatever
+they claim, and the only way to look independent is to *be* independent, which
+costs real separate infrastructure rather than a new identifier. `deviceId`
+survives as a hint that can only **merge** holders, never split them: admitting
+co-location costs the admitter something, so it is believable, while claiming
+separateness is free.
+
+Four properties that make it safe rather than merely clever:
+
+- **Co-failure, not co-availability.** Two honest holders up all month are
+  perfectly correlated and entirely unrelated. Only joint DOWN events carry
+  information; correlating availability would have marked the whole healthy
+  fleet as one domain — the first test in the file.
+- **It refuses to answer on a thin sample.** Below `MIN_JOINT_FAILURES` (3) no
+  coefficient is returned at all, because two shared outages make any pair look
+  perfect. An aggregate carries its sample size or it is not returned.
+- **Unknown means possibly independent.** A brand-new holder has no history;
+  excluding it would make joining impossible, which Principle 1 forbids.
+- **It costs nothing extra.** The observations are the spot checks and reads
+  that already happen, and history is bounded by a retention window.
+
+**Residual risks, recorded rather than solved:** correlated downtime is evidence
+and not proof — it is equally consistent with one datacentre, one ISP, or one
+bad afternoon. It needs time to accumulate, so a fleet of fresh identities is
+indistinguishable from a fleet of fresh honest nodes until they have failed a
+few times. And an attacker able to DoS two honest holders simultaneously can
+make them *look* correlated and steer placement away from both: a sustained
+attack on two nodes that degrades placement without stealing anything, which is
+a poor trade for them but a real capability.
 
 ### Fan-IN at a billion followers (measured 2026-09-21)
 

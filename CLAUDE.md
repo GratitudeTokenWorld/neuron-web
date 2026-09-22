@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **596 tests / 77 files passing**, `npm run build` clean.
+Current baseline: **605 tests / 78 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -256,8 +256,15 @@ below).
   on one machine are one replica (Lucian, 2026-09-22). `planRepair` takes
   `domainOf`, `selectProviders` will not offer two keys sharing a `deviceId`,
   and `liveHolderCount` counts domains — all three must agree or the health
-  number reports redundancy the placement rule knows is fictional. Ceiling: one
-  operator on many machines still looks independent.
+  number reports redundancy the placement rule knows is fictional.
+  **`deviceId` is a HINT, never the control**: it is a `crypto.randomUUID()` in
+  localStorage, so "we are different machines" is a free assertion. Domains are
+  inferred from **observed co-failure** (`engine/content/failure-domain.ts`) —
+  co-failure, never co-availability, since a healthy fleet is perfectly
+  correlated and unrelated — and `deviceId` may only MERGE holders, never split
+  them. Below `MIN_JOINT_FAILURES` the statistic returns nothing rather than a
+  confident guess, and unknown means *possibly independent* (Principle 1: a new
+  holder must be able to join).
 - **Authorship is not custody.** Published content is handed to the network;
   the publisher keeps no copy by default and is not automatically a replica
   (except while the network finishes replicating it). Ownership is on-chain,

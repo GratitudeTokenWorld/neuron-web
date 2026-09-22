@@ -55,6 +55,27 @@ finding, not a performance one.
   moment; a map that only ever grows satisfies it at every instant and still
   exhausts the box. See ARCHITECTURE.md → *The invariant has two dimensions*.
 
+### 1b. Self-asserted identifiers used as security controls
+
+`deviceId` is `crypto.randomUUID()` stored in localStorage, and it was deciding
+whether two replicas sat on different machines — a question the holder answers
+about itself, for free. Ask of any identifier that gates something: **who
+assigns it, and what does a lie cost?** The replacement is the rule reciprocity
+arrived at independently — *observation replaces testimony*: judge independence
+on observed co-failure, which cannot be asserted into existence
+(`engine/content/failure-domain.ts`).
+
+### 1c. Fan-out that grows with every peer ever seen
+
+`SmokeStore.peerFallbacks` is a `Set` with an `add` and no remover, seeded from
+every peer that ever connected — and `retrieve()` races `Promise.any` across
+**all** of it. Three defects in one field: unbounded state keyed by an outsider,
+a per-read fan-out that grows for the life of the process, and an amplification
+vector where one cheap read causes work at every peer. Found 2026-09-22 while
+confirming that reader-caches scale popular content for free — they do, and this
+is the path that finds them, so it must be **bounded rather than removed**.
+**Open.**
+
 ### 2. Silent returns
 
 A `return` with no log is indistinguishable from "the message never arrived",

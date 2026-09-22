@@ -40,6 +40,7 @@ import {
   REDUNDANCY_TARGET, MAX_REPLICA_TARGET, MIN_REPLICAS, mayReleasePublisherCopy,
   CustodySignals, planRepair, planRejoin, pollIntervalMs, liveHolders,
 } from '../engine/content/custody';
+import { FailureCorrelation, inferDomains } from '../engine/content/failure-domain';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 // Every cadence here is a FRACTION of the timing profile, not a wall-clock
@@ -191,6 +192,15 @@ export class StorageManager extends EventEmitter {
    * of its own usage, which is what makes them unbiasable and bounded.
    */
   private readonly signals = new CustodySignals();
+  /**
+   * Observed co-failure between holders — how independence is actually judged.
+   *
+   * Fed from the spot checks and reads that already happen, so it costs nothing
+   * extra. `deviceId` is only a hint to it: a self-assigned UUID cannot
+   * establish that two replicas sit on different machines, but watching them
+   * fail together can (failure-domain.ts).
+   */
+  private readonly failureCorrelation = new FailureCorrelation();
 
   /** Primary CIDs currently being cached — prevents concurrent duplicate downloads */
   private cachingInProgress = new Set<string>();
@@ -489,7 +499,8 @@ export class StorageManager extends EventEmitter {
     // while `planRepair` counts domains would be the classic split — two things
     // measuring different things, one of them reporting a redundancy the other
     // knows is fictional.
-    return new Set(live.map(pub => this.providerDomain(pub))).size;
+    const domain = this.domainOf(live);
+    return new Set(live.map(domain)).size;
   }
 
   /**
@@ -512,6 +523,27 @@ export class StorageManager extends EventEmitter {
   private providerDomain(pub: string): string {
     const p = this.ledger.getStorageProviders().find(x => x.pub === pub);
     return p?.deviceId ? `dev:${p.deviceId}` : `pub:${pub}`;
+  }
+
+  /**
+   * Group a set of providers into inferred failure domains.
+   *
+   * The self-asserted `deviceId` can only MERGE holders here; it can never
+   * split them, because claiming to be a separate machine is free. What
+   * separates them is observed co-failure — two holders that go down together
+   * count once, however distinct their identifiers (failure-domain.ts).
+   */
+  private domainOf(pubs: Iterable<string>): (pub: string) => string {
+    const list = [...new Set(pubs)];
+    const map = inferDomains({
+      holders: list,
+      correlation: this.failureCorrelation,
+      declared: pub => {
+        const p = this.ledger.getStorageProviders().find(x => x.pub === pub);
+        return p?.deviceId ? `dev:${p.deviceId}` : undefined;
+      },
+    });
+    return pub => map.get(pub) ?? this.providerDomain(pub);
   }
 
   /**
@@ -1034,7 +1066,7 @@ export class StorageManager extends EventEmitter {
           isLive: pub => this.ledger.isProviderLive(pub, now),
           candidates: [],
           target,
-          domainOf: pub => this.providerDomain(pub),
+          domainOf: this.domainOf(tracked.confirmedProviders),
         }).release;
         if (shed.length > 0) {
           for (const pub of shed) tracked.confirmedProviders.delete(pub);
@@ -1073,7 +1105,7 @@ export class StorageManager extends EventEmitter {
         isLive: pub => this.ledger.isProviderLive(pub, now),
         candidates: offered.map(p => p.pub),
         target,
-        domainOf: pub => this.providerDomain(pub),
+        domainOf: this.domainOf([...tracked.confirmedProviders, ...offered.map(p => p.pub)]),
       });
       for (const gone of plan.drop) tracked.confirmedProviders.delete(gone);
       if (plan.drop.length > 0) {
@@ -1704,6 +1736,7 @@ export class StorageManager extends EventEmitter {
         const wasHandedOff = this.isHandedOff(receipt.cid);
         tracked.confirmedProviders.add(receipt.providerPub);
         this.signals.recordSuccess(receipt.cid, receipt.providerPub);
+        this.failureCorrelation.record(receipt.providerPub, true);
         this.cidStuckCount.delete(receipt.cid); // new confirmation — reset backoff
         const live = this.liveHolderCount(tracked.confirmedProviders);
         console.log(`[StorageManager] handleReceipt: ${receipt.cid.slice(0, 20)}… now ${live} live holder(s) of ${tracked.confirmedProviders.size} confirmed`);
@@ -1857,6 +1890,7 @@ export class StorageManager extends EventEmitter {
             success = true;
             responseRank = ++rankCounter; // atomic: only one microtask runs at a time
             this.signals.recordSuccess(cid, pub);
+            this.failureCorrelation.record(pub, true);
             if (!wasConfirmed(pub)) {
               console.log(`[StorageManager] Spot-check discovered unconfirmed provider ${pub.slice(0, 12)}… has ${cid.slice(0, 16)}…`);
             }
@@ -1873,6 +1907,10 @@ export class StorageManager extends EventEmitter {
           // between clears the streak.
           if (wasConfirmed(pub)) {
             const streak = this.signals.recordFailure(cid, pub);
+            // Independence is judged on observed co-failure, so every spot check
+            // feeds it — the measurement is free because the probe was going to
+            // happen anyway.
+            this.failureCorrelation.record(pub, false);
             if (this.signals.shouldEvict(cid, pub)) {
               console.warn(`[StorageManager] Evicting ${pub.slice(0, 12)}… from ${cid.slice(0, 16)}… after ${streak} consecutive failures`);
               tracked.confirmedProviders.delete(pub);
