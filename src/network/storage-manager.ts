@@ -342,6 +342,9 @@ export class StorageManager extends EventEmitter {
     if (!peer) return;                              // served from our own disk
     const provider = this.providerBySmokeAddr(peer);
     if (!provider) return;                          // not a registered provider
+    // A read is the cheapest custody proof there is — it was going to happen
+    // anyway, and the bytes hashed to the CID or `retrieve` would have thrown.
+    this.ledger.providerLedger.liveness.record(provider, true);
 
     const nth = (this.readsPerCid.get(cid) ?? 0) + 1;
     this.readsPerCid.set(cid, nth);
@@ -2123,6 +2126,7 @@ export class StorageManager extends EventEmitter {
         tracked.confirmedProviders.add(receipt.providerPub);
         this.signals.recordSuccess(receipt.cid, receipt.providerPub);
         this.failureCorrelation.record(receipt.providerPub, true);
+        this.ledger.providerLedger.liveness.record(receipt.providerPub, true);
         this.cidStuckCount.delete(receipt.cid); // new confirmation — reset backoff
         const live = this.liveHolderCount(tracked.confirmedProviders);
         console.log(`[StorageManager] handleReceipt: ${receipt.cid.slice(0, 20)}… now ${live} live holder(s) of ${tracked.confirmedProviders.size} confirmed`);
@@ -2277,6 +2281,10 @@ export class StorageManager extends EventEmitter {
             responseRank = ++rankCounter; // atomic: only one microtask runs at a time
             this.signals.recordSuccess(cid, pub);
             this.failureCorrelation.record(pub, true);
+            // The lease is renewed by observed service now, not by an
+            // announcement. A spot check that returned bytes hashing to the CID
+            // is exactly that evidence.
+            this.ledger.providerLedger.liveness.record(pub, true);
             // Every spot check is already a timed fetch of real content, so it
             // is a free level-1 calibration sample. The higher rungs need the
             // deliberate ladder (`calibrateProvider`).
@@ -2297,6 +2305,7 @@ export class StorageManager extends EventEmitter {
           // between clears the streak.
           if (wasConfirmed(pub)) {
             const streak = this.signals.recordFailure(cid, pub);
+            this.ledger.providerLedger.liveness.record(pub, false);
             // Independence is judged on observed co-failure, so every spot check
             // feeds it — the measurement is free because the probe was going to
             // happen anyway.

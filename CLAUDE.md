@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **816 tests / 91 files passing**, `npm run build` clean.
+Current baseline: **826 tests / 91 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -133,9 +133,16 @@ legacy `DAGLedger`** — it takes an `EngineLedger` and gossips storage blocks o
 the engine topic. Three things there are load-bearing and were decided, not
 inherited:
 
-- **The heartbeat is the lease renewal.** `isLive()` / `liveStorageProviders()`
-  answer custody questions; `getStorageProviders()` (unfiltered) answers routing
-  ones. `MAX_OFFLINE_MS` = 3 heartbeat intervals = 12h.
+- **The lease is renewed by OBSERVED SERVICE, not by the heartbeat** (changed
+  2026-09-22). `providerLedger.liveness` (`content/custody-sampling.ts` →
+  `CustodyLiveness`) is fed by spot checks, reads and sampled challenges —
+  evidence the network generates anyway. A heartbeat still carries routing
+  details (`smokeAddr`, country) but renews nothing: announcing presence is not
+  evidence of holding anything. A newly registered provider nobody has probed
+  is live for one window so joining is possible (Principle 1), and not after,
+  so being unobserved is not a free pass. `isLive()` / `liveStorageProviders()`
+  still answer custody questions; `getStorageProviders()` still answers routing
+  ones.
 - **An early heartbeat is accepted and not counted; only a flood is rejected.**
   Rejecting a validly-signed block mid-chain truncates it and strands every later
   block as non-sequential — the failure that made NFTs vanish on reload — so

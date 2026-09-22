@@ -42,20 +42,31 @@ describe('lease liveness', () => {
     expect(pl.isLive(PUB, DAY + MAX_OFFLINE_MS)).toBe(false);
   });
 
-  it('renews the lease on each counted heartbeat', () => {
+  it('renews the lease on OBSERVED SERVICE, not on an announcement', () => {
+    // Changed 2026-09-22: the lease used to renew when the provider said it was
+    // there. It now renews when the network watched it serve bytes that hashed
+    // correctly — evidence it cannot produce without holding them.
     const pl = registered(10, DAY);
-    const hb = DAY + HEARTBEAT_INTERVAL_MS;
-    pl.apply(blk('storage-heartbeat', hb, {}), hb);
-    // The lease now runs from the heartbeat, not from registration.
+    const served = DAY + HEARTBEAT_INTERVAL_MS;
+    pl.liveness.record(PUB, true, served);
     expect(pl.isLive(PUB, DAY + MAX_OFFLINE_MS + 1)).toBe(true);
-    expect(pl.leaseExpiresAt(PUB)).toBe(hb + MAX_OFFLINE_MS);
+    expect(pl.isLive(PUB, served + MAX_OFFLINE_MS + 1)).toBe(false);
   });
 
-  it('expires the lease when renewals stop — declared capacity does not keep content alive', () => {
+  it('does not renew on a heartbeat, because announcing is not evidence', () => {
     const pl = registered(10, DAY);
     const hb = DAY + HEARTBEAT_INTERVAL_MS;
     pl.apply(blk('storage-heartbeat', hb, {}), hb);
-    const gone = hb + MAX_OFFLINE_MS;
+    // Past the joining grace with nothing observed: the announcement bought
+    // nothing at all.
+    expect(pl.isLive(PUB, DAY + MAX_OFFLINE_MS + 1)).toBe(false);
+  });
+
+  it('expires the lease when service stops — declared capacity does not keep content alive', () => {
+    const pl = registered(10, DAY);
+    const hb = DAY + HEARTBEAT_INTERVAL_MS;
+    pl.liveness.record(PUB, true, hb);
+    const gone = hb + MAX_OFFLINE_MS + 1;
     expect(pl.isLive(PUB, gone)).toBe(false);
     expect(pl.liveProviders(gone)).toHaveLength(0);
     // ...but the provider is still *registered*: the lease lapsed, the declaration
@@ -181,8 +192,12 @@ describe('deregistering does not launder the account history', () => {
     // The original registration is what the grace runs from, so it has lapsed.
     expect(pl.providers.get(PUB)!.registeredAt).toBe(DAY);
     expect(pl.isLive(PUB, backLater)).toBe(false);
-    // A real heartbeat revives it — that is the only thing that should.
+    // Observed SERVICE revives it — that is the only thing that should, and a
+    // heartbeat is not it: re-announcing is exactly what an account with
+    // nothing to prove would do.
     pl.apply(blk('storage-heartbeat', backLater, {}), backLater);
+    expect(pl.isLive(PUB, backLater)).toBe(false);
+    pl.liveness.record(PUB, true, backLater);
     expect(pl.isLive(PUB, backLater)).toBe(true);
   });
 });

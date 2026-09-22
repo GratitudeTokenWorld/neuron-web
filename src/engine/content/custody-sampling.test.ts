@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   detectionProbability, cumulativeDetection, challengesForConfidence,
-  samplingCost, selectChallenges, cheatingExpectedValue,
+  samplingCost, selectChallenges, cheatingExpectedValue, CustodyLiveness,
 } from './custody-sampling.js';
 
 /**
@@ -112,5 +112,74 @@ describe('the challenge must be unpredictable and auditable', () => {
   it('cannot ask for more objects than exist', () => {
     expect(selectChallenges(7, 3, 10).length).toBe(3);
     expect(selectChallenges(7, 0, 10).length).toBe(0);
+  });
+});
+
+describe('liveness from observation, not from announcement', () => {
+  const WINDOW = 12 * 60 * 60 * 1000;   // the old lease window
+  const T = 1_000_000_000;
+
+  it('counts a provider that recently served', () => {
+    const l = new CustodyLiveness();
+    l.record('P', true, T);
+    expect(l.isLive('P', T + 1000, WINDOW)).toBe(true);
+  });
+
+  it('stops counting one that has gone silent past the window', () => {
+    const l = new CustodyLiveness();
+    l.record('P', true, T);
+    expect(l.isLive('P', T + WINDOW + 1, WINDOW)).toBe(false);
+  });
+
+  it('does NOT evict on a single failure', () => {
+    // One flaky dial is weather. Evicting on it made every relay hiccup start
+    // a repair round against holders that were fine.
+    const l = new CustodyLiveness();
+    l.record('P', true, T);
+    l.record('P', false, T + 100);
+    expect(l.isLive('P', T + 200, WINDOW)).toBe(true);
+  });
+
+  it('evicts on consecutive failures', () => {
+    const l = new CustodyLiveness();
+    l.record('P', false, T);
+    l.record('P', false, T + 100);
+    expect(l.isLive('P', T + 200, WINDOW)).toBe(false);
+  });
+
+  it('forgives a streak the moment the provider serves again', () => {
+    const l = new CustodyLiveness();
+    l.record('P', false, T);
+    l.record('P', false, T + 1);
+    l.record('P', true, T + 2);
+    expect(l.consecutiveFailures('P')).toBe(0);
+    expect(l.isLive('P', T + 3, WINDOW)).toBe(true);
+  });
+
+  it('lets a NEW provider count before anyone has probed it', () => {
+    // Principle 1: treating unknown as dead would mean nobody could ever join.
+    const l = new CustodyLiveness();
+    l.noteRegistered('fresh', T);
+    expect(l.isLive('fresh', T + 1000, WINDOW)).toBe(true);
+  });
+
+  it('…but the grace is bounded, so it is not a hiding place', () => {
+    // A provider never successfully read, ever, stops counting when the grace
+    // expires — otherwise "unobserved" would be a permanent free pass.
+    const l = new CustodyLiveness();
+    l.noteRegistered('ghost', T);
+    expect(l.isLive('ghost', T + WINDOW + 1, WINDOW)).toBe(false);
+  });
+
+  it('knows nothing about a provider it has never heard of', () => {
+    expect(new CustodyLiveness().isLive('stranger', T, WINDOW)).toBe(false);
+  });
+
+  it('is bounded — it sweeps', () => {
+    const l = new CustodyLiveness();
+    l.record('P', true, T);
+    expect(l.size()).toBe(1);
+    expect(l.sweep(T + WINDOW * 10, WINDOW * 2)).toBe(1);
+    expect(l.size()).toBe(0);
   });
 });

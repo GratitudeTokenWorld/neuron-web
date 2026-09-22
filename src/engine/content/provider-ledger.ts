@@ -1,4 +1,5 @@
 import { creditFromSignedReceipts, receiptPayload, MAX_RECEIPTS_PER_SETTLEMENT } from './read-receipts.js';
+import { CustodyLiveness } from './custody-sampling.js';
 import { verify } from '../core/keys.js';
 import type { Block } from '../core/block.js';
 
@@ -334,13 +335,32 @@ export class ProviderLedger {
    * both survive a node that has been gone for a week, and neither keeps content
    * alive.
    */
+  /**
+   * Observed custody, feeding the lease.
+   *
+   * Populated from spot checks, reads and sampled challenges — evidence the
+   * network generates anyway. This is what replaced the heartbeat as the
+   * liveness signal: the heartbeat asked the holder, this watches what it did.
+   */
+  readonly liveness = new CustodyLiveness();
+
+  /**
+   * Is this provider still holding?
+   *
+   * **Answered by observation since 2026-09-22.** The heartbeat lease worked,
+   * and cost a block per interval per provider forever — growth driven by the
+   * clock rather than by anything a user did. Sampled reads answer the same
+   * question from evidence that already exists.
+   *
+   * A registered provider nobody has probed yet is live for one window, so
+   * joining is possible (Principle 1), and no longer after that, so being
+   * unobserved is not a permanent free pass.
+   */
   isLive(pub: string, now: number): boolean {
     const p = this.get(pub);
     if (!p || p.capacityGB <= 0) return false;
-    // A provider that registered but has not heartbeated yet is inside its initial
-    // grace: the lease runs from registration until the first renewal is due.
-    const since = p.lastHeartbeat > 0 ? p.lastHeartbeat : p.registeredAt;
-    return now - since < MAX_OFFLINE_MS;
+    this.liveness.noteRegistered(pub, p.registeredAt);
+    return this.liveness.isLive(pub, now, MAX_OFFLINE_MS);
   }
 
   /**

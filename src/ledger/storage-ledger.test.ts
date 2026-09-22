@@ -127,7 +127,11 @@ describe('storage blocks on the engine', () => {
     expect(ledger.getStorageProviders().map(x => x.pub)).toEqual([keys.pub]);
   });
 
-  it('renews the lease on a heartbeat and reports address, geo and bytes held', async () => {
+  it('reports address, geo and bytes held — but does NOT renew the lease', async () => {
+    // A heartbeat still carries the routing details peers need. Since
+    // 2026-09-22 it no longer renews the lease: that is decided by observed
+    // service (`content/custody-sampling.ts`), because announcing presence is
+    // not evidence of holding anything.
     const { ledger, keys, chain } = await provider();
     chain.push(ledger, 'storage-heartbeat', DAY1, {
       smokeAddr: 'p1.example', storedBytes: 3 * GB_BYTES, countryCode: 'DE',
@@ -136,6 +140,10 @@ describe('storage blocks on the engine', () => {
     expect(p.smokeAddr).toBe('p1.example');
     expect(p.countryCode).toBe('DE');
     expect(p.lastActualStoredBytes).toBe(3 * GB_BYTES);
+    // Past the joining grace with nothing observed, the announcement bought
+    // nothing.
+    expect(ledger.isProviderLive(keys.pub, DAY0 + MAX_OFFLINE_MS + 1)).toBe(false);
+    ledger.providerLedger.liveness.record(keys.pub, true, DAY1);
     expect(ledger.isProviderLive(keys.pub, DAY1 + MAX_OFFLINE_MS - 1)).toBe(true);
     expect(ledger.isProviderLive(keys.pub, DAY1 + MAX_OFFLINE_MS)).toBe(false);
   });
@@ -208,6 +216,8 @@ describe('publish feasibility follows the lease, not the declaration', () => {
     vi.setSystemTime(DAY0 + HEARTBEAT_INTERVAL_MS);
     const renew = chain.push(ledger, 'storage-heartbeat', DAY0 + HEARTBEAT_INTERVAL_MS, { storedBytes: 0 });
     expect(renew.result.success).toBe(true);
+    // The lease is renewed by SERVICE now, not by the announcement above.
+    ledger.providerLedger.liveness.record(chain.keys.pub, true, DAY0 + HEARTBEAT_INTERVAL_MS);
     vi.setSystemTime(DAY0 + MAX_OFFLINE_MS + 1);
     const verdict = ledger.checkPublishFeasibility(GB_BYTES, 2);
     expect(verdict.feasible).toBe(false);
