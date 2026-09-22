@@ -47,6 +47,7 @@
 
 import type { ReceiptLedger } from './read-receipts.js';
 import { MIN_DISTINCT_READERS } from './read-receipts.js';
+import { hashJson } from '../core/hash.js';
 
 /** Account fields the settlement replaces. Both are hashes of off-chain records. */
 export interface StorageRoots {
@@ -170,4 +171,131 @@ export function settlementOutcome(args: {
   const chargeable = Math.max(0, args.claim.storedBytes - args.freeBytes);
   const burned = chargeable * args.mintPerByteServed * args.costRatio;
   return { minted, burned, net: minted - burned };
+}
+
+// ── When to settle ───────────────────────────────────────────────────────────
+
+/**
+ * Settlement period. Thirty days at production timing, compressed with
+ * `STORAGE_TIMING` like every other storage duration so it is testable in a
+ * sitting.
+ */
+export function settlementPeriodMs(epochMs: number): number {
+  return epochMs * 30;
+}
+
+/**
+ * Which slot inside the period this account settles in.
+ *
+ * A fixed day for everyone would put the whole network's settlement traffic on
+ * one day in thirty. Deriving the slot from the account id spreads it with no
+ * coordination and lets any observer check that a node settled in its own slot
+ * rather than whenever it felt like it.
+ *
+ * Slots are minutes, not days: 30 days of minutes is 43,200 slots, so even a
+ * very large network lands a trickle per slot instead of a spike per day.
+ */
+export function settlementSlot(accountId: string, slotsInPeriod: number): number {
+  let h = 2166136261;
+  for (let i = 0; i < accountId.length; i++) {
+    h ^= accountId.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822507) >>> 0;
+  // Forced back to unsigned before the modulo. Without this the result is
+  // SIGNED and the slot can come out negative — found by measuring the spread
+  // and counting more distinct slots than the period contains.
+  h = (h ^ (h >>> 13)) >>> 0;
+  return h % Math.max(1, slotsInPeriod);
+}
+
+/** Period index for a timestamp. */
+export function periodIndexAt(now: number, periodMs: number): number {
+  return Math.floor(now / periodMs);
+}
+
+/**
+ * Minimum credited bytes before settling is worth a block.
+ *
+ * Most accounts earn a rounding error, so most settlements would write a block
+ * to move almost nothing. Letting those accrue is free — receipts are
+ * cumulative and baselines only move when settled — and it was measured to drop
+ * claim volume by ~65x (`sim/reward-formula.ts`).
+ */
+export const MIN_SETTLE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Is this account due to settle right now?
+ *
+ * Both conditions must hold: the period must be new (never settle the same one
+ * twice) and the clock must have reached this account's slot. The slot is a
+ * floor rather than an exact match, so a node that was offline at its slot
+ * still settles when it comes back instead of waiting another month.
+ */
+export function settlementDue(args: {
+  accountId: string;
+  now: number;
+  periodMs: number;
+  lastSettledPeriod: number;
+  pendingBytes: number;
+  minBytes?: number;
+}): { due: boolean; periodIndex: number; reason: string } {
+  const periodIndex = periodIndexAt(args.now, args.periodMs);
+  const min = args.minBytes ?? MIN_SETTLE_BYTES;
+  if (periodIndex <= args.lastSettledPeriod) {
+    return { due: false, periodIndex, reason: `period ${periodIndex} already settled` };
+  }
+  if (args.pendingBytes < min) {
+    return { due: false, periodIndex, reason: `only ${args.pendingBytes} byte(s) pending, below ${min}` };
+  }
+  const slots = Math.max(1, Math.floor(args.periodMs / 60_000));
+  const slot = settlementSlot(args.accountId, slots);
+  const elapsedSlots = Math.floor((args.now % args.periodMs) / 60_000);
+  if (elapsedSlots < slot) {
+    return { due: false, periodIndex, reason: `slot ${slot} not reached (at ${elapsedSlots})` };
+  }
+  return { due: true, periodIndex, reason: `due in slot ${slot}` };
+}
+
+// ── Building the two records ─────────────────────────────────────────────────
+
+/**
+ * The publish record: what this account has put on the network.
+ *
+ * Its root goes on-chain and the record itself does not, so the chain commits
+ * to the whole file index at a fixed cost per settlement however many files
+ * there are. Entries are sorted by CID so two nodes holding the same files
+ * compute the same root — an unordered hash would make the commitment depend
+ * on iteration order, which is the kind of non-determinism that only shows up
+ * once two implementations disagree.
+ */
+export function publishRecordRoot(files: ReadonlyArray<{ cid: string; sizeBytes: number }>): string {
+  const sorted = [...files].sort((a, b) => (a.cid < b.cid ? -1 : a.cid > b.cid ? 1 : 0));
+  return hashJson({
+    v: 1,
+    files: sorted.map(f => [f.cid, f.sizeBytes]),
+    totalBytes: sorted.reduce((sum, f) => sum + f.sizeBytes, 0),
+  });
+}
+
+/**
+ * The service record: what this account has served, per counterparty.
+ *
+ * Built from the settled baselines rather than from live receipts, so it
+ * commits to what the chain has already accepted. A validator holding the same
+ * chain recomputes the same root without holding a single receipt.
+ */
+export function serviceRecordRoot(settled: ReadonlyMap<string, number>): string {
+  const entries = [...settled.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return hashJson({
+    v: 1,
+    readers: entries,
+    totalBytes: entries.reduce((sum, [, bytes]) => sum + bytes, 0),
+  });
+}
+
+/** Total logical bytes an account stores, from its publish record. */
+export function storedBytesOf(files: ReadonlyArray<{ sizeBytes: number }>): number {
+  return files.reduce((sum, f) => sum + f.sizeBytes, 0);
 }

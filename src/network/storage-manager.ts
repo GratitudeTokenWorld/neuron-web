@@ -48,6 +48,9 @@ import {
   type SignedReceipt,
 } from '../engine/content/read-receipts';
 import { readCredit, DEFAULT_TAPER } from '../engine/content/read-credit';
+import {
+  settlementDue, settlementPeriodMs, publishRecordRoot, serviceRecordRoot,
+} from '../engine/content/storage-settlement';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 // Every cadence here is a FRACTION of the timing profile, not a wall-clock
@@ -363,6 +366,70 @@ export class StorageManager extends EventEmitter {
       });
       break;                                        // one reader identity is enough
     }
+  }
+
+  /**
+   * Settle, if this account's slot has come round and there is enough owed.
+   *
+   * Rides the spot-check timer rather than owning one, for the same reason
+   * calibration does: that cadence already scales with population and jitters,
+   * and a settlement that fires on a fixed wall-clock would put the whole
+   * network's traffic in the same minute.
+   */
+  private async settleIfDue(): Promise<void> {
+    if (!this.started) return;
+    const now = Date.now();
+    const periodMs = settlementPeriodMs(REWARD_EPOCH_MS);
+
+    for (const [pub, keys] of this.localKeys) {
+      const provider = this.ledger.storageProviders.get(pub);
+      if (!provider || provider.capacityGB === 0) continue;
+
+      const envelopes = this.settlementReceipts();
+      if (envelopes.length === 0) continue;
+      const pendingBytes = this.inboundReceipts.earnings(pub).payableBytes;
+
+      const due = settlementDue({
+        accountId: pub, now, periodMs,
+        lastSettledPeriod: provider.lastSettledPeriod ?? -1,
+        pendingBytes,
+      });
+      if (!due.due) continue;
+
+      // The two roots: what we store, and what we have served. Both are
+      // commitments to records that live off-chain, so the block stays one
+      // block whatever they contain.
+      const own = this.ownFileRecords();
+      const roots = {
+        publishRoot: publishRecordRoot(own),
+        serviceRoot: serviceRecordRoot(this.ledger.providerLedger.settledFor(pub)),
+      };
+
+      const res = await this.ledger.createStorageSettle(pub, keys, envelopes, due.periodIndex, roots);
+      if (res.error) {
+        // Say why: a settlement that silently does not happen is
+        // indistinguishable from a provider nobody read from.
+        console.warn(`[StorageManager] settlement for ${pub.slice(0, 12)}… refused: ${res.error}`);
+        continue;
+      }
+      console.log(`[StorageManager] Settled period ${due.periodIndex} for ${pub.slice(0, 12)}…: `
+        + `${envelopes.length} reader receipt(s), +${res.block?.amount ?? 0n}`);
+      // Settled receipts have moved the baselines, so the pending set is spent.
+      this.pendingEnvelopes.clear();
+    }
+  }
+
+  /** This node's own published files, for the publish record. */
+  private ownFileRecords(): Array<{ cid: string; sizeBytes: number }> {
+    const out: Array<{ cid: string; sizeBytes: number }> = [];
+    // The file index already holds own-file records with their sizes
+    // (`content/file-index.ts` keeps ours only), so the publish record is a
+    // projection of it rather than a second source of truth that could drift.
+    for (const rec of this.fileIndex.values()) {
+      if (!this.localKeys.has(rec.uploaderPub)) continue;
+      out.push({ cid: rec.cid, sizeBytes: rec.sizeBytes ?? 0 });
+    }
+    return out;
   }
 
   /** Which registered provider is behind a smoke address. */
@@ -965,6 +1032,7 @@ export class StorageManager extends EventEmitter {
     this.spotCheckTimer = setTimeout(() => {
       this.runSpotChecks()
         .then(() => this.runDueCalibration())
+        .then(() => this.settleIfDue())
         .catch(() => {})
         .finally(() => this.scheduleNextSpotCheck());
     }, delay);
