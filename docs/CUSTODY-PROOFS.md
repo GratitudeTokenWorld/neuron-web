@@ -166,6 +166,66 @@ Black-hat pass on the receipt design:
   and therefore costs you bandwidth. It must never meter a payout
   (SCREENING.md → 11 is the same defect, already open).
 
+### 2b. BUILT 2026-09-22 — `engine/content/read-receipts.ts`
+
+Lucian's decision: **do not remove payment; improve it.** So the receipt design
+above is now implemented, and the heartbeat keeps its other job.
+
+**The change in one line: the heartbeat stops being the payment meter and stays
+the lease.** Two jobs were conflated. "Is this provider still holding the
+bytes?" is custody, and the heartbeat still answers it. "Did it actually serve
+anyone?" is service, and only readers can answer that. Separating them is the
+minimum change that removes the circular verification, and it costs the custody
+model nothing.
+
+What is metered now:
+
+| | Old | New |
+|---|---|---|
+| Who reports volume | the provider being paid | the readers it served |
+| Verification | claim checked against terms derived from the same claim | claim not made by the payee at all |
+| State per provider | grows with the clock | `O(distinct counterparties)` |
+| Chain writes | 2,555 blocks/year, idle or busy | one settlement, **zero when quiet** |
+
+Measured in `read-receipts.test.ts`: 100,000 reads across 200 readers are held
+as **200 records** and settle as **one** on-chain event — two collapses, 500×
+then 200×. An idle provider writes nothing at all, which is the property no
+heartbeat cadence can have.
+
+Four defences, and the fourth is the honest one:
+
+1. **Self-attestation is refused outright** — `reader === provider` is rejected
+   before anything else.
+2. **A per-reader cap.** One counterparty is worth at most `PER_READER_EPOCH_CAP_BYTES`
+   however much it claims, so a friendly reader cannot mint a fortune.
+3. **A distinct-reader floor** (3, matching `MIN_DISTINCT_PROBERS`). A provider
+   whose whole income comes from one reader has a testimonial, not an
+   observation, and is paid nothing.
+4. **Collusion is priced, not prevented.** `collusionCeilingBytes` states it as
+   a function: earnings scale linearly with the number of identities an attacker
+   controls, and each identity costs a nullifier — a human. That is the only
+   shape this project has ever been able to defend, and pretending otherwise
+   would be the overstatement the black-hat skill warns about.
+
+Monotonicity does the anti-replay work with no history stored: the counter must
+advance, and neither cumulative total may shrink — otherwise a reader could
+attest a large figure, let it settle, then rebuild the same bytes for a second
+payment. Settlement moves each pair's baseline to its current total, so the same
+bytes can never be claimed twice.
+
+**`lastLatencyMs` is carried and never paid on.** Lucian asked for retrieval
+time to be signalled and it is useful — for routing and local reputation, where
+gaming it buys more traffic and therefore costs bandwidth. It is reader-reported
+and unverifiable, so it must not meter a payout, and a test asserts that a
+provider claiming 1 ms and one claiming 99,999 ms earn identically.
+
+**Still open, and it is the part no code can settle:** who funds the payment. If
+the network mints per read, a reader and provider collude for free money and no
+receipt scheme can fix it, because every receipt in that fraud is honestly
+signed. If the **publisher pays** for distribution of their own content,
+collusion becomes self-dealing. This module meters what is OWED and never mints,
+so the funding decision is still Lucian's to make.
+
 ### 3. The stronger move is to remove the payment as well — measured
 
 Applying "what can be REMOVED" one step further: delete the money, and throttle

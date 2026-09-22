@@ -225,8 +225,19 @@ verification is circular. The on-chain evidence ceiling bounds UPTIME, which is
 cheap to produce honestly, and bounds nothing about volume.
 
 Found by the first black-hat pass (2026-09-21) and kept as an adversarial
-control in `provider-ledger.test.ts`. **Open** — the fix is Phase 4's
-custody-proven payouts, which is an economic design decision, not a patch.
+control in `provider-ledger.test.ts`.
+
+**Mechanism built 2026-09-22** — `engine/content/read-receipts.ts` meters
+payment on reader-signed cumulative receipts, so the payee never reports its own
+volume: self-attestation is refused, a per-reader cap bounds any one
+counterparty, and a distinct-reader floor rejects a provider vouched for by a
+single friend. The heartbeat keeps its real job as the custody lease and stops
+being the payment meter.
+
+**Still open until two things happen:** the funding decision (minting makes
+reader/provider collusion free money, publisher-pays makes it self-dealing —
+CUSTODY-PROOFS.md → 2b), and the cut-over, since `rewardTerms` still pays on
+self-reported bytes today.
 
 ### 12. Numbers without provenance
 
