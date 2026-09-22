@@ -717,8 +717,6 @@ function showAccountDetail(pub: string) {
         <div class="stat-item"><div class="stat-label">Capacity</div><div class="stat-value">${provider.capacityGB} GB</div></div>
         <div class="stat-item"><div class="stat-label">Score</div><div class="stat-value">${provider.score.toFixed(2)}</div></div>
         <div class="stat-item" title="Liveness only — earnings are metered by reader-signed receipts, not by uptime."><div class="stat-label">Uptime (liveness)</div><div class="stat-value">${node.storage.getUptimePct(pub)}%</div></div>
-        <div class="stat-item"><div class="stat-label">Rate</div><div class="stat-value">${formatUNIT(provider.earningRate)} UNIT/day</div></div>
-        <div class="stat-item"><div class="stat-label">Total Earned</div><div class="stat-value">${formatUNIT(provider.totalEarned)} UNIT</div></div>
         <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '-'}</div></div>
       </div>
     </div>` : '';
@@ -4045,40 +4043,15 @@ function refreshStorage() {
       // Measured from the END of the billed epoch, which is when the reward
       // became claimable and, within one poll, when it was issued. `lastReward`
       // itself only records WHICH epoch was paid, not when the block landed.
-      const lastReward = p.lastRewardEpoch > 0
-        ? fmtAgo(Math.max(0, Date.now() - (p.lastRewardEpoch + 1) * REWARD_EPOCH_MS))
-        : 'Never';
-      // Bytes actually held is what the reward is metered on — declared capacity
-      // earns nothing — so it belongs on the provider's own row, not only in the
-      // network table. "empty" rather than "0 B": a provider that is up and
-      // holding nothing is a specific, expected state during setup, and it
-      // explains a RATE/DAY of 0 that would otherwise look broken.
       const myUsed = p.lastActualStoredBytes > 0
         ? `<div style="font-size:10px;color:var(--text-muted)">${fmtBytes(p.lastActualStoredBytes)} used</div>`
         : '<div style="font-size:10px;color:var(--text-muted)">empty — declared capacity earns nothing</div>';
-      // Earnings stopped being metered by uptime on 2026-09-22: volume is only
-      // payable when READERS attest it, and this path fails closed without
-      // that. So a row showing "100% uptime" beside an earning rate would be
-      // claiming a causal link that no longer exists — the same defect as
-      // rendering the unmeasured as fact, one level up.
-      //
-      // Until settlement is wired end to end there is nothing attested, so the
-      // honest rate is "—" with the reason attached, not a number.
-      const attested = node.ledger.storageProviders.get(servingAccount.pub);
-      const rateCell = p.earningRate > 0
-        ? formatUNIT(p.earningRate)
-        : '<span title="Earnings are metered by reader-signed receipts (storage-settlement). '
-          + 'Uptime is a liveness signal and no longer determines pay.">— not yet attested</span>';
-      void attested;
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB${myUsed}</td>
         <td title="Liveness only — ${p.heartbeatsLast24h} renewal block(s) in the counting window. Does NOT determine earnings.">${
           uptime}${uptimeFraction === undefined ? '' : ` (${shown}/${due} renewals)`}</td>
         <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
-        <td>${rateCell}</td>
-        <td>${formatUNIT(p.totalEarned)}</td>
-        <td>${lastReward}</td>
       </tr>`;
     }
   } else {
@@ -4127,7 +4100,6 @@ function refreshStorage() {
       : `${measured.length} measured`;
     const band = (v: number | undefined) => v === undefined ? 'var(--text-muted)'
       : v >= 0.8 ? 'var(--success)' : v >= 0.4 ? 'var(--warning)' : 'var(--danger)';
-    const totalEarned = providers.reduce((s, p) => s + p.totalEarned, 0);
     const fmtGB = (gb: number) => gb >= 1024 ? `${(gb / 1024).toFixed(2)} TB` : `${gb.toFixed(1)} GB`;
     const chip = (label: string, value: string, color = 'var(--accent)') =>
       `<div style="background:var(--surface2);border-radius:8px;padding:8px 14px;min-width:110px;text-align:center;">
@@ -4154,7 +4126,6 @@ function refreshStorage() {
         avgUptime === undefined ? '—' : `${Math.round(avgUptime * 100)}%`, band(avgUptime)),
       chip(`Score (${sampleNote})`,
         avgScore === undefined ? '—' : avgScore.toFixed(3), band(avgScore)),
-      chip('Total Earned', formatUNIT(totalEarned)),
       timingChip,
     ].join('');
   }
@@ -4224,8 +4195,6 @@ function refreshStorage() {
         <td>${latency}</td>
         <td>${spotCheck}</td>
         <td>${unknown ? noChain : `<strong style="color:${scoreColor}">${p.score.toFixed(3)}</strong>`}</td>
-        <td>${unknown ? noChain : formatUNIT(p.earningRate)}</td>
-        <td>${unknown ? noChain : formatUNIT(p.totalEarned)}</td>
       </tr>`;
     }).join('');
   }
@@ -4435,14 +4404,6 @@ $('#btnManualHeartbeat')?.addEventListener('click', async () => {
   else { toast(`${result.error}`, 'error'); }
 });
 
-$('#btnClaimReward')?.addEventListener('click', async () => {
-  const servingAcc = localAccounts.find(a => node.storage.isServing(a.pub));
-  if (!servingAcc) { toast('Not currently serving storage', 'error'); return; }
-
-  await node.storage.issueRewardsIfEligible();
-  toast('Reward check complete - see balance if minted', 'info');
-  refreshStorage();
-});
 
 $('#btnClearCache')?.addEventListener('click', () => {
   $('#clearCacheDialog').classList.add('active');

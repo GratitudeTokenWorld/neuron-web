@@ -7,8 +7,7 @@ import { deriveCommitment } from '../engine/core/identity.js';
 import { createBlock, type Block, type StoragePayload } from '../engine/core/block.js';
 import { AccountAccumulator } from '../engine/core/accumulator.js';
 import {
-  REWARD_EPOCH_MS, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_EPOCH,
-  BASE_STORAGE_RATE_MILLI, MAX_OFFLINE_MS, GB_BYTES,
+  REWARD_EPOCH_MS, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_EPOCH, MAX_OFFLINE_MS, GB_BYTES,
 } from '../engine/content/provider-ledger.js';
 
 /**
@@ -106,9 +105,7 @@ async function provider(capacityGB = 10) {
  * attestation the network would. `attest: false` exercises the fail-closed
  * rule itself.
  */
-function fullDayOfHeartbeats(
-  ledger: EngineLedger, chain: Chain, storedGB: number, attest = true,
-): void {
+function fullDayOfHeartbeats(ledger: EngineLedger, chain: Chain, storedGB: number): void {
   for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
     const { result } = chain.push(
       ledger, 'storage-heartbeat', DAY1 + i * HEARTBEAT_INTERVAL_MS,
@@ -116,7 +113,6 @@ function fullDayOfHeartbeats(
     );
     expect(result.success).toBe(true);
   }
-  if (attest) ledger.providerLedger.setAttestedGB(chain.keys.pub, TODAY - 2, storedGB);
 }
 
 afterEach(() => { vi.useRealTimers(); });
@@ -164,115 +160,6 @@ describe('storage blocks on the engine', () => {
   });
 });
 
-describe('reward minting — the adversarial surface', () => {
-  it('mints exactly what the on-chain evidence supports', async () => {
-    const { ledger, keys, chain } = await provider(10);
-    fullDayOfHeartbeats(ledger, chain, 4);
-    const expected = BASE_STORAGE_RATE_MILLI * 4;   // 4GB held × full uptime
-
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS,
-      { epochDay: TODAY - 2, storedGB: 4, heartbeatCount: MAX_HEARTBEATS_PER_EPOCH },
-      { amount: BigInt(expected), balance: MINT + BigInt(expected) },
-    );
-    expect(result.success).toBe(true);
-    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT) + expected);
-    expect(ledger.storageProviders.get(keys.pub)!.totalEarned).toBe(expected);
-  });
-
-  it('rejects a reward that claims more than the evidence allows', async () => {
-    const { ledger, keys, chain } = await provider(10);
-    fullDayOfHeartbeats(ledger, chain, 4);
-    const inflated = BigInt(BASE_STORAGE_RATE_MILLI * 4 * 1000);
-
-    // Internally consistent: the balance delta EQUALS the amount, so the
-    // conservation check passes. Only the evidence ceiling stops it.
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS,
-      { epochDay: TODAY - 2, storedGB: 4 },
-      { amount: inflated, balance: MINT + inflated },
-    );
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/exceeds maximum/);
-    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT));
-  });
-
-  it('rejects a reward whose balance delta does not equal its amount', async () => {
-    const { ledger, keys, chain } = await provider(10);
-    fullDayOfHeartbeats(ledger, chain, 4);
-    const legit = BigInt(BASE_STORAGE_RATE_MILLI * 4);
-
-    // The classic self-mint: claim a modest, defensible amount while writing a
-    // balance a million times larger. The evidence ceiling would pass this.
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS,
-      { epochDay: TODAY - 2, storedGB: 4 },
-      { amount: legit, balance: MINT + legit * 1_000_000n },
-    );
-    expect(result.success).toBe(false);
-    expect(result.error).toBe('storage-reward balance inconsistent');
-    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT));
-  });
-
-  it('rejects a reward for an epoch with no heartbeats at all', async () => {
-    const { ledger, chain } = await provider(10);
-    // Capacity was declared on day -3, so day -2 prices fine — but the provider
-    // never proved it was there for it.
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 2 },
-      { amount: 1_000n, balance: MINT + 1_000n },
-    );
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/no heartbeats/);
-  });
-
-  it('rejects a reward for the day the provider registered — no capacity at epoch start', async () => {
-    const { ledger, chain } = await provider(10);
-    chain.push(ledger, 'storage-heartbeat', DAY0 + HEARTBEAT_INTERVAL_MS, { storedBytes: GB_BYTES });
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1, { epochDay: TODAY - 3 },
-      { amount: 1_000n, balance: MINT + 1_000n },
-    );
-    expect(result.error).toMatch(/not registered at epoch start/);
-  });
-
-  it('rejects a second reward for the same epoch', async () => {
-    const { ledger, chain } = await provider(10);
-    fullDayOfHeartbeats(ledger, chain, 4);
-    const amount = BigInt(BASE_STORAGE_RATE_MILLI * 4);
-    const claim = (ts: number) => chain.push(
-      ledger, 'storage-reward', ts, { epochDay: TODAY - 2, storedGB: 4 },
-      { amount, balance: chain.balance + amount },
-    );
-    expect(claim(DAY1 + REWARD_EPOCH_MS).result.success).toBe(true);
-    expect(claim(DAY1 + REWARD_EPOCH_MS + 1).result.error).toMatch(/already rewarded/);
-  });
-
-  it('rejects a reward that bills any day but the one before its own block', async () => {
-    const { ledger, keys, chain } = await provider(10);
-    fullDayOfHeartbeats(ledger, chain, 4);
-    const amount = BigInt(BASE_STORAGE_RATE_MILLI * 4);
-    // Dated day -1, so it may bill day -2 and nothing else. Billing the running
-    // day is refused even though the provider genuinely has evidence for it.
-    const { result } = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 1, storedGB: 4 },
-      { amount, balance: MINT + amount },
-    );
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/may only claim epoch/);
-    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT));
-  });
-
-  it('rejects a balance change on register, deregister or heartbeat', async () => {
-    const { ledger, chain } = await provider(10);
-    for (const type of ['storage-register', 'storage-heartbeat', 'storage-deregister'] as const) {
-      const { result } = chain.push(ledger, type, DAY1, { capacityGB: 10 }, { balance: MINT + 1n });
-      expect(result.success).toBe(false);
-      expect(result.error).toBe(`${type} must preserve balance`);
-    }
-  });
-});
-
 describe('an early heartbeat must not truncate the chain', () => {
   it('accepts it, does not count it, and keeps accepting later blocks', async () => {
     const { ledger, keys, chain } = await provider(10);
@@ -293,87 +180,11 @@ describe('an early heartbeat must not truncate the chain', () => {
     expect(result.success).toBe(true);
     expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
 
-    // And the spam bought nothing: a reward still prices at 2/6 uptime.
-    // Attested separately — uptime is what this test is about, and since
-    // 2026-09-22 no reward computes at all without reader-signed volume.
-    ledger.providerLedger.setAttestedGB(keys.pub, TODAY - 2, 1);
-    const amount = BigInt(Math.floor(BASE_STORAGE_RATE_MILLI * 1 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
-    const claim = chain.push(
-      ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 2, storedGB: 1 },
-      { amount, balance: chain.balance + amount },
-    );
-    expect(claim.result.success).toBe(true);
-    const overclaim = BigInt(BASE_STORAGE_RATE_MILLI);   // what a full day would have paid
-    expect(overclaim).toBeGreaterThan(amount);
-  });
-});
-
-describe('local issuance (the create* path)', () => {
-  it('registers, heartbeats once, then refuses a second heartbeat until it is due', async () => {
-    const ledger = new EngineLedger('testnet');
-    const keys = generateKeyPair();
-    await openAcct(ledger, keys, 'human-local');
-
-    const reg = await ledger.createStorageRegister(keys.pub, 50, keys, 'dev-local');
-    expect(reg.block?.type).toBe('storage-register');
-    expect(ledger.storageProviders.get(keys.pub)!.capacityGB).toBe(50);
-
-    const hb = await ledger.createStorageHeartbeat(keys.pub, keys, 'local.example', 2 * GB_BYTES, 'RO');
-    expect(hb.block?.type).toBe('storage-heartbeat');
-    expect(ledger.storageProviders.get(keys.pub)!.smokeAddr).toBe('local.example');
-
-    const early = await ledger.createStorageHeartbeat(keys.pub, keys);
-    expect(early.block).toBeUndefined();
-    expect(early.error).toMatch(/interval not reached/);
-
-    // Registering is not a reward: one heartbeat on the day of registration
-    // means no capacity was declared at epoch start.
-    const reward = await ledger.createStorageReward(keys.pub, keys);
-    expect(reward.error).toMatch(/not registered at epoch start/);
-
-    const dereg = await ledger.createStorageDeregister(keys.pub, keys);
-    expect(dereg.block?.type).toBe('storage-deregister');
-    expect(ledger.storageProviders.has(keys.pub)).toBe(false);
-  });
-
-  it('issues a reward the ledger itself then accepts, over a full simulated day', async () => {
-    const ledger = new EngineLedger('testnet');
-    const keys = generateKeyPair();
-    await openAcct(ledger, keys, 'human-earner');
-
-    vi.useFakeTimers();
-    vi.setSystemTime(DAY0);
-    await ledger.createStorageRegister(keys.pub, 10, keys, 'dev-earner');
-
-    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      vi.setSystemTime(DAY1 + i * HEARTBEAT_INTERVAL_MS);
-      const hb = await ledger.createStorageHeartbeat(keys.pub, keys, 'e.example', 6 * GB_BYTES);
-      expect(hb.block).toBeDefined();
-    }
-
-    vi.setSystemTime(DAY1 + REWARD_EPOCH_MS);   // next day: yesterday is claimable
-    // Reader-signed volume for the claimed epoch. Without it the reward path
-    // fails closed (2026-09-22) — which is the point, and is covered by its own
-    // test; this one is about the end-to-end issue/accept round trip.
-    ledger.providerLedger.setAttestedGB(keys.pub, TODAY - 2, 6);
-    const reward = await ledger.createStorageReward(keys.pub, keys);
-    expect(reward.error).toBeUndefined();
-    const expected = BASE_STORAGE_RATE_MILLI * 6;
-    expect(Number(reward.block!.amount)).toBe(expected);
-    expect(ledger.getAccountBalance(keys.pub)).toBe(Number(MINT) + expected);
-
-    // A peer holding the same chain accepts every block and derives the same
-    // balance — issuance and validation agree.
-    const peer = new EngineLedger('testnet');
-    for (const block of ledger.getAccountChain(keys.pub)) {
-      expect(peer.addBlock(block).success).toBe(true);
-    }
-    expect(peer.getAccountBalance(keys.pub)).toBe(Number(MINT) + expected);
-    expect(peer.storageProviders.get(keys.pub)!.totalEarned).toBe(expected);
-
-    // Claiming the same day twice is refused locally too.
-    const again = await ledger.createStorageReward(keys.pub, keys);
-    expect(again.error).toMatch(/already rewarded/);
+    // And the spam bought nothing: only two renewals counted, which is what
+    // the LEASE is measured on. (The reward path this used to assert against
+    // was deleted on 2026-09-22 — storage no longer mints from self-reported
+    // volume at all.)
+    expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
   });
 });
 

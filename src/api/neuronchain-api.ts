@@ -438,11 +438,6 @@ export class NeuronChainAPI extends EventEmitter {
     return this.node.storage.broadcastHeartbeat(pub, keys);
   }
 
-  /** Manually trigger today's storage reward if eligible (normally automatic). */
-  async issueStorageReward(): Promise<void> {
-    return this.node.storage.issueRewardsIfEligible();
-  }
-
   // ── Block explorer ────────────────────────────────────────────────────────
 
   getBlock(hash: string): AccountBlock | undefined { return this.node.ledger.getBlock(hash); }

@@ -164,9 +164,9 @@ describe('discovered providers in the ledger', () => {
     expect(pl.allProviders().map(x => x.pub)).toEqual([p.pub]);
     expect(pl.isLive(p.pub, DAY + 1000)).toBe(true);
     expect(pl.freeBytes(p.pub)).toBe(10 * GB_BYTES);
-    // Known, but not a chain we hold — so it can never feed reward validation.
+    // Known, but not a chain we hold — so it can never be treated as verified
+    // chain state, only as a routing hint.
     expect(pl.isAuthoritative(p.pub)).toBe(false);
-    expect(pl.rewardTerms(p.pub, 100)).toMatch(/not a registered/);
   });
 
   it('lets a discovered lease expire like any other', () => {

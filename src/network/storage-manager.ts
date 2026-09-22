@@ -56,8 +56,9 @@ import type { Block as EngineBlock } from '../engine/core/block';
 // carries a half-interval of slack (see countHeartbeatsLast24h). The old
 // comment here claimed "±" while the code was `Math.random() * J`; the code was
 // right and the comment was not.
+/** How often uptime/score are recomputed so the rolling window stays live. */
+const statsRefreshMs = () => Math.max(5_000, REWARD_EPOCH_MS / 48);   // 30 min at production timing
 const jitterMs = () => HEARTBEAT_INTERVAL_MS / 48;            // up to +5 min at production timing
-const rewardCheckMs = () => Math.max(5_000, REWARD_EPOCH_MS / 48);   // 30 min at production timing
 const spotCheckBaseMs = () => Math.max(10_000, REWARD_EPOCH_MS / 24); // 1 h at production timing
 const receiptWindowMs = () => REWARD_EPOCH_MS;                // one epoch of rolling receipts
 
@@ -153,7 +154,6 @@ export class StorageManager extends EventEmitter {
   private localKeys: Map<string, KeyPair>;
 
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-  private rewardInterval: ReturnType<typeof setInterval> | null = null;
   private spotCheckTimer: ReturnType<typeof setTimeout> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private statsRefreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -564,9 +564,7 @@ export class StorageManager extends EventEmitter {
     this.scheduleNextHeartbeat();
 
     // Check daily reward eligibility every 30 min
-    this.rewardInterval = setInterval(() => this.issueRewardsIfEligible(), rewardCheckMs());
     // Also check immediately on start (catches missed day-boundary events)
-    setTimeout(() => this.issueRewardsIfEligible(), 5_000);
 
     // Spot checks reschedule themselves at a population-scaled, jittered cadence
     // rather than on a fixed timer — see scheduleNextSpotCheck.
@@ -577,7 +575,7 @@ export class StorageManager extends EventEmitter {
     this.statsRefreshInterval = setInterval(() => {
       this.ledger.refreshHeartbeatCounts();
       this.emit('storage:providers-updated');
-    }, rewardCheckMs());
+    }, statsRefreshMs());
 
     // Periodically re-announce own files so any peer that missed the original gossip
     // receives it without needing a page reload or reconnect.
@@ -590,7 +588,6 @@ export class StorageManager extends EventEmitter {
     if (!this.started) return;
     this.started = false;
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
-    if (this.rewardInterval) { clearInterval(this.rewardInterval); this.rewardInterval = null; }
     if (this.spotCheckTimer) { clearTimeout(this.spotCheckTimer); this.spotCheckTimer = null; }
     if (this.statsRefreshInterval) { clearInterval(this.statsRefreshInterval); this.statsRefreshInterval = null; }
     if (this.reannounceInterval) { clearInterval(this.reannounceInterval); this.reannounceInterval = null; }
@@ -922,6 +919,15 @@ export class StorageManager extends EventEmitter {
     });
   }
 
+  /** Broadcast storage stats for all local providers. Used when pub/keys are not in scope. */
+  async broadcastStorageStatsForLocalProviders(): Promise<void> {
+    for (const [pub, keys] of this.localKeys) {
+      const provider = this.ledger.storageProviders.get(pub);
+      if (!provider || provider.capacityGB === 0) continue;
+      await this.broadcastStorageStats(pub, keys).catch(() => {});
+    }
+  }
+
   // ── Heartbeats ────────────────────────────────────────────────────────────
 
   private scheduleNextHeartbeat(): void {
@@ -1057,53 +1063,7 @@ export class StorageManager extends EventEmitter {
     });
   }
 
-  /** Broadcast storage stats for all local providers. Used when pub/keys are not in scope. */
-  async broadcastStorageStatsForLocalProviders(): Promise<void> {
-    for (const [pub, keys] of this.localKeys) {
-      const provider = this.ledger.storageProviders.get(pub);
-      if (!provider || provider.capacityGB === 0) continue;
-      await this.broadcastStorageStats(pub, keys).catch(() => {});
-    }
-  }
-
-  // ── Daily rewards ─────────────────────────────────────────────────────────
-
-  async issueRewardsIfEligible(): Promise<void> {
-    for (const [pub, keys] of this.localKeys) {
-      const provider = this.ledger.storageProviders.get(pub);
-      if (!provider || provider.capacityGB === 0) continue;
-      // Rewards settle a day behind — the running day's uptime isn't known yet
-      // (see claimableEpochDay). Comparing against the *current* day here would
-      // leave this polling every 30 min for a claim that is already made.
-      const epochDay = claimableEpochDay(Date.now());
-      if (provider.lastRewardEpoch >= epochDay) continue;
-
-      const result = await this.ledger.createStorageReward(pub, engineKeysFromAppPrivate(keys.priv));
-      if (!result.block) {
-        // The comment here used to say "log and continue" and then logged
-        // nothing, so a provider that never got paid gave no clue why — and
-        // this poll runs every 15 s under the compressed profile, i.e. it was
-        // declining ~100 times an epoch in total silence. Throttled by REASON:
-        // a repeat says nothing new, a change in reason is the whole story.
-        this.logRewardSkip(pub, epochDay, result.error ?? 'not eligible (no counted heartbeats, or nothing stored)');
-        continue;
-      }
-      const submitResult = await this.submitBlock(result.block);
-      if (submitResult.success) {
-        const amount = Number(result.block.amount ?? 0);
-        console.log(`[StorageManager] Reward issued: ${amount} milli-UNIT for ${pub.slice(0, 12)}...`);
-        this.emit('storage:reward-issued', { pub, amount, epochDay });
-      } else {
-        // A built-but-rejected reward block is a different failure from an
-        // ineligible one, and far more serious: the chain refused something we
-        // signed. Never silent.
-        console.warn(`[StorageManager] Reward block REJECTED for ${pub.slice(0, 12)}… `
-          + `(epoch ${epochDay}): ${submitResult.error ?? 'unknown'}`);
-      }
-    }
-  }
-
-  /** Say why a reward was not issued, once per (provider, reason). */
+    /** Say why a reward was not issued, once per (provider, reason). */
   private rewardSkipLog = new Map<string, string>();
   private logRewardSkip(pub: string, epochDay: number, reason: string): void {
     const key = pub;

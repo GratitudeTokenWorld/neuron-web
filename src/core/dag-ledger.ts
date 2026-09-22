@@ -53,9 +53,7 @@ export interface StorageProvider {
   /** Heartbeat blocks in the last 24h window (recomputed on each new block) */
   heartbeatsLast24h: number;
   /** epochDay index of the last storage-reward block (0 = never rewarded) */
-  lastRewardEpoch: number;
   /** Cumulative milli-UNIT minted via storage-reward blocks */
-  totalEarned: number;
   /** Current smoke Hub address - set from heartbeat contractData, used for targeted retrieval */
   smokeAddr?: string;
   /** ISO 3166-1 alpha-2 country code - self-reported via heartbeat, used for geographic diversity in provider selection */
@@ -68,7 +66,6 @@ export interface StorageProvider {
   /** Composite score: uptime × latency × spot-check factors (0–1) */
   score: number;
   /** Projected milli-UNIT earned per day at current score */
-  earningRate: number;
 }
 
 export class DAGLedger extends EventEmitter {
@@ -350,63 +347,7 @@ export class DAGLedger extends EventEmitter {
     return { block };
   }
 
-  /**
-   * Issue a daily storage reward. Validates amount against on-chain heartbeat count
-   * and registered capacity. Mints new UNIT into the provider's balance.
-   */
-  async createStorageReward(pub: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
-    const provider = this.storageProviders.get(pub);
-    if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
-
-    const epochDay = Math.floor(Date.now() / REWARD_EPOCH_MS);
-    if (provider.lastRewardEpoch >= epochDay) return { error: 'Storage reward already claimed for today' };
-    // Guard against two devices with the same account both issuing a reward before
-    // either block is accepted (epoch race). Check the chain directly.
-    const chain = this.accountChains.get(pub) || [];
-    const alreadyInChain = chain.some(b => {
-      if (b.type !== 'storage-reward' || !b.contractData) return false;
-      try { return (JSON.parse(b.contractData) as StorageRewardData).epochDay === epochDay; }
-      catch { return false; }
-    });
-    if (alreadyInChain) return { error: 'Storage reward already in chain for today' };
-
-    // Use capacity at epoch start - not current capacity - to prevent bumping GB just before claiming
-    const capacityAtEpochStart = this.getCapacityAtEpochStart(pub, epochDay);
-    if (capacityAtEpochStart === 0) return { error: 'Not registered at epoch start - no reward eligible' };
-
-    const heartbeatCount = this.countHeartbeatsInEpoch(pub, epochDay);
-    if (heartbeatCount === 0) return { error: 'No heartbeat blocks recorded today - cannot claim reward' };
-
-    const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
-    // Use actual stored GB from heartbeat data; fall back to declared capacity when
-    // heartbeats predate the actualStoredBytes field (backward compatibility).
-    const actualStoredGB = this.getActualStoredGBInEpoch(pub, epochDay);
-    const effectiveGB = actualStoredGB > 0
-      ? Math.min(actualStoredGB, capacityAtEpochStart)
-      : capacityAtEpochStart;
-    const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
-    if (amount <= 0) return { error: 'Calculated reward is zero' };
-
-    const head = this.getAccountHead(pub);
-    if (!head) return { error: 'Account not opened' };
-
-    const rewardData: StorageRewardData = {
-      type: 'storage-reward',
-      epochDay,
-      storedGB: effectiveGB,
-      heartbeatCount,
-      amount,
-    };
-
-    const block = await createAccountBlock({
-      accountPub: pub, index: head.index + 1, type: 'storage-reward',
-      previousHash: head.hash, balance: head.balance + amount,
-      contractData: JSON.stringify(rewardData),
-    }, keys);
-    return { block };
-  }
-
-  // ── Storage scoring (also called by StorageManager to update off-chain metrics) ──
+    // ── Storage scoring (also called by StorageManager to update off-chain metrics) ──
 
   updateProviderScore(provider: StorageProvider): void {
     const uptimeFactor = Math.max(0.1, Math.min(1.0,
@@ -414,19 +355,12 @@ export class DAGLedger extends EventEmitter {
 
     const latencyFactor = provider.avgLatencyMs > 0
       ? Math.max(0.1, Math.min(1.0, 1_000 / provider.avgLatencyMs)) // 1000ms target
-      : 1.0; // no receipts yet → full score
+      : 1.0; // no receipts yet -> full score
 
     const spotFactor = Math.max(0.1, Math.min(1.0, provider.spotCheckPassRate));
 
     provider.score = uptimeFactor * latencyFactor * spotFactor;
-    // Earning rate reflects actual stored GB (capped at declared capacity), not just declared capacity
-    const effectiveGB = provider.lastActualStoredBytes > 0
-      ? Math.min(provider.lastActualStoredBytes / GB_BYTES, provider.capacityGB)
-      : provider.capacityGB;
-    provider.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * provider.score);
   }
-
-  // ── Block submission ──────────────────────────────────────────────────────
 
   async addBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
     if (this.allBlocks.has(block.hash)) return { success: true };
@@ -452,10 +386,6 @@ export class DAGLedger extends EventEmitter {
     }
 
     // storage-reward semantic validation (requires chain state)
-    if (block.type === 'storage-reward' && block.contractData) {
-      const rewardErr = this.validateStorageReward(block);
-      if (rewardErr) return { success: false, error: rewardErr };
-    }
 
     // storage-heartbeat minimum interval check
     if (block.type === 'storage-heartbeat') {
@@ -539,12 +469,9 @@ export class DAGLedger extends EventEmitter {
           lastActualStoredBytes: existing?.lastActualStoredBytes ?? 0,
           lastHeartbeat: existing?.lastHeartbeat ?? 0,
           heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,
-          lastRewardEpoch: existing?.lastRewardEpoch ?? 0,
-          totalEarned: existing?.totalEarned ?? 0,
           avgLatencyMs: existing?.avgLatencyMs ?? 0,
           spotCheckPassRate: existing?.spotCheckPassRate ?? 1.0,
           score: existing?.score ?? 1.0,
-          earningRate: 0,
         };
         this.updateProviderScore(provider);
         this.storageProviders.set(block.accountPub, provider);
@@ -589,18 +516,6 @@ export class DAGLedger extends EventEmitter {
       }
     }
 
-    if (block.type === 'storage-reward' && block.contractData) {
-      try {
-        const data = JSON.parse(block.contractData) as StorageRewardData;
-        const provider = this.storageProviders.get(block.accountPub);
-        if (provider) {
-          provider.lastRewardEpoch = data.epochDay;
-          provider.totalEarned += data.amount;
-          this.updateProviderScore(provider);
-        }
-        this.emit('storage:reward', { pub: block.accountPub, amount: data.amount, epochDay: data.epochDay });
-      } catch { /* invalid */ }
-    }
 
     if (block.type === 'open' && block.faceMapHash) {
       const prev = this.faceAccountCount.get(block.faceMapHash) || 0;
@@ -664,46 +579,6 @@ export class DAGLedger extends EventEmitter {
     if (!chain || chain.length <= DAGLedger.MAX_CHAIN_MEMORY) return;
     const pruned = chain.splice(0, chain.length - DAGLedger.MAX_CHAIN_MEMORY);
     for (const b of pruned) this.allBlocks.delete(b.hash);
-  }
-
-  // ── Storage reward validation (semantic, requires chain state) ────────────
-
-  private validateStorageReward(block: AccountBlock): string | null {
-    try {
-      const data = JSON.parse(block.contractData!) as StorageRewardData;
-      const provider = this.storageProviders.get(block.accountPub);
-      if (!provider || provider.capacityGB === 0) {
-        return 'storage-reward: account is not a registered storage provider';
-      }
-      if (provider.lastRewardEpoch >= data.epochDay) {
-        return `storage-reward: epoch ${data.epochDay} already rewarded`;
-      }
-      // Validate storedGB against capacity at epoch start - not current capacity
-      const capacityAtEpochStart = this.getCapacityAtEpochStart(block.accountPub, data.epochDay);
-      if (capacityAtEpochStart === 0) {
-        return 'storage-reward: not registered at epoch start';
-      }
-      const heartbeatCount = this.countHeartbeatsInEpoch(block.accountPub, data.epochDay);
-      if (heartbeatCount === 0) {
-        return 'storage-reward: no heartbeat blocks found for this epoch';
-      }
-      // Compute the effective GB the same way createStorageReward does
-      const actualStoredGB = this.getActualStoredGBInEpoch(block.accountPub, data.epochDay);
-      const effectiveGB = actualStoredGB > 0
-        ? Math.min(actualStoredGB, capacityAtEpochStart)
-        : capacityAtEpochStart;
-      if (data.storedGB > effectiveGB + 1e-9) {
-        return `storage-reward: storedGB (${data.storedGB.toFixed(3)}) exceeds effective allowed GB (${effectiveGB.toFixed(3)})`;
-      }
-      const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
-      const maxAllowed = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
-      if (data.amount > maxAllowed) {
-        return `storage-reward: amount ${data.amount} exceeds maximum ${maxAllowed} (${effectiveGB.toFixed(3)}GB × ${uptimeFactor.toFixed(2)} uptime)`;
-      }
-      return null;
-    } catch {
-      return 'storage-reward: invalid contractData';
-    }
   }
 
   // ── Heartbeat helpers ─────────────────────────────────────────────────────

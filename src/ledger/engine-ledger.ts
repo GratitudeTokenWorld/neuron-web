@@ -677,36 +677,7 @@ export class EngineLedger extends EventEmitter {
     });
   }
 
-  /**
-   * Self-issue the day's storage reward. The amount is not a choice: it is derived
-   * from on-chain evidence (capacity declared at epoch start, counted heartbeats,
-   * bytes actually reported held) by the same function every other node uses to
-   * check it.
-   */
-  async createStorageReward(pub: string, keys: SignerKeys): Promise<{ block?: Block; error?: string }> {
-    const head = this.getAccountHead(pub);
-    if (!head) return { error: 'Account not opened' };
-    if (this.equivocated.has(pub)) return { error: 'Account frozen' };
-    // ONE clock read for both the claim and the block timestamp. A reward may only
-    // bill `claimableEpochDay(block.timestamp)`, so reading the clock twice across
-    // a midnight boundary would produce a block that fails its own validation —
-    // and being rejected mid-chain would strand everything after it.
-    const now = Date.now();
-    const epochDay = claimableEpochDay(now);
-    // Issuance requires reader-signed evidence; validation does not (see
-    // `rewardTerms`). A node will not MINT on a self-report, and still accepts
-    // peers' blocks so a chain is never stranded mid-migration.
-    const terms = this.providerLedger.rewardTerms(pub, epochDay, { requireAttested: true });
-    if (typeof terms === 'string') return { error: `Storage reward: ${terms}` };
-    return this.appendStorageBlock(
-      pub, keys, 'storage-reward', head.balance + BigInt(terms.amount),
-      { epochDay, storedGB: terms.storedGB, heartbeatCount: terms.heartbeatCount },
-      BigInt(terms.amount), now,
-    );
-  }
-
-  /** Sign, apply, and index one storage block on the account's own chain. */
-  private appendStorageBlock(
+    private appendStorageBlock(
     pub: string, keys: SignerKeys, type: Block['type'], balance: bigint,
     storage: StoragePayload, amount?: bigint, timestamp = Date.now(),
   ): { block?: Block; error?: string } {

@@ -1651,7 +1651,6 @@ function getCount() { return state.counter; }"></textarea>
             <input type="number" class="form-input" id="adjustCapacityGB" placeholder="Capacity (GB)" min="1" max="10000" style="width:160px;" />
             <button class="btn btn-outline" id="btnAdjustCapacity">Adjust Capacity</button>
             <button class="btn btn-outline" id="btnManualHeartbeat">Send Heartbeat Now</button>
-            <button class="btn btn-outline" id="btnClaimReward">Claim Today's Reward</button>
             <button class="btn btn-outline" id="btnStopServing" style="color:var(--danger);border-color:var(--danger);">Stop Serving Storage</button>
           </div>
         </div>
@@ -1670,7 +1669,7 @@ function getCount() { return state.counter; }"></textarea>
 
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Latency</th><th>Spot Check</th><th>Score</th><th>Rate/day</th><th>Total Earned</th></tr></thead>
+            <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Latency</th><th>Spot Check</th><th>Score</th></tr></thead>
             <tbody id="storageProvidersList"></tbody>
           </table>
         </div>

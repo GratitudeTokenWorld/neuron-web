@@ -7,7 +7,6 @@ import type { Block } from '../core/block.js';
  *   - `storage-register`   declare capacity (the upper bound offered to the network)
  *   - `storage-deregister` release the lease and leave
  *   - `storage-heartbeat`  the periodic liveness proof — **this is the lease renewal**
- *   - `storage-reward`     the daily self-issued mint, metered by the two above
  *
  * The custody model this implements (decided 2026-08-10, see CLAUDE.md):
  * **durability is a flow property.** Content survives because the network
@@ -122,8 +121,7 @@ export function claimableEpochDay(now: number): number {
   return Math.floor(now / REWARD_EPOCH_MS) - 1;
 }
 
-/** Base earning rate: 1 UNIT per stored GB per epoch, in milli-UNIT. */
-export const BASE_STORAGE_RATE_MILLI = 1_000;
+
 
 /**
  * Uptime assumed for a provider whose chain we do not hold, when a number is
@@ -242,9 +240,6 @@ export interface StorageProviderState {
   /** Timestamp of the most recent *counted* heartbeat — the lease renewal clock. */
   lastHeartbeat: number;
   heartbeatsLast24h: number;
-  /** epochDay of the last reward claimed (0 = never). */
-  lastRewardEpoch: number;
-  totalEarned: number;
   /** Current smoke/WebRTC address, from the latest heartbeat. */
   smokeAddr?: string;
   /** ISO 3166-1 alpha-2, self-reported; feeds geographic diversity in selection. */
@@ -252,12 +247,11 @@ export interface StorageProviderState {
   avgLatencyMs: number;
   spotCheckPassRate: number;
   score: number;
-  earningRate: number;
   /**
    * True when this record came from discovery rather than from a chain we hold
-   * (see provider-discovery.ts). Its `score`, `heartbeatsLast24h` and
-   * `totalEarned` are NOT measurements — we have no history for it — so they
-   * must be shown as unknown, not as fact.
+   * (see provider-discovery.ts). Its `score` and `heartbeatsLast24h` are NOT
+   * measurements — we have no history for it — so they must be shown as
+   * unknown, not as fact.
    */
   discovered?: boolean;
 }
@@ -272,14 +266,6 @@ interface EpochRecord {
   latestBytesAt: number;
 }
 
-/** What a reward for one epoch may claim, derived entirely from on-chain evidence. */
-export interface RewardTerms {
-  epochDay: number;
-  storedGB: number;
-  heartbeatCount: number;
-  /** milli-UNIT ceiling. A reward block claiming more than this is invalid. */
-  amount: number;
-}
 
 export class ProviderLedger {
   /**
@@ -321,14 +307,6 @@ export class ProviderLedger {
   private readonly epochs = new Map<string, Map<number, EpochRecord>>();
   /** pub → capacity changes over time, oldest first. One entry per register/deregister. */
   private readonly capacityHistory = new Map<string, { ts: number; capacityGB: number }[]>();
-  /**
-   * Reader-attested service volume, keyed `pub:epochDay`.
-   *
-   * Populated from settled receipts, never from a provider's own report. Empty
-   * means "nobody has vouched for this provider yet", which pays zero — the
-   * fail-closed direction.
-   */
-  private readonly attestedGB = new Map<string, number>();
   /** pub → timestamps of recent counted heartbeats (bounded ring). */
   private readonly heartbeatTimes = new Map<string, number[]>();
 
@@ -434,111 +412,6 @@ export class ProviderLedger {
    * Returns a string when no reward is owed at all.
    */
   /**
-   * Record reader-attested service for an epoch. The ONLY way volume becomes
-   * payable.
-   */
-  setAttestedGB(pub: string, epochDay: number, gb: number): void {
-    if (!(gb > 0)) return;
-    this.attestedGB.set(`${pub}:${epochDay}`, gb);
-  }
-
-  /** Drop attestations for epochs no longer claimable, so the map has a remover. */
-  sweepAttested(oldestClaimableEpochDay: number): number {
-    let removed = 0;
-    for (const k of [...this.attestedGB.keys()]) {
-      const day = Number(k.slice(k.lastIndexOf(':') + 1));
-      if (Number.isFinite(day) && day < oldestClaimableEpochDay) {
-        this.attestedGB.delete(k);
-        removed++;
-      }
-    }
-    return removed;
-  }
-
-  /**
-   * `requireAttested` gates ISSUANCE only, never validation.
-   *
-   * This distinction is load-bearing and was found by a test rather than by
-   * design. Attestation lives in LOCAL state — receipts this node happens to
-   * have seen — while `validate` runs on every peer. Gating validation on it
-   * made a correctly-issued reward block rejected by any peer that had not
-   * seen the same receipts, which strands every later block on that chain as
-   * non-sequential. That is the exact failure mode CLAUDE.md warns about, and
-   * it is how NFTs once vanished on reload.
-   *
-   * So: a node refuses to CREATE a reward it cannot justify from reader-signed
-   * evidence, and still ACCEPTS peers' blocks under the existing on-chain
-   * evidence ceiling. Making validation attestation-aware requires the
-   * evidence to travel IN the block — `content/storage-settlement.ts` — which
-   * is the remaining half of the migration.
-   */
-  rewardTerms(pub: string, epochDay: number, opts?: { requireAttested?: boolean }): RewardTerms | string {
-    const p = this.providers.get(pub);
-    if (!p || p.capacityGB <= 0) return 'not a registered storage provider';
-    if (p.lastRewardEpoch >= epochDay) return `epoch ${epochDay} already rewarded`;
-
-    // Capacity as of the START of the epoch, never current capacity — otherwise a
-    // provider bumps its declared GB minutes before claiming and is paid for a day
-    // it never offered.
-    const capacityAtStart = this.capacityAtEpochStart(pub, epochDay);
-    if (capacityAtStart === 0) return 'not registered at epoch start';
-
-    const heartbeatCount = this.heartbeatsInEpoch(pub, epochDay);
-    if (heartbeatCount === 0) return 'no heartbeats recorded in this epoch';
-
-    // Pay ONLY for bytes actually held, capped by what was declared at epoch
-    // start. Storing nothing earns nothing — declared capacity is self-asserted,
-    // so paying for it pays for a claim rather than for custody.
-    //
-    // This used to fall back to declared capacity when no bytes were reported, a
-    // backward-compatibility rule carried over from the legacy ledger, where
-    // heartbeats predating the `storedBytes` field had to stay claimable. That
-    // premise does not exist here: `storage-heartbeat` is a new block type and
-    // has carried `storedBytes` since its first line, so there are no such
-    // chains. What the fallback actually did was pay a provider its full
-    // declared rate for storing nothing — and, because the field is optional,
-    // hand a free full-capacity reward to anyone who simply omitted it.
-    const actualGB = this.storedGBInEpoch(pub, epochDay);
-    const effectiveGB = Math.min(actualGB, capacityAtStart);
-    const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_EPOCH, 1);
-    const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
-    if (amount <= 0) return 'calculated reward is zero';
-
-    // ── FAIL CLOSED ON SELF-REPORTED VOLUME (2026-09-22) ────────────────────
-    //
-    // Everything above is computed from numbers the PAYEE supplied: its own
-    // `storedBytes` heartbeats and its own declared capacity. `validate` then
-    // checked the claim against terms derived from that same self-report, so
-    // the verification was circular and bounded nothing (SCREENING.md → 11).
-    //
-    // The replacement is reader-attested receipts settled through
-    // `content/storage-settlement.ts`. Until a settlement supplies attested
-    // volume, this path pays NOTHING — it does not fall back to the old
-    // figures. Fail-closed is the only safe direction while a payment path is
-    // being migrated: paying on unverifiable numbers "just until the new code
-    // lands" is how a temporary measure becomes the live one.
-    //
-    // The arithmetic is kept rather than deleted so the legacy chains that
-    // contain these blocks still replay, and so the exact shape of what was
-    // wrong stays visible next to what replaced it. Delete it with the rest of
-    // the legacy path once settlement is wired end to end.
-    if (!opts?.requireAttested) {
-      // Validation path: bounded by the on-chain evidence ceiling as before.
-      return { epochDay, storedGB: effectiveGB, heartbeatCount, amount };
-    }
-    if (!this.attestedGB.has(`${pub}:${epochDay}`)) {
-      return 'no reader-attested service for this epoch — self-reported volume is not payable';
-    }
-    const attested = this.attestedGB.get(`${pub}:${epochDay}`)!;
-    const payableGB = Math.min(effectiveGB, attested);
-    const attestedAmount = Math.floor(BASE_STORAGE_RATE_MILLI * payableGB * uptimeFactor);
-    if (attestedAmount <= 0) return 'attested reward is zero';
-    return { epochDay, storedGB: payableGB, heartbeatCount, amount: attestedAmount };
-
-    return { epochDay, storedGB: effectiveGB, heartbeatCount, amount };
-  }
-
-  /**
    * Validate a storage block against provider state. Returns an error string, or
    * null if the block may be applied.
    *
@@ -581,35 +454,6 @@ export class ProviderLedger {
         }
         return null;
       }
-      case 'storage-reward': {
-        const claimed = block.storage;
-        if (!claimed || typeof claimed.epochDay !== 'number') return 'storage-reward: missing epochDay';
-        if (block.amount === undefined || block.amount <= 0n) return 'storage-reward: amount must be positive';
-        // A reward may ONLY bill the day before the block that carries it.
-        //
-        // This is what keeps the reward verifiable forever. Evidence is retained
-        // for RETAIN_EPOCHS; a claim for anything older would find the heartbeats
-        // pruned and be rejected — mid-chain, stranding every later block. Pinning
-        // the claim to the block's own timestamp means the evidence is always one
-        // day old, so the retention window can never be reached and there is no
-        // second constant to keep below it. The rule is decidable from the block
-        // alone, so every node agrees without holding any state: a violating block
-        // is malformed, not merely unverifiable.
-        const billable = claimableEpochDay(block.timestamp);
-        if (claimed.epochDay !== billable) {
-          return `storage-reward: may only claim epoch ${billable} (the day before this block), got ${claimed.epochDay}`;
-        }
-        const terms = this.rewardTerms(block.accountId, claimed.epochDay);
-        if (typeof terms === 'string') return `storage-reward: ${terms}`;
-        if (block.amount > BigInt(terms.amount)) {
-          return `storage-reward: amount ${block.amount} exceeds maximum ${terms.amount} `
-            + `(${terms.storedGB.toFixed(3)}GB × ${(terms.heartbeatCount / MAX_HEARTBEATS_PER_EPOCH).toFixed(2)} uptime)`;
-        }
-        if ((claimed.storedGB ?? 0) > terms.storedGB + 1e-9) {
-          return `storage-reward: storedGB ${claimed.storedGB} exceeds allowed ${terms.storedGB.toFixed(3)}`;
-        }
-        return null;
-      }
       default:
         return null;
     }
@@ -623,7 +467,6 @@ export class ProviderLedger {
       case 'storage-register': return this.applyRegister(block);
       case 'storage-deregister': return this.applyDeregister(block);
       case 'storage-heartbeat': return this.applyHeartbeat(block, now);
-      case 'storage-reward': return this.applyReward(block);
       default: return;
     }
   }
@@ -649,14 +492,11 @@ export class ProviderLedger {
       lastActualStoredBytes: existing?.lastActualStoredBytes ?? 0,
       lastHeartbeat: d.lastHeartbeat,
       heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,
-      lastRewardEpoch: existing?.lastRewardEpoch ?? 0,
-      totalEarned: existing?.totalEarned ?? 0,
       smokeAddr: existing?.smokeAddr,
       countryCode: existing?.countryCode,
       avgLatencyMs: existing?.avgLatencyMs ?? 0,
       spotCheckPassRate: existing?.spotCheckPassRate ?? 1,
       score: existing?.score ?? 1,
-      earningRate: 0,
     };
     this.updateScore(p);
     this.providers.set(pub, p);
@@ -711,18 +551,6 @@ export class ProviderLedger {
     p.heartbeatsLast24h = this.countHeartbeatsLast24h(pub, now);
     this.updateScore(p, now);
   }
-
-  private applyReward(block: Block): void {
-    const p = this.providers.get(block.accountId);
-    if (!p) return;
-    const epochDay = block.storage?.epochDay;
-    if (typeof epochDay !== 'number') return;
-    p.lastRewardEpoch = epochDay;
-    p.totalEarned += Number(block.amount ?? 0n);
-    this.updateScore(p);
-  }
-
-  // ── Chain-derived evidence ───────────────────────────────────────────────────
 
   /** Counted heartbeats inside a reward epoch — what the reward is priced on. */
   heartbeatsInEpoch(pub: string, epochDay: number): number {
@@ -851,11 +679,6 @@ export class ProviderLedger {
       : 1;
     const spotFactor = Math.max(0.1, Math.min(1, p.spotCheckPassRate));
     p.score = uptimeFactor * latencyFactor * spotFactor;
-    // Metered on bytes HELD, never on capacity offered — and by exactly the rule
-    // `rewardTerms` pays by, so the projected rate cannot promise what the reward
-    // will refuse. A provider holding nothing shows 0, which is what it earns.
-    const effectiveGB = Math.min(p.lastActualStoredBytes / GB_BYTES, p.capacityGB);
-    p.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * p.score);
   }
 
   /** Drop all state (ledger reset). */

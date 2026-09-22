@@ -176,14 +176,11 @@ export function foldProviderBlocks(blocks: readonly Block[]): DiscoveredProvider
       lastActualStoredBytes: live?.storage?.storedBytes ?? 0,
       lastHeartbeat: live?.timestamp ?? 0,
       heartbeatsLast24h: 0,        // no history without the chain — shown as "—"
-      lastRewardEpoch: 0,
-      totalEarned: 0,
       smokeAddr: live?.storage?.smokeAddr,
       countryCode: live?.storage?.countryCode,
       avgLatencyMs: 0,
       spotCheckPassRate: 1,
       score: UNKNOWN_SCORE,
-      earningRate: 0,
       discovered: true,
     });
   }

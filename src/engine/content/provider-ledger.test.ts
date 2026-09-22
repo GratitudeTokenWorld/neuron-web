@@ -2,8 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 
 import {
   ProviderLedger, claimableEpochDay, MAX_OFFLINE_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_GRACE_MS,
-  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_EPOCH, MAX_HEARTBEATS_PER_EPOCH_HARD,
-  BASE_STORAGE_RATE_MILLI, GB_BYTES, applyStorageTiming, storageTiming,
+  REWARD_EPOCH_MS, MAX_HEARTBEATS_PER_EPOCH, MAX_HEARTBEATS_PER_EPOCH_HARD, GB_BYTES, applyStorageTiming, storageTiming,
 } from './provider-ledger.js';
 import type { Block, StoragePayload } from '../core/block.js';
 
@@ -157,12 +156,9 @@ describe('deregistering does not launder the account history', () => {
     // Only the FIRST heartbeat of the day counts: the rest are inside the
     // interval, measured against a clock the attacker cannot destroy.
     expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
-    pl.setAttestedGB(PUB, 100, 1000);   // readers vouch; uptime is what is under test
-    const terms = pl.rewardTerms(PUB, 100);
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 1000 * (1 / MAX_HEARTBEATS_PER_EPOCH)));
-    // ...which is a sixth of the full day it was trying to claim.
-    expect(terms.amount).toBeLessThan(BASE_STORAGE_RATE_MILLI * 1000);
+    // …a sixth of the day it was trying to claim. Uptime still gates the LEASE
+    // even though it no longer meters any payment.
+    expect(pl.submittedInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);
   });
 
   it('still pays an honest provider that churns between real heartbeats', () => {
@@ -191,273 +187,6 @@ describe('deregistering does not launder the account history', () => {
   });
 });
 
-describe('reward terms', () => {
-  /** A full day of heartbeats reporting `storedBytes`, on epoch `day`. */
-  /**
-   * A full day of heartbeats.
-   *
-   * `attest` defaults to true because most tests here are about the reward
-   * ARITHMETIC, and since 2026-09-22 no arithmetic runs at all without
-   * reader-attested volume. Pass false to exercise the fail-closed rule.
-   */
-  function fullDay(pl: ProviderLedger, day: number, storedBytes: number, attest = true): void {
-    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, { storedBytes }), ts);
-    }
-    if (attest) pl.setAttestedGB(PUB, day, storedBytes / GB_BYTES);
-  }
-
-  it('pays for bytes actually held, scaled by uptime', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, 4 * GB_BYTES);
-    const terms = pl.rewardTerms(PUB, 100);
-    expect(typeof terms).not.toBe('string');
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.heartbeatCount).toBe(MAX_HEARTBEATS_PER_EPOCH);
-    expect(terms.storedGB).toBe(4);
-    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 4);
-  });
-
-  /**
-   * Was an ADVERSARIAL CONTROL, now the GUARANTEE — rewritten 2026-09-22
-   * exactly as the original comment predicted it would be.
-   *
-   * The old reward was `BASE_RATE x min(storedGB, capacityAtStart) x uptime`,
-   * and both volume terms came from the provider being paid: `storedBytes`
-   * rode in its own heartbeat and `capacityGB` was whatever it declared.
-   * `validate` checked the claim against terms computed from that same
-   * self-report, so the verification was circular and a provider storing
-   * NOTHING earned the full rate for a declaration.
-   *
-   * Volume is now payable only when readers attest it
-   * (`content/read-receipts.ts`, settled through `storage-settlement.ts`), and
-   * this path FAILS CLOSED: no attestation, no payment. It does not fall back
-   * to the old figures, because paying on unverifiable numbers "just until the
-   * new code lands" is how a temporary measure becomes the live one.
-   */
-  it('GUARANTEE: declaring capacity and self-reporting bytes now earns NOTHING', () => {
-    const HUGE_GB = 10_000;
-    const pl = registered(HUGE_GB, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, HUGE_GB * GB_BYTES, /* attest */ false);
-    // `requireAttested` gates ISSUANCE. Validation deliberately does not use
-    // it: attestation is local state, so gating validation on it would make a
-    // correctly-issued block rejected by peers that had not seen the same
-    // receipts, stranding every later block on the chain.
-    expect(pl.rewardTerms(PUB, 100, { requireAttested: true })).toMatch(/not payable/);
-    // …and a peer validating the same chain is unaffected.
-    expect(typeof pl.rewardTerms(PUB, 100)).not.toBe('string');
-  });
-
-  it('pays only up to what readers attested, never what was self-reported', () => {
-    const pl = registered(10_000, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, 10_000 * GB_BYTES, false);
-    pl.setAttestedGB(PUB, 100, 4);   // readers vouch for 4 GB of the 10,000 claimed
-    const terms = pl.rewardTerms(PUB, 100, { requireAttested: true });
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.storedGB).toBe(4);
-    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 4);
-  });
-
-  it('keeps the declared-capacity ceiling too — attestation does not lift it', () => {
-    // Both bounds apply: never past what was offered, never past what was
-    // witnessed. The tighter one wins.
-    const pl = registered(2, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, 2 * GB_BYTES, false);
-    pl.setAttestedGB(PUB, 100, 500);
-    const terms = pl.rewardTerms(PUB, 100, { requireAttested: true });
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.storedGB).toBe(2);
-  });
-
-  it('sweeps attestations for epochs that can no longer be claimed', () => {
-    // Keyed by a provider an outsider chooses, so it needs a remover
-    // (SCREENING.md -> 1).
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    pl.setAttestedGB(PUB, 90, 5);
-    pl.setAttestedGB(PUB, 100, 5);
-    expect(pl.sweepAttested(95)).toBe(1);
-  });
-
-  it('caps payment at declared capacity — over-reporting bytes earns nothing extra', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, 500 * GB_BYTES);   // claims to hold 50× what it offered
-    const terms = pl.rewardTerms(PUB, 100);
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.storedGB).toBe(10);
-    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 10);
-  });
-
-  it('scales down a partial day of uptime', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < 2; i++) {
-      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, { storedBytes: 6 * GB_BYTES }), ts);
-    }
-    pl.setAttestedGB(PUB, 100, 6);
-    const terms = pl.rewardTerms(PUB, 100);
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 6 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
-  });
-
-  it('prices capacity as it stood at epoch START — a last-minute bump pays nothing', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    fullDay(pl, 100, 900 * GB_BYTES);
-    // Bump the declaration to 900GB near the end of the day being claimed.
-    const late = DAY + REWARD_EPOCH_MS - 60_000;
-    pl.apply(blk('storage-register', late, { capacityGB: 900 }), late);
-    const terms = pl.rewardTerms(PUB, 100);
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.storedGB).toBe(10);   // priced at the 10GB that was declared all day
-  });
-
-  it('pays NOTHING for declared capacity that holds no bytes', () => {
-    // Declared capacity is self-asserted. Paying for it pays for a claim, not
-    // for custody — a provider could declare 1000GB, store nothing, and collect
-    // the full rate forever.
-    const pl = registered(1000, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, { storedBytes: 0 }), ts);
-    }
-    expect(pl.rewardTerms(PUB, 100)).toMatch(/zero/);
-    pl.refresh(DAY + REWARD_EPOCH_MS - 1);
-    expect(pl.providers.get(PUB)!.earningRate).toBe(0);   // the bar agrees with the till
-  });
-
-  it('pays nothing when a heartbeat OMITS the byte count', () => {
-    // `storedBytes` is optional, so "no bytes reported" must mean no reward.
-    // Treating it as "assume full capacity" handed a free full-rate reward to
-    // anyone who simply left the field out.
-    const pl = registered(1000, DAY - REWARD_EPOCH_MS);
-    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, {}), ts);      // no storedBytes at all
-    }
-    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);  // uptime is real
-    expect(pl.rewardTerms(PUB, 100)).toMatch(/zero/);                     // custody is not
-  });
-
-  it('owes nothing for an epoch with no heartbeats, or one already claimed', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    expect(pl.rewardTerms(PUB, 100)).toMatch(/no heartbeats/);
-    fullDay(pl, 100, GB_BYTES);
-    const terms = pl.rewardTerms(PUB, 100);
-    if (typeof terms === 'string') throw new Error(terms);
-    pl.apply(blk('storage-reward', DAY + REWARD_EPOCH_MS, { epochDay: 100 }, BigInt(terms.amount)), DAY + REWARD_EPOCH_MS);
-    expect(pl.rewardTerms(PUB, 100)).toMatch(/already rewarded/);
-  });
-
-  it('settles a day behind, so polling for eligibility cannot lock in a partial day', () => {
-    const pl = registered(10, DAY - 2 * REWARD_EPOCH_MS);   // declared since day 98
-    // Mid-morning on day 100, one heartbeat in. A claim for the RUNNING day would
-    // price at 1/6 uptime and close the epoch for good — the rest of the day's
-    // work would earn nothing. Only the completed day 99 is claimable, and the
-    // provider was offline for it.
-    const morning = DAY + HEARTBEAT_INTERVAL_MS;
-    pl.apply(blk('storage-heartbeat', DAY, { storedBytes: 6 * GB_BYTES }), DAY);
-    expect(claimableEpochDay(morning)).toBe(99);
-    expect(pl.rewardTerms(PUB, claimableEpochDay(morning))).toMatch(/no heartbeats/);
-
-    // The rest of day 100 runs; the next day it is complete and prices on all of it.
-    for (let i = 1; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, { storedBytes: 6 * GB_BYTES }), ts);
-    }
-    pl.setAttestedGB(PUB, claimableEpochDay(DAY + REWARD_EPOCH_MS), 6);
-    const terms = pl.rewardTerms(PUB, claimableEpochDay(DAY + REWARD_EPOCH_MS));
-    if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.epochDay).toBe(100);
-    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 6);   // full day, not 1/6
-  });
-
-  it('owes nothing for a day the provider was not registered', () => {
-    const pl = registered(10, DAY);            // registered ON day 100, not before
-    const ts = DAY + HEARTBEAT_INTERVAL_MS;
-    pl.apply(blk('storage-heartbeat', ts, { storedBytes: GB_BYTES }), ts);
-    expect(pl.rewardTerms(PUB, 100)).toMatch(/not registered at epoch start/);
-  });
-
-  it('does not pay across a gap: leave, come back, and the away days are worth 0', () => {
-    const pl = registered(10, DAY - 10 * REWARD_EPOCH_MS);
-    // Leave on day 98, re-register on day 100 — day 99 must price at 0 capacity.
-    pl.apply(blk('storage-deregister', 98 * REWARD_EPOCH_MS, {}), 98 * REWARD_EPOCH_MS);
-    pl.apply(blk('storage-register', DAY, { capacityGB: 10 }), DAY);
-    expect(pl.capacityAtEpochStart(PUB, 99)).toBe(0);
-    expect(pl.capacityAtEpochStart(PUB, 101)).toBe(10);
-  });
-});
-
-describe('reward validation', () => {
-  function earned(pl: ProviderLedger, day: number): number {
-    for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
-      const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
-      pl.apply(blk('storage-heartbeat', ts, { storedBytes: 8 * GB_BYTES }), ts);
-    }
-    pl.setAttestedGB(PUB, day, 8);
-    const terms = pl.rewardTerms(PUB, day);
-    if (typeof terms === 'string') throw new Error(terms);
-    return terms.amount;
-  }
-
-  it('rejects a reward claiming more than the on-chain evidence supports', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    const max = earned(pl, 100);
-    const ts = DAY + REWARD_EPOCH_MS;
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 100 }, BigInt(max)), ts)).toBeNull();
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 100 }, BigInt(max + 1)), ts)).toMatch(/exceeds maximum/);
-  });
-
-  it('rejects a reward whose declared storedGB overstates what was reported', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    const max = earned(pl, 100);
-    const ts = DAY + REWARD_EPOCH_MS;
-    const err = pl.validate(blk('storage-reward', ts, { epochDay: 100, storedGB: 10 }, BigInt(max)), ts);
-    expect(err).toMatch(/storedGB/);
-  });
-
-  it('may only bill the day before the block that carries it', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    const max = earned(pl, 100);
-    const ts = DAY + REWARD_EPOCH_MS;                 // a block dated day 101
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 100 }, BigInt(max)), ts)).toBeNull();
-    // Billing the running day, or any other day, is malformed — decidable from
-    // the block alone, so every node rejects it identically.
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 101 }, BigInt(max)), ts)).toMatch(/may only claim epoch 100/);
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 99 }, BigInt(max)), ts)).toMatch(/may only claim epoch 100/);
-  });
-
-  it('closes the stale-claim hole: an old day is refused by the rule, not by pruning', () => {
-    // Before this rule, a genuinely-earned day stayed claimable until its
-    // evidence aged out of retention, and only THEN became unverifiable — so the
-    // same block was valid on a node that held the history and rejected by one
-    // that had pruned it. Rejection mid-chain strands every later block.
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    const max = earned(pl, 100);
-    const muchLater = DAY + 60 * REWARD_EPOCH_MS;
-    const err = pl.validate(blk('storage-reward', muchLater, { epochDay: 100 }, BigInt(max)), muchLater);
-    expect(err).toMatch(/may only claim epoch 159/);
-    // The refusal does not depend on whether the evidence is still retained: it
-    // is a property of the block, so it is the same answer on every node forever.
-    expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(MAX_HEARTBEATS_PER_EPOCH);
-  });
-
-  it('rejects a non-positive or malformed reward', () => {
-    const pl = registered(10, DAY - REWARD_EPOCH_MS);
-    earned(pl, 100);
-    const ts = DAY + REWARD_EPOCH_MS;
-    expect(pl.validate(blk('storage-reward', ts, { epochDay: 100 }, 0n), ts)).toMatch(/positive/);
-    expect(pl.validate(blk('storage-reward', ts, {}, 1n), ts)).toMatch(/epochDay/);
-  });
-
-  it('rejects storage blocks from an account that never registered', () => {
-    const pl = new ProviderLedger();
-    expect(pl.validate(blk('storage-heartbeat', DAY, {}), DAY)).toMatch(/not a registered/);
-    expect(pl.validate(blk('storage-deregister', DAY, {}), DAY)).toMatch(/not a registered/);
-    expect(pl.validate(blk('storage-register', DAY, { capacityGB: 0 }), DAY)).toMatch(/positive/);
-  });
-});
-
 describe('score and free space', () => {
   it('meters the earning rate on bytes held, not capacity declared', () => {
     const pl = registered(100, DAY - REWARD_EPOCH_MS);
@@ -468,7 +197,7 @@ describe('score and free space', () => {
     pl.refresh(DAY + REWARD_EPOCH_MS - 1);
     const p = pl.providers.get(PUB)!;
     expect(p.score).toBe(1);                                        // full uptime, no latency data
-    expect(p.earningRate).toBe(BASE_STORAGE_RATE_MILLI * 2);        // 2GB held, not 100 declared
+    expect(p.lastActualStoredBytes).toBe(2 * GB_BYTES);             // 2GB held, not 100 declared
     expect(pl.freeBytes(PUB)).toBe(100 * GB_BYTES - 2 * GB_BYTES);
   });
 

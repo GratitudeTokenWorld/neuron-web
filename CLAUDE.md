@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **812 tests / 88 files passing**, `npm run build` clean.
+Current baseline: **782 tests / 88 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -154,15 +154,16 @@ inherited:
   HTTP. Discovered records are held **separately** from chains we hold: they are
   verified signatures, not verified chain state, so they feed selection and
   never reward validation (`isAuthoritative`).
-- **A reward bills the day before its own block, and only that day**
-  (`claimableEpochDay`, enforced in `validate`). Billing the running day paid a
-  partial day and closed the epoch for good (polling every 30 min locked in 1/6);
-  billing an *old* day would find the evidence pruned past `RETAIN_EPOCHS` and be
-  rejected mid-chain by exactly those nodes that had pruned it. One rule kills
-  both: evidence is always one day old, and the rule is decidable from the block
-  alone, so every node agrees with no retained state. **Issuance must read the
-  clock once** for the claim and the timestamp — twice across midnight builds a
-  block that fails its own validation.
+- **Storage rewards are GONE (deleted 2026-09-22).** The `storage-reward`
+  block type, `rewardTerms`, `BASE_STORAGE_RATE_MILLI`, `createStorageReward`,
+  the issuance timer, `lastRewardEpoch`/`totalEarned`/`earningRate` and their UI
+  are all removed, from both the engine and the legacy `dag-ledger`. Storage
+  minted from numbers the payee supplied; the replacement meters service on
+  reader-signed receipts (`content/read-receipts.ts`), settles through
+  `content/storage-settlement.ts`, and proves custody by sampled reads
+  (`content/custody-sampling.ts`). **The heartbeat remains, as the LEASE only** —
+  it renews custody and no longer touches money. ⚠ Deleting a block type is
+  consensus-visible: wipe before running against an old chain.
 
 **Phase 3's build list is DONE as of 2026-08-15** — all six remaining items
 shipped this session. What is NOT done is verifying them on the live network.
