@@ -182,3 +182,92 @@ export function remainingBudget(args: {
 }): number {
   return Math.max(0, args.perHumanBudget - args.spentByRoot);
 }
+
+// ── Human-readable names ─────────────────────────────────────────────────────
+
+/**
+ * Sub-account names are domain-shaped: `lucian.sensor1` (Lucian, 2026-09-22).
+ *
+ * The label is scoped to its parent, so `lucian.phone` and `maria.phone` can
+ * both exist. That is not only convenient — it removes the global namespace
+ * contention that makes flat username systems a landrush, and it means adding a
+ * device never requires competing for a name.
+ *
+ * ## The security rule that makes this safe
+ *
+ * **A root username may never contain a dot.** Without that rule, somebody
+ * registers the top-level name `lucian.support` and is indistinguishable from
+ * Lucian's sub-account — impersonation with no forgery required, because the
+ * two namespaces would overlap. The dot has to mean exactly one thing.
+ *
+ * The binding is to the parent's **account id**, never to its current username.
+ * A displayed name is derived at render time, so a parent that renames does not
+ * strand or silently re-point its children — and a name that changed underneath
+ * a delegation would be a way to inherit someone else's reputation.
+ */
+export const MAX_LABEL_LENGTH = 32;
+export const MAX_ROOT_LENGTH = 32;
+
+/**
+ * Characters a name may use: lowercase ASCII, digits, hyphen.
+ *
+ * Deliberately narrow. Unicode would let `luciаn` (Cyrillic а) sit beside
+ * `lucian` and read identically — a homograph attack that costs nothing and
+ * defeats every visual check a human can make. Case is excluded for the same
+ * reason: `Lucian` and `lucian` must not be two accounts.
+ */
+const NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
+/** Is this a valid ROOT (human) username? Dots are forbidden here. */
+export function isValidRootName(name: string): boolean {
+  if (name.length === 0 || name.length > MAX_ROOT_LENGTH) return false;
+  if (name.includes('.')) return false;
+  return NAME_RE.test(name);
+}
+
+/** Is this a valid sub-account label — the part after the dot? */
+export function isValidLabel(label: string): boolean {
+  if (label.length === 0 || label.length > MAX_LABEL_LENGTH) return false;
+  return NAME_RE.test(label);
+}
+
+/**
+ * Build a sub-account name, or null if either part is invalid.
+ *
+ * Exactly one dot, exactly two levels — the same depth rule the delegation
+ * graph enforces, expressed in the namespace so the two cannot disagree.
+ */
+export function subAccountName(rootName: string, label: string): string | null {
+  if (!isValidRootName(rootName) || !isValidLabel(label)) return null;
+  return `${rootName}.${label}`;
+}
+
+export interface ParsedName {
+  root: string;
+  /** Undefined for a root account. */
+  label?: string;
+}
+
+/**
+ * Split a name into its root and optional label.
+ *
+ * Returns null rather than guessing for anything malformed — two dots, an empty
+ * part, a bad character. A parser that salvages a malformed name is how
+ * `lucian..support` or `lucian.` end up resolving to something.
+ */
+export function parseName(name: string): ParsedName | null {
+  const parts = name.split('.');
+  if (parts.length === 1) {
+    return isValidRootName(parts[0]!) ? { root: parts[0]! } : null;
+  }
+  if (parts.length !== 2) return null;
+  const [root, label] = parts as [string, string];
+  if (!isValidRootName(root) || !isValidLabel(label)) return null;
+  return { root, label };
+}
+
+/** Does this name belong to `rootName`'s namespace? */
+export function isUnderRoot(name: string, rootName: string): boolean {
+  const p = parseName(name);
+  return !!p && p.root === rootName && p.label !== undefined;
+}

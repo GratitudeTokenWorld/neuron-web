@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   projectEarnings, custodyShareOfEarnings, servingPremium,
   splittingGain, inequalityRatio, DEFAULT_FLEET,
-  claimCost, claimDayFor,
+  claimCost, claimDayFor, claimSlotFor, claimsUnderThreshold,
+  fleetBreakEven, ASSUMED_ANNUAL_COST,
 } from './reward-formula.js';
 
 /**
@@ -169,5 +170,91 @@ describe('claim cadence (Lucian, 2026-09-22)', () => {
   it('is deterministic, so a node can predict its own day without asking', () => {
     expect(claimDayFor('alice', 30)).toBe(claimDayFor('alice', 30));
     expect(claimDayFor('alice', 30)).toBeLessThan(30);
+  });
+});
+
+describe('spreading claims without a fixed day (Lucian, 2026-09-22)', () => {
+  it('never returns a negative slot — the bug this measurement caught', () => {
+    // The first version mixed with `h ^= h >>> 13` and skipped the final
+    // `>>> 0`, so the result was SIGNED and the modulo could come out
+    // negative. Found by counting distinct slots and getting 77,740 in a
+    // 43,200-slot period, which is arithmetically impossible.
+    for (let i = 0; i < 20_000; i++) {
+      const slot = claimSlotFor(`acct${i}`, 43_200);
+      expect(slot).toBeGreaterThanOrEqual(0);
+      expect(slot).toBeLessThan(43_200);
+    }
+  });
+
+  it('turns a daily spike into a continuous trickle', () => {
+    // 30 days of minutes is 43,200 slots. 200k accounts land ~4.6 per slot
+    // instead of 6,667 on one day.
+    const buckets = new Map<number, number>();
+    for (let i = 0; i < 200_000; i++) {
+      const s = claimSlotFor(`acct${i}`, 43_200);
+      buckets.set(s, (buckets.get(s) ?? 0) + 1);
+    }
+    expect(buckets.size).toBeGreaterThan(40_000);
+    // No slot carries a meaningful share of the load.
+    expect(Math.max(...buckets.values())).toBeLessThan(30);
+  });
+});
+
+describe('a minimum claim collapses the volume — the better fix', () => {
+  const EMISSION_L = (SUPPLY * 20_000 / 1e6) / WINDOWS_PER_YEAR;
+  const earnings = new Map(
+    projectEarnings({
+      archetypes: DEFAULT_FLEET, weights: { custodyRate: 1, serviceRate: 3, alpha: 0.9 },
+      emissionPerWindow: EMISSION_L, windowsPerYear: WINDOWS_PER_YEAR,
+    }).rows.map(r => [r.name, r.perYear] as const),
+  );
+
+  it('drops claims 65x by refusing to write a block for a rounding error', () => {
+    // Most accounts earn almost nothing, so most claims would move almost
+    // nothing. Letting those accrue is free: receipts are cumulative and the
+    // baseline only moves at settlement, so waiting loses nobody anything.
+    const none = claimsUnderThreshold({
+      archetypes: DEFAULT_FLEET, earningsPerYear: earnings, minClaim: 0, maxClaimsPerYear: 12.17,
+    });
+    const threshold = claimsUnderThreshold({
+      archetypes: DEFAULT_FLEET, earningsPerYear: earnings, minClaim: 0.1, maxClaimsPerYear: 12.17,
+    });
+    expect(none.totalClaimsPerYear / threshold.totalClaimsPerYear).toBeGreaterThan(60);
+  });
+
+  it('leaves only the accounts with something worth settling', () => {
+    const c = claimsUnderThreshold({
+      archetypes: DEFAULT_FLEET, earningsPerYear: earnings, minClaim: 0.1, maxClaimsPerYear: 12.17,
+    });
+    // Datacentres claim at the cadence; a phone would wait millennia, which is
+    // the correct answer for an amount that rounds to nothing.
+    expect(c.byName.get('datacentre')).toBeCloseTo(12.17, 1);
+    expect(c.byName.get('phone')!).toBeLessThan(0.01);
+  });
+});
+
+describe('can rewards cover the cost of RUNNING a node?', () => {
+  it('answers at the fleet level, which is the honest scale', () => {
+    // Lucian: the reward should not pay for the device, but could cover
+    // running it. At fleet level that is one statement - the annual emission
+    // must be worth roughly what the fleet costs to run.
+    const b = fleetBreakEven({
+      archetypes: DEFAULT_FLEET, annualCostByName: ASSUMED_ANNUAL_COST,
+      annualEmissionUnits: 20_000, supplyUnits: SUPPLY,
+    });
+    expect(b.annualFleetCost / 1e6).toBeCloseTo(16.9, 0);
+    // So a UNIT has to be worth ~$848, i.e. an ~$848M market cap at 1M supply.
+    expect(b.unitPrice).toBeGreaterThan(800);
+    expect(b.unitPrice).toBeLessThan(900);
+  });
+
+  it('scales with the emission rate, not with the formula weights', () => {
+    // The binding constraint is the size of the pool. No choice of
+    // custody:service ratio or alpha changes what the fleet costs to run.
+    const doubled = fleetBreakEven({
+      archetypes: DEFAULT_FLEET, annualCostByName: ASSUMED_ANNUAL_COST,
+      annualEmissionUnits: 40_000, supplyUnits: SUPPLY,
+    });
+    expect(doubled.unitPrice).toBeCloseTo(424, 0);
   });
 });

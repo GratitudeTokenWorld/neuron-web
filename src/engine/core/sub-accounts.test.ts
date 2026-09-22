@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { SubAccountRegistry, remainingBudget, type Delegation } from './sub-accounts.js';
+import {
+  SubAccountRegistry, remainingBudget, subAccountName, parseName,
+  isValidRootName, isValidLabel, isUnderRoot, MAX_ROOT_LENGTH, MAX_LABEL_LENGTH,
+  type Delegation,
+} from './sub-accounts.js';
 
 /**
  * The claim under test: sub-accounts give a human many keys without giving them
@@ -152,5 +156,71 @@ describe('state is bounded', () => {
     r.revoke('phone');
     expect(r.children('alice')).toEqual([]);
     expect(r.size()).toBe(0);
+  });
+});
+
+describe('domain-shaped names (Lucian, 2026-09-22)', () => {
+  it('builds lucian.sensor1 from a root and a label', () => {
+    expect(subAccountName('lucian', 'sensor1')).toBe('lucian.sensor1');
+    expect(parseName('lucian.sensor1')).toEqual({ root: 'lucian', label: 'sensor1' });
+    expect(parseName('lucian')).toEqual({ root: 'lucian' });
+  });
+
+  it('scopes labels to their parent, so two people can both have a phone', () => {
+    // The namespace win: adding a device never competes for a global name.
+    expect(subAccountName('lucian', 'phone')).toBe('lucian.phone');
+    expect(subAccountName('maria', 'phone')).toBe('maria.phone');
+  });
+
+  it('FORBIDS a dot in a root username — the impersonation rule', () => {
+    // Without this, someone registers the top-level name `lucian.support` and
+    // is indistinguishable from Lucian's sub-account. No forgery needed; the
+    // namespaces would simply overlap.
+    expect(isValidRootName('lucian.support')).toBe(false);
+    expect(subAccountName('lucian.support', 'x')).toBeNull();
+    expect(isValidRootName('lucian')).toBe(true);
+  });
+
+  it('rejects anything that is not lowercase ASCII, digits or hyphen', () => {
+    // Unicode would let a Cyrillic homograph sit beside the real name and read
+    // identically, defeating every visual check a human can make. Case is
+    // excluded so `Lucian` and `lucian` cannot be two accounts.
+    expect(isValidRootName('luci\u0430n')).toBe(false); // Cyrillic a
+    expect(isValidRootName('Lucian')).toBe(false);
+    expect(isValidRootName('luci an')).toBe(false);
+    expect(isValidLabel('sensor_1')).toBe(false);
+    expect(isValidLabel('sensor-1')).toBe(true);
+  });
+
+  it('refuses malformed names rather than salvaging them', () => {
+    // A parser that repairs input is how `lucian..support` resolves to
+    // something nobody intended.
+    expect(parseName('lucian..support')).toBeNull();
+    expect(parseName('lucian.')).toBeNull();
+    expect(parseName('.support')).toBeNull();
+    expect(parseName('a.b.c')).toBeNull();
+    expect(parseName('')).toBeNull();
+    expect(parseName('-lucian')).toBeNull();
+    expect(parseName('lucian-')).toBeNull();
+  });
+
+  it('enforces exactly two levels, matching the delegation depth rule', () => {
+    // The namespace and the delegation graph must agree, or one permits what
+    // the other forbids.
+    expect(parseName('lucian.phone.watch')).toBeNull();
+    expect(subAccountName('lucian.phone', 'watch')).toBeNull();
+  });
+
+  it('identifies which names belong to a given human', () => {
+    expect(isUnderRoot('lucian.sensor1', 'lucian')).toBe(true);
+    expect(isUnderRoot('maria.sensor1', 'lucian')).toBe(false);
+    // A root name is not under itself: it IS the human, not a device.
+    expect(isUnderRoot('lucian', 'lucian')).toBe(false);
+  });
+
+  it('bounds name length', () => {
+    expect(isValidRootName('a'.repeat(MAX_ROOT_LENGTH))).toBe(true);
+    expect(isValidRootName('a'.repeat(MAX_ROOT_LENGTH + 1))).toBe(false);
+    expect(isValidLabel('a'.repeat(MAX_LABEL_LENGTH + 1))).toBe(false);
   });
 });
