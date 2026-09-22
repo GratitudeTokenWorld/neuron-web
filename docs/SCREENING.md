@@ -93,9 +93,28 @@ instantiate it, and nothing in the code says so.
 
 The general rule: **independence is a measurement, not an assumption baked into
 a deployment diagram.** Any k-of-n claim should name what it is independent
-*of*. Adding a third attester on unrelated infrastructure is the fix; Lucian's
-laptop is already a third vantage point for probing, which is also what
-`MIN_DISTINCT_PROBERS` needs. **Open.**
+*of*.
+
+**Attempted fix, 2026-09-22: the laptop as a third node.** Measured what it can
+actually do. All three relays agree (generation 19), so the laptop's relay
+federates fine — libp2p dials *outbound* and the gossip meshes merge. But
+inbound is blocked: from relay-1, `http://<laptop>:9090` and `:9092` both
+return `000`, connection refused. So:
+
+| Role | Works? | Why |
+|---|---|---|
+| Third gossip participant / archive | **yes** | outbound dial, mesh merges |
+| Third calibration prober | **yes** | probing is outbound fetches |
+| Storage provider | **yes** | smoke/WebRTC traverses NAT via STUN |
+| Third attester for clients ON the laptop | **yes** | localhost, and this is why dev logs 3 attestations |
+| **Third attester for anyone else** | **no** | clients cannot reach it |
+
+So the laptop closes the prober half (`MIN_DISTINCT_PROBERS`) and adds a genuine
+third failure domain for its own client. It does **not** close the k-of-n
+independence gap for other users, because an attester nobody can reach is not an
+attester. That needs either inbound port-forwarding on Lucian's router, or a
+third relay on a **different hosting provider** — the latter being billable and
+therefore Lucian's call. **Still open for the attester half.**
 
 ### 1e. The reviewer writes the same defect while documenting it
 
