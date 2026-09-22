@@ -226,6 +226,137 @@ signed. If the **publisher pays** for distribution of their own content,
 collusion becomes self-dealing. This module meters what is OWED and never mints,
 so the funding decision is still Lucian's to make.
 
+### 2c. Black-hat pass on "remove the heartbeat, pay per read" (2026-09-22)
+
+Lucian's proposal: drop the heartbeat entirely, prove custody by successful
+reads, set earnings by read/write volume and size, penalise failures inside
+declared capacity, and let users claim manually (>=24 h apart) or automatically
+every 30 days, minted on chain.
+
+Attacked before implementing, per the black-hat skill. **Three of the five
+parts survive; two must change.**
+
+#### B1 - Pay-per-read abandons the long tail. MEASURED, and it destroys data.
+
+The attacker here is not even malicious: it is a **rational provider**. Reads
+for an object are split among its replicas, so marginal earnings equalise at
+`replicas proportional to read rate`. Over a Zipf catalogue that is
+catastrophic (`sim/incentive-coverage.ts`, same fleet and workload, only the
+payment rule changed):
+
+| Payment rule | Objects at full durability | Median replicas | Hottest object |
+|---|---|---|---|
+| Service only (pay per read) | **12.4%** | 2.5 | 124,068 replicas |
+| Custody + service | **100%** | 10.8 | 41,366 replicas |
+
+At merely-adequate capacity, service-only pay puts **17% of the catalogue below
+a single replica** - not under-replicated, deleted. Meanwhile the hottest object
+attracts six figures of voluntary copies, because nothing bounds what providers
+*chase* even though `replicaTarget` bounds what the network *assigns*.
+
+"Custody is proven by reads" is true only for content someone reads. For the
+rest there is no signal at all, and a provider can delete every cold byte while
+looking perfectly healthy on the hot ones.
+
+#### B2 - Proving cold custody by reads costs ~833x a beacon.
+
+If nobody reads it, somebody must issue synthetic reads. That is per **object**;
+a heartbeat is per **provider**. At 10,000 providers holding 5,000 objects each:
+60,000 beacons per window against 50,000,000 spot checks. Removing the heartbeat
+makes proving custody *more* expensive, not less.
+
+#### B3 - The fix: un-chain the heartbeat, do not delete it.
+
+The measured objection was never liveness. It was that a heartbeat is a
+**BLOCK** - 2,555 per provider per year, accruing with the clock and nothing
+else. That is a property of putting it on the chain. **An off-chain gossiped
+beacon gives identical liveness at identical message cost and zero chain
+growth**, which satisfies the invariant's sustained dimension and keeps the
+cold-content signal Lucian's version loses.
+
+So: heartbeat stays as an off-chain **lease**, receipts meter **service**, and
+earnings carry a custody component so the tail survives.
+
+#### B4 - Penalising failures hands every reader a weapon. Do not build it.
+
+The asymmetry is fatal. A false *success* costs the attacker its per-reader cap.
+A false *failure* costs the **victim** its entire income, for free. A single
+malicious reader could delete any provider's earnings by reporting failures
+nobody can check, and "the read failed" is unverifiable by construction - it is
+the absence of an event.
+
+Worse, honest declaration becomes a liability: flood a provider to the capacity
+it truthfully declared, and genuine reads fail inside it. The better it measures
+itself (`calibration.ts`), the cheaper it is to grief.
+
+**Penalise by NON-PAYMENT only.** A provider that fails reads earns less
+automatically, because fewer successes get attested. That is self-limiting,
+needs no failure attestation, and cannot be aimed at anyone.
+
+#### B5 - Minting is the hole, and the fix already exists in the tree.
+
+`economy/rewards.ts` already caps emission at `inflationPpm` of supply and
+**splits it proportionally by contribution weight**. The storage path ignores
+it: `rewardTerms` mints an absolute `BASE_STORAGE_RATE_MILLI x GB x uptime`.
+
+Routing storage pay through the capped pool changes the attack's character
+completely: wash-reading stops **minting** value and starts **diluting** honest
+providers' share. Unbounded theft becomes a share contest, and a share contest
+is winnable by making shares expensive to fake. This is the single highest-value
+change available and it is mostly deletion.
+
+Claim mechanics are otherwise sound: cumulative baselines make double-claiming
+impossible, and a 24 h floor is a bounded per-account rate limit. One fix - a
+30-day automatic claim for everyone is a synchronised herd and a predictable
+settlement spike. Jitter it, as `pollIntervalMs` does elsewhere.
+
+#### B6 - The premise behind the IP/device throttle is not true today.
+
+Lucian's reasoning: a bad actor reading their own content with many accounts is
+not a real worry, because an account needs a real human.
+
+**It does not, in the current build.** `/face-verify/verify` accepts a
+client-supplied 128-float descriptor over HTTP and has never seen a camera -
+liveness is enforced entirely client-side, and custom tooling skips it. The
+relay's real Sybil defences are the per-IP cap and `FACE_MAX` (3 on testnet, 1
+on mainnet). So the price of N fake readers is not N humans; it is defeating a
+client-side check and sourcing N addresses.
+
+The two proposed limits are also weak in different ways:
+
+- **deviceId is self-asserted** - `crypto.randomUUID()` in localStorage. An
+  attacker changes it by typing. It catches honest duplicates only.
+- **IP caps meet IPv6.** A single /64 offers 2^64 addresses, which is already
+  stress-test #2 in SCREENING. Useful against casual abuse, not against anyone
+  prepared.
+
+They are still worth having - but as **one priced layer among several**, never
+as the reason collusion is safe.
+
+#### The resolution that keeps Principle 1 intact
+
+Throttle what **counts for payment**, never what a user may **read**. Reading
+stays free and unlimited; only the earning attestation is rate-limited per IP
+and device. A shared university or CGNAT address then costs nobody their access
+- it costs only the ability to mint extra payable reads from one vantage point,
+which is exactly the behaviour being limited.
+
+#### Revised defences, replacing the four in 2b
+
+1. Self-attestation refused (`reader === provider`).
+2. Per-reader cap on attested bytes.
+3. Distinct-reader floor before anything is payable.
+4. **Capped, proportional emission** - collusion dilutes rather than mints.
+5. **Payable-read throttling per IP/device**, never read throttling.
+6. **No failure attestation anywhere.** Penalty is absence of payment.
+7. **Off-chain liveness beacon** retained, so cold content keeps a custody
+   signal that does not depend on anyone reading it.
+
+Residual, stated plainly: with the identity gate as weak as it currently is,
+(2)+(3)+(4) bound the damage but do not make wash-reading unprofitable. **The
+identity gate is the load-bearing defence for the entire payment system**, and
+it is the thing to strengthen next if UNITS are to mean anything.
+
 ### 3. The stronger move is to remove the payment as well — measured
 
 Applying "what can be REMOVED" one step further: delete the money, and throttle
