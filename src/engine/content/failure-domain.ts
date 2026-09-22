@@ -71,6 +71,22 @@ export const MIN_JOINT_FAILURES = 3;
 export const DOMAIN_PHI_THRESHOLD = 0.8;
 
 /**
+ * Hard ceiling on holders entered into the pairwise sweep.
+ *
+ * The sweep is O(d²) in holders that have actually failed, and `groupable()`
+ * keeps `d` small only while the fleet is healthy — which is not a promise
+ * anyone makes. Measured: 240 holders that all have failure history cost 41 ms
+ * a call. This caps the work whatever the fleet is doing.
+ *
+ * Above the cap the most-failed holders are kept, because they are the ones
+ * carrying evidence. The rest are treated as singletons, which assumes MORE
+ * independence than is proven — the unsafe direction — so the cap is set far
+ * above any set a node has a legitimate reason to compare. A client only ever
+ * compares holders of its OWN content, which is `own files × replicas`.
+ */
+export const MAX_PAIRWISE_HOLDERS = 256;
+
+/**
  * Observation bucket. Derived from the heartbeat so it compresses with
  * `STORAGE_TIMING` like every other storage duration — a fixed bucket would
  * make this untestable under the fast profile.
@@ -144,6 +160,29 @@ export class FailureCorrelation {
   /** Holders with any history. */
   holders(): string[] {
     return [...new Set([...this.up.keys(), ...this.down.keys()])];
+  }
+
+  /**
+   * Holders that could possibly be grouped: those with at least
+   * `MIN_JOINT_FAILURES` observed failures.
+   *
+   * This is what keeps domain inference affordable. A pair needs that many
+   * JOINT failures to be judged at all, so a holder with fewer failures of its
+   * own can never reach the floor with anybody — no arithmetic required. In a
+   * healthy fleet almost every holder has zero, which turns an O(h²) sweep over
+   * all holders into O(d²) over the few that have actually failed.
+   */
+  /** Observed failures for one holder, within the retention window. */
+  failureCount(holder: string): number {
+    return this.down.get(holder)?.size ?? 0;
+  }
+
+  groupable(): Set<string> {
+    const out = new Set<string>();
+    for (const [holder, downs] of this.down) {
+      if (downs.size >= MIN_JOINT_FAILURES) out.add(holder);
+    }
+    return out;
   }
 
   /**
@@ -228,9 +267,23 @@ export function inferDomains(args: {
     }
   }
 
-  for (let i = 0; i < holders.length; i++) {
-    for (let j = i + 1; j < holders.length; j++) {
-      if (correlation.sameDomain(holders[i]!, holders[j]!)) union(holders[i]!, holders[j]!);
+  // Only holders that have failed enough times can possibly be grouped, so the
+  // pairwise sweep runs over those and not over the whole set. Measured: 120
+  // healthy holders cost 10.7 ms the naive way, which is paid per CID per
+  // repair cycle — an O(N) path reintroduced inside the code meant to police
+  // them (SCREENING.md → 9).
+  const groupable = correlation.groupable();
+  let candidates = holders.filter(h => groupable.has(h));
+  if (candidates.length > MAX_PAIRWISE_HOLDERS) {
+    // Keep the holders with the most failure evidence — they are where a
+    // domain is most likely to be found.
+    candidates = [...candidates]
+      .sort((a, b) => correlation.failureCount(b) - correlation.failureCount(a))
+      .slice(0, MAX_PAIRWISE_HOLDERS);
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (correlation.sameDomain(candidates[i]!, candidates[j]!)) union(candidates[i]!, candidates[j]!);
     }
   }
 

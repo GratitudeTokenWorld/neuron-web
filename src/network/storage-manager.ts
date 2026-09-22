@@ -231,7 +231,7 @@ export class StorageManager extends EventEmitter {
    * no agreement at all.
    */
   private holderCapacity(pub: string, now = Date.now()): number {
-    const provider = this.ledger.getStorageProviders().find(p => p.pub === pub);
+    const provider = this.providerOf(pub);
     const declaredClass = provider?.deviceClass as DeviceClass | undefined;
     const declared = provider?.declaredConcurrency
       ?? (declaredClass ? DEFAULT_CONCURRENCY[declaredClass] : undefined);
@@ -272,6 +272,35 @@ export class StorageManager extends EventEmitter {
     return plan.target;
   }
 
+  /**
+   * Drop calibration and co-failure history for providers that no longer
+   * exist.
+   *
+   * Both maps are keyed by a provider public key, and anyone may register as a
+   * provider — so the key is chosen by an outsider and the maps grow with
+   * everyone who ever appeared. That is the shape SCREENING.md → 1 is about,
+   * and it was written into the code that measures capacity while the same
+   * document was being edited. Every keyed structure that outlives a request
+   * names what removes an entry, or it is an attack surface rather than a
+   * cache.
+   */
+  private sweepProviderState(): void {
+    const known = this.ledger.storageProviders;
+    let dropped = 0;
+    for (const pub of [...this.calibrations.keys()]) {
+      if (known.has(pub)) continue;
+      this.calibrations.delete(pub);
+      this.calibratedAt.delete(pub);
+      this.failureCorrelation.forget(pub);
+      dropped++;
+    }
+    if (dropped > 0) {
+      // Say why, rather than returning silently (SCREENING.md → 2).
+      console.log(`[StorageManager] Swept calibration/co-failure history for ${dropped} departed provider(s)`);
+      this.domainCache = undefined;
+    }
+  }
+
   /** Record one probe of a provider — the prober side of calibration. */
   private recordProbe(pub: string, level: number, ok: boolean, latencyMs: number): void {
     let run = this.calibrations.get(pub);
@@ -301,7 +330,7 @@ export class StorageManager extends EventEmitter {
    *   consulted about its own speed, which is the self-report this replaces.
    */
   async calibrateProvider(pub: string, cid: string, maxLevel = 16): Promise<void> {
-    const provider = this.ledger.getStorageProviders().find(p => p.pub === pub);
+    const provider = this.providerOf(pub);
     if (!provider?.smokeAddr) return;
     for (const level of LADDER) {
       if (level > maxLevel) break;
@@ -652,8 +681,19 @@ export class StorageManager extends EventEmitter {
    * collect (ASN, network topology, attested hardware), so it is a real residual
    * risk, not a solved problem.
    */
+  /**
+   * One provider by key. `storageProviders` is already a Map, so the `.find()`
+   * this replaced was a linear scan over the whole fleet — run once per holder,
+   * inside a loop over every tracked CID, i.e. O(cids x holders x providers) per
+   * repair cycle. An O(N) path reintroduced by convenience, which is exactly
+   * what SCREENING.md → 9 is about.
+   */
+  private providerOf(pub: string): StorageProvider | undefined {
+    return this.ledger.storageProviders.get(pub);
+  }
+
   private providerDomain(pub: string): string {
-    const p = this.ledger.getStorageProviders().find(x => x.pub === pub);
+    const p = this.providerOf(pub);
     return p?.deviceId ? `dev:${p.deviceId}` : `pub:${pub}`;
   }
 
@@ -665,16 +705,45 @@ export class StorageManager extends EventEmitter {
    * separates them is observed co-failure — two holders that go down together
    * count once, however distinct their identifiers (failure-domain.ts).
    */
+  private domainCache?: { map: Map<string, string>; at: number };
+
+  /**
+   * Domain inference is CACHED node-wide, not computed per CID.
+   *
+   * The first version called `inferDomains` on every `liveHolderCount` — eleven
+   * call sites, several inside a loop over every tracked CID — and the sweep is
+   * quadratic in holders with failure history. Measured at 41 ms a call for 240
+   * such holders, which a thousand tracked CIDs would turn into 41 seconds of
+   * arithmetic per repair cycle. That is an O(N) path reintroduced for
+   * convenience inside the code written to police them.
+   *
+   * Caching is safe because of what is being measured: co-failure accumulates
+   * over a retention window of a week, so the answer cannot change materially
+   * between refreshes. Recomputing it per CID was never buying freshness, only
+   * cost.
+   */
   private domainOf(pubs: Iterable<string>): (pub: string) => string {
-    const list = [...new Set(pubs)];
-    const map = inferDomains({
-      holders: list,
-      correlation: this.failureCorrelation,
-      declared: pub => {
-        const p = this.ledger.getStorageProviders().find(x => x.pub === pub);
-        return p?.deviceId ? `dev:${p.deviceId}` : undefined;
-      },
-    });
+    const now = Date.now();
+    const ttl = HEARTBEAT_INTERVAL_MS / 4;
+    if (!this.domainCache || now - this.domainCache.at > ttl) {
+      // Inferred over everyone we know about, once, rather than over each CID's
+      // holders separately — the union is what the cache is for.
+      this.domainCache = {
+        at: now,
+        map: inferDomains({
+          holders: [...this.ledger.storageProviders.keys()],
+          correlation: this.failureCorrelation,
+          declared: pub => {
+            const p = this.providerOf(pub);
+            return p?.deviceId ? `dev:${p.deviceId}` : undefined;
+          },
+        }),
+      };
+    }
+    const map = this.domainCache.map;
+    // `pubs` is accepted so callers read naturally and so a holder we have no
+    // record of still gets a stable identity of its own.
+    void pubs;
     return pub => map.get(pub) ?? this.providerDomain(pub);
   }
 
@@ -1170,6 +1239,7 @@ export class StorageManager extends EventEmitter {
     // and their entries are dropped here. Doing it in a loop that already runs
     // avoids a timer whose only job is to prevent a leak (SCREENING.md → 1).
     this.signals.sweepDemand();
+    this.sweepProviderState();
     if (this.trackedCids.size === 0) return;
     if (this.selectProviders(1).length === 0) return;
     const now = Date.now();

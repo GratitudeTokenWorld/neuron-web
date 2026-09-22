@@ -97,6 +97,34 @@ a deployment diagram.** Any k-of-n claim should name what it is independent
 laptop is already a third vantage point for probing, which is also what
 `MIN_DISTINCT_PROBERS` needs. **Open.**
 
+### 1e. The reviewer writes the same defect while documenting it
+
+Self-review of 2026-09-22 found **four** instances of items 1 and 9 in code
+added that same day, by the same author, alongside the text warning about them:
+
+- `CalibrationRun.samples` grew forever — every spot check pushed one and
+  nothing removed any. Measured: 100k samples cost 17.9 ms per `analyze()`, and
+  `analyze()` runs per holder per target computation. Now capped per rung.
+- `inferDomains` ran a quadratic sweep **per CID per repair cycle**. Measured
+  41 ms a call at 240 holders with failure history; a thousand tracked CIDs
+  would have spent 41 seconds per cycle. Now capped and cached node-wide.
+- `providerDomain`/`holderCapacity` did `getStorageProviders().find()` — a
+  linear scan past an existing `Map` — once per holder inside a loop over every
+  tracked CID.
+- `calibrations`/`calibratedAt` were keyed by provider public key with no
+  remover, and anyone may register as a provider.
+
+The general lesson is not "be careful". It is that **new state and new loops
+need the checklist run against them explicitly, by someone reading the diff for
+that purpose** — knowing the rule does not apply it. A useful trigger: any new
+`Map`/`Set`/array field, and any call inside a loop over tracked content.
+
+One more, worth its own line: **the first fix was insufficient and the test
+written for it flattered the fix.** Skipping holders with no failure history
+made a *healthy* fleet cheap, and the test used a healthy fleet — so it passed
+while the realistic case (every holder has some failures) stayed quadratic. Ask
+what workload the test is using, and whether it is the easy one.
+
 ### 2. Silent returns
 
 A `return` with no log is indistinguishable from "the message never arrived",

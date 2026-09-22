@@ -222,3 +222,53 @@ describe('a single prober can measure itself by mistake', () => {
     expect(res.maxConcurrentReads).toBeGreaterThan(0);
   });
 });
+
+describe('sample history is bounded', () => {
+  it('caps samples per rung instead of growing forever', () => {
+    // The defect: every spot check pushed a sample and nothing removed any, so
+    // the array grew for the life of the process. Measured before the cap,
+    // 100k samples cost 17.9 ms per analyze() — and analyze() runs per holder
+    // per target computation. Unbounded in time is half the invariant.
+    const r = new CalibrationRun();
+    for (let i = 0; i < 10_000; i++) {
+      r.add({ level: 1, size: 'small', ok: true, latencyMs: 100, prober: `p${i % 3}` });
+    }
+    expect(r.size()).toBeLessThanOrEqual(CalibrationRun.MAX_PER_LEVEL);
+  });
+
+  it('keeps the newest samples, because capacity is a property of NOW', () => {
+    // A sample from last week is not evidence about this afternoon: a laptop
+    // moves from ethernet to a train. Recency is correct on the merits, not
+    // only convenient for memory.
+    const r = new CalibrationRun();
+    for (let i = 0; i < 100; i++) {
+      r.add({ level: 1, size: 'small', ok: true, latencyMs: 10, prober: 'old' });
+    }
+    for (let i = 0; i < CalibrationRun.MAX_PER_LEVEL; i++) {
+      r.add({ level: 1, size: 'small', ok: true, latencyMs: 500, prober: 'new' });
+    }
+    expect(r.analyze().distinctProbers).toBe(1);
+  });
+
+  it('bounds each rung separately, so a ladder keeps every rung', () => {
+    const r = new CalibrationRun();
+    for (const level of [1, 2, 4, 8]) {
+      for (let i = 0; i < 100; i++) {
+        r.add({ level, size: 'small', ok: true, latencyMs: 100, prober: `p${i % 3}` });
+      }
+    }
+    // Four rungs retained, each capped — not one rung's worth in total.
+    expect(r.size()).toBe(4 * CalibrationRun.MAX_PER_LEVEL);
+    expect(r.analyze().levelsJudged).toBe(4);
+  });
+
+  it('stays fast however long the node runs', () => {
+    const r = new CalibrationRun();
+    for (let i = 0; i < 50_000; i++) {
+      r.add({ level: (i % 4) * 2 || 1, size: 'small', ok: true, latencyMs: 100, prober: `p${i % 3}` });
+    }
+    const t0 = performance.now();
+    for (let i = 0; i < 50; i++) r.analyze();
+    expect((performance.now() - t0) / 50).toBeLessThan(2);
+  });
+});
