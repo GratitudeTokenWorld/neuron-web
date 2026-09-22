@@ -236,7 +236,27 @@ every 30 days, minted on chain.
 Attacked before implementing, per the black-hat skill. **Three of the five
 parts survive; two must change.**
 
-#### B1 - Pay-per-read abandons the long tail. MEASURED, and it destroys data.
+#### B1 - CORRECTED: this attacked a rule Lucian did not propose.
+
+The first pass modelled earnings from reads and **nothing for holding**. The
+proposal is a **"replicas + reads" score**, which already contains the replica
+term, and that is the hybrid row below scoring 100%. The objection does not
+apply to the design.
+
+Two things it got wrong, worth keeping so they are not repeated:
+
+- It was framed as a black-hat finding and it is not one. **Nobody is
+  cheating.** Content is hash-addressed, so a provider cannot fake a response:
+  wrong bytes fail the CID check and right bytes require having them. Lucian's
+  reasoning there is correct and is the foundation of everything below.
+- Filed under "attack", an incentive result reads as an accusation. It is a
+  statement about what rational honest providers keep when space is finite.
+
+What survives is a **guardrail**, not a criticism: the numbers below show why
+the replica term must stay in the score. Drop it and the tail dies — not to
+fraud, but to arithmetic.
+
+#### B1a - Why the replica term cannot be dropped later (the guardrail)
 
 The attacker here is not even malicious: it is a **rational provider**. Reads
 for an object are split among its replicas, so marginal earnings equalise at
@@ -258,7 +278,38 @@ attracts six figures of voluntary copies, because nothing bounds what providers
 rest there is no signal at all, and a provider can delete every cold byte while
 looking perfectly healthy on the hot ones.
 
-#### B2 - Proving cold custody by reads costs ~833x a beacon.
+#### B2 - CORRECTED and SOLVED: sampling, not exhaustive checking.
+
+The 833x figure assumed "proof by read" meant reading **every** object. It does
+not. Reading a random **few** per provider per round gives the same assurance at
+`O(providers)` — `engine/content/custody-sampling.ts`.
+
+A provider claiming `n` objects is challenged on `k` of them, chosen from a seed
+it cannot pick (the consensus VRF, which is publicly verifiable so the selection
+is auditable). Holding only fraction `f`, it survives with probability `f^k`.
+
+| Actually holds | k=5, one round | k=5 over 6 rounds | k=5 over 24 rounds |
+|---|---|---|---|
+| 50% | 96.9% caught | ~100% | ~100% |
+| 90% | 41.0% | **95.8%** | ~100% |
+| 99% | 4.9% | 26.0% | **70.1%** |
+
+One round is deliberately weak; **detection compounds**, because the provider
+must survive every round for the life of the lease. Cost at 10,000 providers
+holding 5,000 objects each: **50,000 challenges against 50,000,000** — 1,000x
+cheaper, and identical whether a provider holds 100 objects or 100,000.
+
+And these challenges *are* successful reads, exactly as Lucian specified. The
+only addition is that some of them are issued by auditors rather than users, so
+that content nobody reads still has a signal.
+
+**The honest framing: this is priced, not proven.** Cryptography cannot stop a
+provider deleting bytes. `cheatingExpectedValue` makes the trade explicit — with
+a penalty worth more than the storage saved, cheating is negative-value at every
+level tested; make the penalty small enough and it flips. The penalty size is
+the real security parameter.
+
+#### B2-old - The superseded figure
 
 If nobody reads it, somebody must issue synthetic reads. That is per **object**;
 a heartbeat is per **provider**. At 10,000 providers holding 5,000 objects each:
@@ -310,7 +361,110 @@ impossible, and a 24 h floor is a bounded per-account rate limit. One fix - a
 30-day automatic claim for everyone is a synchronised herd and a predictable
 settlement spike. Jitter it, as `pollIntervalMs` does elsewhere.
 
-#### B6 - The premise behind the IP/device throttle is not true today.
+#### B1b - The custody term is BYTES HELD, not replica count (Lucian, 2026-09-22)
+
+Refinement, and it is the right one. A replica count is a **network** property:
+how many copies of an object exist. A provider neither knows nor controls it.
+What a provider has is **bytes**, and what it did is **reads served**. So:
+
+```
+weight = custodyRate x verifiedBytesHeld  +  serviceRate x bytesServed
+```
+
+Three consequences:
+
+- **Per-byte is the fair measure.** Paying per *object* would reward holding
+  many tiny files; per byte, a small file earns proportionally less and costs
+  proportionally less space, so the provider is indifferent to file size and
+  simply fills its disk. (Small residual: per-object overheads — manifest,
+  tracking, challenge participation — are not per-byte, so very small files are
+  marginally unattractive. Worth watching, not worth a rule yet.)
+- **The coverage result is unchanged.** `sim/incentive-coverage.ts` models a
+  custody term per unit of space held; whether that unit is an object or a byte
+  does not move the conclusion, because the term is constant per unit either
+  way. Cold content still earns, so it is still kept.
+- **This is the shape the current system already has** — `BASE_RATE x storedGB`.
+  The formula was never the defect. *Who reports `storedGB`* was. Sampled
+  challenges (B2) turn that same term from self-reported into attested, which
+  is the whole repair.
+
+**One distinction that decides whether this is safe:** pay on **verified bytes
+held**, never on **declared capacity**. Declared capacity is a promise, and
+paying for a promise is precisely the defect being removed. Capacity keeps its
+two real jobs — gating how much a provider may be assigned, and (as measured
+concurrency, `calibration.ts`) deciding how much traffic to route at it — and
+touches the money nowhere.
+
+#### B5a - Two updateable per-account objects (Lucian, 2026-09-22)
+
+Replace per-file minting with **two records per account, each replaced rather
+than appended**:
+
+- a **publish record** — the account's own file index, as an uploader;
+- a **service record** — replicas held, bytes served, reads served, as a
+  provider.
+
+Two rather than one because the roles have different attestors and different
+lifetimes: a publish record is authored by its owner, a service record is only
+credible when signed by *other* people. Merging them would let one signature
+cover both, which is the self-attestation defect again.
+
+**Where they live so an update is really an update.** The record itself is
+content-addressed and off-chain; what goes on the chain is its **root**, a
+single field replaced at settlement — the same shape as a balance, and the
+engine already keeps a per-account Merkle accumulator for exactly this. So the
+chain grows by one settlement per claim, not per file and not per read. At a
+24 h manual floor and a 30-day automatic claim, that is at most ~15 blocks per
+account per year against the heartbeat design's 2,555.
+
+This also answers "where should the values live" from the original proposal:
+concatenated and compressed in the off-chain record, committed by one root
+on-chain.
+
+#### B6 - CORRECTED: screened under one human = one account.
+
+The previous pass screened against the *current dev build*, where
+`/face-verify/verify` accepts a client-supplied descriptor. That is the
+synthetic-face bypass on CLAUDE.md's **Remove before production** list — a
+temporary testing feature, not the design. Screening a permanent economic
+mechanism against a temporary bypass was the wrong baseline, and the conclusion
+it produced was wrong with it.
+
+**Under one-human-one-account, the defences hold:**
+
+- Each fake reader costs **a human**. That is the strongest Sybil price any
+  system of this kind has.
+- The per-reader cap bounds what one human can attest per epoch.
+- The distinct-reader floor requires at least three.
+- Capped proportional emission means a colluding set **dilutes** honest
+  providers rather than minting new value.
+
+Together: collusion earnings scale linearly with humans recruited, each
+contributing at most the cap, out of a fixed pool. That is bounded, priced, and
+the same residual every proof-of-personhood economy carries.
+
+**The residual attack, named honestly: a paid read farm.** Bribe real humans to
+read your content. It works, it is legal-looking, and it is limited only by
+whether the share of emission earned exceeds what the humans cost. Nothing in
+the receipt design changes that; the defence is that the pool is capped, so the
+farm competes against every honest provider for a fixed prize and the marginal
+return falls as the farm grows.
+
+**Forward-looking finding, because it is already planned.** Lucian intends
+sub-accounts and domain-based accounts for IoT. Those would **reintroduce the
+Sybil surface through the back door**: if one human can mint many device
+accounts and each device account carries its own payable-read budget, the cap
+becomes per-account rather than per-human and the entire pricing argument above
+collapses. **Device and sub-accounts must draw on their parent's payable-read
+budget, never receive their own.** That constraint is cheap to honour now and
+very expensive to retrofit after IoT accounts exist.
+
+The IP and device limits keep their place as a secondary priced layer — a farm
+needs distinct addresses as well as distinct humans — with the same rule as
+before: throttle what counts for **payment**, never what a user may **read**,
+so that a family, an office or a CGNAT range never loses access.
+
+#### B6-old - The superseded reasoning
 
 Lucian's reasoning: a bad actor reading their own content with many accounts is
 not a real worry, because an account needs a real human.

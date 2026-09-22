@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { coverage, custodyProofCost } from './incentive-coverage.js';
 
 /**
- * Hypothesis H-P5: paying purely on read/write volume is safe, because a
- * provider that serves is demonstrably holding.
+ * Hypothesis H-P5: a payment rule is also a rule about which content survives,
+ * because providers have finite space and keep whatever earns.
  *
- * Disproved by: content that nobody reads losing its replicas, since a payment
- * rule with finite provider space is also a rule about what survives.
+ * Tested by comparing a reads-only rule against "replicas + reads". Note that
+ * neither is a question about FRAUD: content is hash-addressed, so a provider
+ * cannot fake a response at all. This is purely about what a rational, honest
+ * provider chooses to keep.
  *
  * ASSUMED throughout: Zipf popularity, rational capacity-bound providers, and a
  * fleet with 50% more space than the floor needs. The sociology of early
@@ -23,7 +25,17 @@ const BASE = {
 /** Room for every object at the target, plus half again. */
 const SLOTS = BASE.objects * BASE.redundancyTarget * 1.5;
 
-describe('H-P5 is DISPROVED: pay-per-read abandons the tail', () => {
+/**
+ * CORRECTION (2026-09-22). These cases model `custodyWeight: 0` — earnings from
+ * reads and NOTHING for holding. That is not what Lucian proposed: his score is
+ * "replicas + reads", which is the hybrid below and which scores 100%.
+ *
+ * So this block does not describe his design. It is kept because it establishes
+ * WHY the replica term has to be in the score — remove it and the tail dies —
+ * and because a reads-only rule is the obvious simplification somebody will
+ * propose again. It is a guardrail, not a criticism.
+ */
+describe('reads-only pay (NOT the proposal) abandons the tail', () => {
   it('leaves seven objects in eight below the durability target', () => {
     const r = coverage({ ...BASE, totalSlots: SLOTS, custodyWeight: 0, serviceWeight: 1 });
     // Reads are split among replicas, so marginal value equalises at
@@ -58,7 +70,7 @@ describe('H-P5 is DISPROVED: pay-per-read abandons the tail', () => {
   });
 });
 
-describe('a custody component fixes it, and that is the whole argument', () => {
+describe('replicas + reads — the actual proposal — keeps everything durable', () => {
   it('keeps every object durable at the same fleet size', () => {
     const r = coverage({ ...BASE, totalSlots: SLOTS, custodyWeight: 1, serviceWeight: 1 });
     // Identical capacity, identical workload; only the payment rule changed.

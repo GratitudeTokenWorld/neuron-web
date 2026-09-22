@@ -43,7 +43,15 @@ export interface CoverageParams {
   totalReadsPerWindow: number;
   /** Total object-slots across the whole fleet (providers × slots each). */
   totalSlots: number;
-  /** Earnings per object HELD per window, whether or not it is read. */
+  /**
+   * Earnings per unit of space HELD per window, whether or not it is read.
+   *
+   * Lucian, 2026-09-22: the real term is **bytes held**, not replica count — a
+   * replica count is a network property a provider neither knows nor controls.
+   * Modelled per slot here because the conclusion does not depend on the unit:
+   * the term is constant per unit of space either way, so cold content earns
+   * and is therefore kept.
+   */
   custodyWeight: number;
   /** Earnings per read served. */
   serviceWeight: number;
