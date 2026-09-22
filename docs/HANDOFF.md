@@ -85,9 +85,18 @@ provider/uploader collusion is unfixable by any proof) or the uploader pays.
    sustained load test. Receiver-side inbound admission and the per-sender share
    of the pending-send index belong here too (ARCHITECTURE.md → *Fan-IN at a
    billion followers*).
-2. **Multi-device custody** (decided, unbuilt): per-device chains with an
+2. **Finish calibration — the ladder is INERT.** `calibrateProvider` is written
+   and tested but **has no callers**, so only level-1 samples arrive (from spot
+   checks) and `confident` needs two judged rungs. Under `requireMeasured` every
+   provider therefore sits at the floor capacity of 1. Not dangerous — the
+   saturation maths stays conservative and falls back to the read-rate curve
+   when there is no demand evidence — but the feature does nothing until
+   something schedules it. Needs: a cadence (jittered, per `pollIntervalMs`), a
+   rule for which provider to probe, and Lucian's laptop as a third prober so
+   `MIN_DISTINCT_PROBERS` can be met at all.
+3. **Multi-device custody** (decided, unbuilt): per-device chains with an
    account-signed delegation. Settle the pseudonymous device-group tag first.
-3. **The migration seam**, per caller — 121 app-layer type errors.
+4. **The migration seam**, per caller — 121 app-layer type errors.
 
 ## Traps that each cost a debugging cycle — do not repeat
 
