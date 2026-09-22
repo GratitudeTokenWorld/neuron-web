@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **605 tests / 78 files passing**, `npm run build` clean.
+Current baseline: **621 tests / 79 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -242,6 +242,16 @@ below).
   tidiness beating durability — it deleted redundancy the network had already
   paid bandwidth to create. Over-replication is cheap; under-replication is the
   risk (PRINCIPLES.md → 3, CUSTODY-PROOFS.md → Reframe).
+- **Replication above the floor is driven by measured SATURATION, not a read
+  count** (Lucian, 2026-09-22; `engine/content/device-capacity.ts`). Nodes
+  declare a device class with a concurrent-read limit, so ten phones and ten
+  servers are not the same fleet; a CID gets another holder when reader-observed
+  concurrency passes `HIGH_WATER` of its holders' aggregate capacity, and sheds
+  back to the floor below `LOW_WATER`. **The trigger is reader-observed** — a
+  holder that could declare itself full would be able to conscript storage on
+  other people's disks from one message. The band is wide and release is
+  forbidden when it would re-saturate, because releasing raises the ratio and a
+  narrow band oscillates forever.
 - **Every file keeps at least `REDUNDANCY_TARGET` (10) copies, and popular
   files get more — then give them back.** Demand is a **sliding-window read
   rate**, never a lifetime counter (fixed 2026-09-22: a lifetime counter only

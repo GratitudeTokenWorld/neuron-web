@@ -959,6 +959,90 @@ measured it. Holder serving capacity is assumed too, and Principle 1 guarantees
 a long low tail of small devices. **Both must be measured before the curve is
 tuned further** — tuning it now would be fitting a constant to an assumption.
 
+### Saturation-driven replication, screened (proposed by Lucian 2026-09-22)
+
+**The proposal.** Give each node a concurrent-read limit set by what kind of
+device it is — a phone cannot take what a server can, detected or declared.
+When a CID's holders reach that limit, place another permanent copy; when demand
+falls, shed back to `REDUNDANCY_TARGET`. "This will ensure the network is never
+over capacity and makes it performant."
+
+**Verdict: adopt, with two changes.** It replaces an open loop with a closed
+one, which is the right move — `replicaTarget` maps a read rate to a holder
+count through a curve calibrated on nothing, unable to know the object's size,
+the holders' speed, or whether caches already absorbed the spike. Saturation is
+the quantity we actually care about, measured instead of inferred. It also
+retires the largest unmeasured input in `sim/demand-replication.ts`: holder
+serving capacity stops being an assumption and becomes an observation.
+Implemented in `engine/content/device-capacity.ts`.
+
+#### SECURITY — the gate, and it is where the design changes
+
+1. **The saturation signal must be observed by READERS, never self-reported by
+   holders.** A holder that can say "I am full" and thereby cause a new copy
+   has turned one cheap message into real storage on someone else's disk. That
+   is capacity conscription, and it is the self-metered reward finding
+   (SCREENING.md → 11) pointed at storage instead of money. `planBySaturation`
+   therefore takes reader-observed concurrency; a holder's declaration is used
+   only to *interpret* it.
+2. **Under-declaring is the attack, not over-declaring** — the direction that is
+   easy to miss. Claiming to be a phone wins a smaller share of the work while
+   still counting toward the replica floor: a lazy holder, paid in redundancy
+   credit for doing less. Over-declaring is self-punishing, since failing to
+   serve is exactly what readers measure. The answer is the one the reciprocity
+   work already reached: credit follows *observed service*, so declaring little
+   earns little.
+3. **The cap stays, and this is why the loop cannot be fully closed.** Demand is
+   ultimately a number an attacker can generate, so an uncapped loop converts
+   fake reads into real storage on strangers' disks. `MAX_REPLICA_TARGET` is
+   what bounds that.
+4. **New minor surface:** a device class is a fingerprinting signal. The ladder
+   is coarse (six values) partly for that reason.
+
+#### PERFORMANCE — clearly better, with a control-theory caveat
+
+Closed-loop on measured utilisation beats open-loop on a guessed rate, and it
+handles heterogeneity that a read count cannot express at all: ten phones and
+ten servers holding the same CID under the same demand now produce opposite
+decisions, correctly.
+
+The caveat is **lag**: placing a copy takes a transfer, so the loop always reacts
+one replication delay late. Two mitigations, both tested:
+
+- `HIGH_WATER` is 0.75, not 1.0 — react before saturation, not at it.
+- A saturated CID closes the **whole** capacity gap at once rather than adding
+  one holder per cycle, which would cost a replication delay per increment.
+
+And **oscillation**, which is the failure mode a naive version would ship with:
+releasing a holder RAISES the utilisation ratio, so a narrow band would release,
+re-saturate, re-place, forever — paying a transfer per cycle to hold the same
+number of copies. Hence a wide hysteresis band (0.35–0.75) and an explicit rule
+that nothing is released if releasing it would push the ratio back above
+`HIGH_WATER`. `device-capacity.test.ts` drives the loop to a fixed point in both
+directions rather than asserting that it should reach one.
+
+#### DECENTRALISATION — a direct gain, and it is the Principle 1 argument
+
+A uniform read limit is a **resource floor in disguise**: it either excludes
+small devices or assigns them work they cannot do. Declaring capacity lets a
+phone participate honestly at a phone's scale, which is what "runs on as many
+kinds of device as possible" has to mean operationally. No required party, no
+coordination, all local observation.
+
+#### What the proposal does NOT do, stated against its own claim
+
+"Never over capacity" holds **per CID, for honest demand**. Three limits:
+
+- The loop allocates shares of capacity; it cannot create capacity. When the
+  whole fleet is saturated, every CID asking for more holders finds none, and
+  the answer there is admission control and throttling, not more copies.
+- Saturation is only measurable where there is traffic, so cold content is still
+  governed by the durability floor alone — which is correct, and is why
+  `REDUNDANCY_TARGET` is untouched by any of this.
+- The default per-class concurrency numbers are **ASSUMED** (PRINCIPLES.md → 5).
+  They are starting points for `calibratedCapacity` to correct, not findings,
+  and they are labelled that way in the source.
+
 **A copy means a new NODE** (Lucian, 2026-09-22): "two accounts on one machine
 must not count as separate replicas". Distinctness is by **failure domain**, not
 by public key. `planRepair` takes a `domainOf` mapper, counts live holders by
