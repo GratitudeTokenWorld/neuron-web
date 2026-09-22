@@ -526,3 +526,47 @@ describe('planRepair releases surplus when demand falls', () => {
     expect(under.add.length).toBeGreaterThan(0);
   });
 });
+
+describe('concurrentReads — derived, and honest about not knowing', () => {
+  const t0 = 2_000_000_000;
+
+  it('is zero without a service-time sample, meaning NO EVIDENCE not no demand', () => {
+    // The distinction the caller must respect: a CID being read hard with no
+    // latency recorded yet is unmeasured, and falling back to the read-rate
+    // curve is the correct response to that, not planning for zero load.
+    const s = new CustodySignals();
+    for (let i = 0; i < 50; i++) s.recordRead('cid', t0);
+    expect(s.reads('cid', t0)).toBe(50);
+    expect(s.concurrentReads('cid', t0)).toBe(0);
+  });
+
+  it("applies Little's Law: concurrency = rate x service time", () => {
+    const s = new CustodySignals();
+    const window = demandWindowMs();
+    // 100 reads in the window, each taking 1% of the window to serve.
+    for (let i = 0; i < 100; i++) s.recordRead('cid', t0, window * 0.01);
+    // L = (100 / window) x (0.01 x window) = 1.0
+    expect(s.concurrentReads('cid', t0)).toBeCloseTo(1, 5);
+  });
+
+  it('rises with slower service at the same rate — a slow holder IS more loaded', () => {
+    const window = demandWindowMs();
+    const fast = new CustodySignals();
+    const slow = new CustodySignals();
+    for (let i = 0; i < 100; i++) {
+      fast.recordRead('cid', t0, window * 0.01);
+      slow.recordRead('cid', t0, window * 0.04);
+    }
+    expect(slow.concurrentReads('cid', t0)).toBeGreaterThan(fast.concurrentReads('cid', t0) * 3);
+  });
+
+  it('cannot get stuck — both inputs decay, unlike an in-flight gauge', () => {
+    // An in-flight counter that misses a decrement reports phantom load
+    // forever and quietly conscripts replicas. This estimate falls to zero on
+    // its own when reading stops.
+    const s = new CustodySignals();
+    for (let i = 0; i < 100; i++) s.recordRead('cid', t0, 50);
+    expect(s.concurrentReads('cid', t0)).toBeGreaterThan(0);
+    expect(s.concurrentReads('cid', t0 + demandWindowMs() + 1)).toBe(0);
+  });
+});

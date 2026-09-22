@@ -227,6 +227,16 @@ export interface StorageProviderState {
   registeredAt: number;
   /** Declared capacity (GB) from the latest register block: an upper bound, not a claim of usage. */
   capacityGB: number;
+  /**
+   * Declared device class and concurrent-read offer from the register block.
+   *
+   * Both are self-reported, so they are a STARTING POINT for calibration and
+   * never an answer: `effectiveCapacity` prefers what probers measured, and in
+   * mandatory mode ignores these entirely until a measurement exists
+   * (content/calibration.ts).
+   */
+  deviceClass?: string;
+  declaredConcurrency?: number;
   /** Bytes actually held, as of the latest heartbeat that reported them. */
   lastActualStoredBytes: number;
   /** Timestamp of the most recent *counted* heartbeat — the lease renewal clock. */
@@ -543,6 +553,8 @@ export class ProviderLedger {
   private applyRegister(block: Block): void {
     const pub = block.accountId;
     const capacityGB = block.storage?.capacityGB ?? 0;
+    const deviceClass = block.storage?.deviceClass;
+    const declaredConcurrency = block.storage?.declaredConcurrency;
     const existing = this.providers.get(pub);
     // Seed from the durable record, so a deregister/re-register cycle inherits
     // the account's real registration age and heartbeat clock instead of a fresh
@@ -554,6 +566,8 @@ export class ProviderLedger {
       deviceId: block.storage?.deviceId ?? existing?.deviceId ?? '',
       registeredAt: d.firstRegisteredAt,
       capacityGB,
+      deviceClass,
+      declaredConcurrency,
       lastActualStoredBytes: existing?.lastActualStoredBytes ?? 0,
       lastHeartbeat: d.lastHeartbeat,
       heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,

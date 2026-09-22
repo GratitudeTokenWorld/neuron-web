@@ -540,8 +540,14 @@ export class CustodySignals {
     return `${cid} ${pub}`;
   }
 
+  /**
+   * Mean service time per CID, as an EWMA — the second half of the concurrency
+   * estimate. Kept beside the rate because the two are only meaningful together.
+   */
+  private readonly latencyMs = new Map<string, number>();
+
   /** A successful read of this CID — demand, which feeds `replicaTarget`. */
-  recordRead(cid: string, now: number = Date.now()): void {
+  recordRead(cid: string, now: number = Date.now(), serviceMs?: number): void {
     const idx = this.bucketIndex(now);
     let e = this.advance(cid, now);
     if (!e) {
@@ -549,6 +555,34 @@ export class CustodySignals {
       this.demand.set(cid, e);
     }
     e.buckets[idx % DEMAND_BUCKETS]! += 1;
+    if (serviceMs !== undefined && serviceMs > 0) {
+      const prev = this.latencyMs.get(cid);
+      // EWMA at 0.3: recent enough to track a change in conditions, smooth
+      // enough that one slow fetch does not rewrite the estimate.
+      this.latencyMs.set(cid, prev === undefined ? serviceMs : prev * 0.7 + serviceMs * 0.3);
+    }
+  }
+
+  /**
+   * Concurrent readers of this CID, DERIVED (PRINCIPLES.md → 5) from two
+   * measured quantities by Little's Law: `L = λ × W`, average concurrency is
+   * arrival rate times average service time.
+   *
+   * Derived rather than counted deliberately. Counting in-flight reads would
+   * need begin/end bookkeeping threaded through every read path, and a gauge
+   * that leaks a decrement — a throw between begin and end — reports phantom
+   * load forever and quietly conscripts replicas. Both inputs here already
+   * exist and both decay on their own, so the estimate cannot get stuck.
+   *
+   * Returns 0 when either input is missing, which callers must read as "no
+   * evidence" and not as "no demand".
+   */
+  concurrentReads(cid: string, now: number = Date.now()): number {
+    const perWindow = this.reads(cid, now);
+    const serviceMs = this.latencyMs.get(cid);
+    if (perWindow <= 0 || !serviceMs || serviceMs <= 0) return 0;
+    const ratePerMs = perWindow / demandWindowMs();
+    return ratePerMs * serviceMs;
   }
 
   /** Reads in the last `demandWindowMs()` — a rate, and it falls again. */
@@ -576,7 +610,11 @@ export class CustodySignals {
   sweepDemand(now: number = Date.now()): number {
     let removed = 0;
     for (const cid of [...this.demand.keys()]) {
-      if (this.reads(cid, now) === 0) { this.demand.delete(cid); removed++; }
+      if (this.reads(cid, now) === 0) {
+        this.demand.delete(cid);
+        this.latencyMs.delete(cid);
+        removed++;
+      }
     }
     return removed;
   }
@@ -606,12 +644,14 @@ export class CustodySignals {
   /** Drop every signal for a CID (deleted, replaced, or no longer tracked). */
   forget(cid: string): void {
     this.demand.delete(cid);
+    this.latencyMs.delete(cid);
     const prefix = `${cid} `;
     for (const k of this.failures.keys()) if (k.startsWith(prefix)) this.failures.delete(k);
   }
 
   clear(): void {
     this.demand.clear();
+    this.latencyMs.clear();
     this.failures.clear();
   }
 }

@@ -54,6 +54,14 @@ export interface StoragePayload {
   capacityGB?: number;
   /** register: stable device id. Custody is per-device, not per-account. */
   deviceId?: string;
+  /**
+   * register: what kind of device this is, and how many concurrent reads it
+   * offers to serve. Both are DECLARATIONS and neither is trusted on its own —
+   * they seed a measurement (`content/calibration.ts`), and the network plans
+   * bandwidth against what probers observed rather than against these.
+   */
+  deviceClass?: string;
+  declaredConcurrency?: number;
   /** heartbeat: current smoke/WebRTC address peers fetch blocks from. */
   smokeAddr?: string;
   /** heartbeat: bytes actually held right now — what the reward is metered on. */

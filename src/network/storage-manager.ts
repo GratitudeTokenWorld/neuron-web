@@ -41,6 +41,8 @@ import {
   CustodySignals, planRepair, planRejoin, pollIntervalMs, liveHolders,
 } from '../engine/content/custody';
 import { FailureCorrelation, inferDomains } from '../engine/content/failure-domain';
+import { planBySaturation, DEFAULT_CONCURRENCY, type DeviceClass } from '../engine/content/device-capacity';
+import { CalibrationRun, effectiveCapacity, LADDER } from '../engine/content/calibration';
 import type { Block as EngineBlock } from '../engine/core/block';
 
 // Every cadence here is a FRACTION of the timing profile, not a wall-clock
@@ -201,6 +203,136 @@ export class StorageManager extends EventEmitter {
    * fail together can (failure-domain.ts).
    */
   private readonly failureCorrelation = new FailureCorrelation();
+  /**
+   * Per-provider calibration evidence, from probes WE performed.
+   *
+   * Our own measurements only — a provider's opinion of its own speed is the
+   * self-report this replaces. Bounded by the provider set and cleared with it.
+   */
+  private readonly calibrations = new Map<string, CalibrationRun>();
+  private readonly calibratedAt = new Map<string, number>();
+  /**
+   * How long a calibration stands before it is an assumption again. Derived
+   * from the heartbeat so it compresses with `STORAGE_TIMING`; a laptop that
+   * moves from ethernet to a train has a different capacity within the hour.
+   */
+  private calibrationTtlMs(): number { return HEARTBEAT_INTERVAL_MS * 6; }
+
+  /**
+   * Concurrent reads a provider can serve, measured where possible.
+   *
+   * Mandatory calibration (Lucian, 2026-09-22) is enforced HERE rather than in
+   * `validate()`: an uncalibrated provider is credited the smallest rung
+   * whatever it declared, so it may still register, hold replicas and count
+   * toward the durability floor — Principle 1 — while the network refuses to
+   * plan bandwidth against a number nobody verified. Putting the requirement in
+   * consensus would reject existing register blocks mid-chain and strand every
+   * block behind them, for a rule that is a local planning decision and needs
+   * no agreement at all.
+   */
+  private holderCapacity(pub: string, now = Date.now()): number {
+    const provider = this.ledger.getStorageProviders().find(p => p.pub === pub);
+    const declaredClass = provider?.deviceClass as DeviceClass | undefined;
+    const declared = provider?.declaredConcurrency
+      ?? (declaredClass ? DEFAULT_CONCURRENCY[declaredClass] : undefined);
+    const run = this.calibrations.get(pub);
+    return effectiveCapacity({
+      measured: run?.analyze(),
+      measuredAt: this.calibratedAt.get(pub) ?? 0,
+      declared,
+      now,
+      ttlMs: this.calibrationTtlMs(),
+      requireMeasured: true,
+    }).capacity;
+  }
+
+  /**
+   * How many holders this CID should have.
+   *
+   * Saturation first (device-capacity.ts): the holders' MEASURED aggregate
+   * capacity against observed concurrent demand, which is the quantity that
+   * actually decides whether a reader waits. The read-rate curve survives only
+   * as the fallback for when there is no capacity evidence yet — it maps a rate
+   * to a holder count through a curve calibrated on nothing, which is exactly
+   * what calibration exists to retire.
+   */
+  private targetFor(cid: string, holders: Iterable<string>, now: number): number {
+    const live = liveHolders(holders, pub => this.ledger.isProviderLive(pub, now));
+    const capacities = live.map(pub => this.holderCapacity(pub, now));
+    const demand = this.signals.concurrentReads(cid, now);
+    if (capacities.length === 0 || demand <= 0) {
+      return Math.min(this.signals.targetFor(cid, now), MAX_REPLICA_TARGET);
+    }
+    const plan = planBySaturation({
+      holderCapacities: capacities,
+      demandConcurrent: demand,
+      floor: REDUNDANCY_TARGET,
+      cap: MAX_REPLICA_TARGET,
+    });
+    return plan.target;
+  }
+
+  /** Record one probe of a provider — the prober side of calibration. */
+  private recordProbe(pub: string, level: number, ok: boolean, latencyMs: number): void {
+    let run = this.calibrations.get(pub);
+    if (!run) { run = new CalibrationRun(); this.calibrations.set(pub, run); }
+    run.add({ level, size: 'small', ok, latencyMs, prober: this.localPubForProbes() });
+    this.calibratedAt.set(pub, Date.now());
+  }
+
+  /**
+   * Walk the concurrency ladder against one provider and record what happened.
+   *
+   * This is the prober half of calibration: issue N simultaneous fetches of
+   * content the provider is supposed to hold, time every one, and stop at the
+   * first rung that degrades. The knee is that provider's measured capacity
+   * (`content/calibration.ts`).
+   *
+   * Three properties that are deliberate rather than incidental:
+   *
+   * - **It probes a provider of content we already care about**, using a CID it
+   *   already holds, so it needs no new message type and cannot be aimed at a
+   *   third party. "Everybody fetch from that address" would be a reflected DoS
+   *   with the network as amplifier.
+   * - **It stops at the first degraded rung.** The cost of the probe is the
+   *   thing being measured, so running the whole ladder against a node that
+   *   fell over at 2 would be a small denial of service dressed as diligence.
+   * - **The numbers are ours.** We timed these fetches; the provider is not
+   *   consulted about its own speed, which is the self-report this replaces.
+   */
+  async calibrateProvider(pub: string, cid: string, maxLevel = 16): Promise<void> {
+    const provider = this.ledger.getStorageProviders().find(p => p.pub === pub);
+    if (!provider?.smokeAddr) return;
+    for (const level of LADDER) {
+      if (level > maxLevel) break;
+      const results = await Promise.allSettled(
+        Array.from({ length: level }, async () => {
+          const t0 = Date.now();
+          await this.store.fetchBlockFromProvider(provider.smokeAddr!, cid, 8_000);
+          return Date.now() - t0;
+        }),
+      );
+      let failures = 0;
+      for (const r of results) {
+        if (r.status === 'fulfilled') this.recordProbe(pub, level, true, r.value);
+        else { this.recordProbe(pub, level, false, 9999); failures++; }
+      }
+      // Degraded — stop climbing. Continuing would measure how hard we can
+      // push a node that has already said no.
+      if (failures / level > 0.1) break;
+    }
+    const result = this.calibrations.get(pub)?.analyze();
+    if (result) {
+      console.log(`[StorageManager] Calibrated ${pub.slice(0, 12)}…: ${result.reason} `
+        + `(${result.samples} sample(s), ${result.distinctProbers} prober(s), `
+        + `${result.confident ? 'confident' : 'NOT confident — needs more probers'})`);
+    }
+  }
+
+  /** Our identity as a prober, so samples carry who measured them. */
+  private localPubForProbes(): string {
+    return [...this.localKeys.keys()][0] ?? 'self';
+  }
 
   /** Primary CIDs currently being cached — prevents concurrent duplicate downloads */
   private cachingInProgress = new Set<string>();
@@ -1046,7 +1178,7 @@ export class StorageManager extends EventEmitter {
       // shrinks by itself, so counting it would keep reporting a full replica set
       // long after the holders in it stopped renewing — and the object would sit
       // one honest failure away from loss while looking healthy.
-      const target = Math.min(this.signals.targetFor(cid), MAX_REPLICA_TARGET);
+      const target = this.targetFor(cid, tracked.confirmedProviders, now);
       const live = this.liveHolderCount(tracked.confirmedProviders, now);
 
       if (live >= target) {
@@ -1173,7 +1305,7 @@ export class StorageManager extends EventEmitter {
     console.log(`[StorageManager] distributeContent: cid=${cid.slice(0, 20)}… additionalCids=${additionalCids.length} uploader=${uploaderPub.slice(0, 12)}…`);
 
     const existing = this.trackedCids.get(cid);
-    const target = Math.min(this.signals.targetFor(cid), MAX_REPLICA_TARGET);
+    const target = this.targetFor(cid, existing?.confirmedProviders ?? [], Date.now());
     const alreadyLive = existing ? this.liveHolderCount(existing.confirmedProviders) : 0;
 
     // Already fully replicated — nothing to do. Live leases, not confirmations
@@ -1753,7 +1885,7 @@ export class StorageManager extends EventEmitter {
         if (live >= MIN_REPLICAS) void this.releasePublisherCopy(receipt.cid);
         // If still under-replicated, reset lastDistributed so the next retry interval
         // fires quickly instead of waiting a full 30s cycle from the original send time.
-        if (live < Math.min(this.signals.targetFor(receipt.cid), MAX_REPLICA_TARGET)) {
+        if (live < this.targetFor(receipt.cid, tracked.confirmedProviders, Date.now())) {
           tracked.lastDistributed = Date.now() - 20_000; // eligible again in ~5-10s
         }
         // Persist updated confirmed providers
@@ -1891,6 +2023,10 @@ export class StorageManager extends EventEmitter {
             responseRank = ++rankCounter; // atomic: only one microtask runs at a time
             this.signals.recordSuccess(cid, pub);
             this.failureCorrelation.record(pub, true);
+            // Every spot check is already a timed fetch of real content, so it
+            // is a free level-1 calibration sample. The higher rungs need the
+            // deliberate ladder (`calibrateProvider`).
+            this.recordProbe(pub, 1, true, latencyMs);
             if (!wasConfirmed(pub)) {
               console.log(`[StorageManager] Spot-check discovered unconfirmed provider ${pub.slice(0, 12)}… has ${cid.slice(0, 16)}…`);
             }
@@ -2124,9 +2260,13 @@ export class StorageManager extends EventEmitter {
    * now rather than at whatever a watcher's next poll would have been.
    */
   async retrieve(cid: string, timeoutMs?: number): Promise<Uint8Array> {
+    const start = Date.now();
     try {
       const data = await this.store.retrieve(cid, timeoutMs, this.getCidSmokeAddrs(cid));
-      this.signals.recordRead(cid);
+      // The service time goes in with the read: rate alone cannot say whether
+      // holders are loaded, and the two together give concurrency by Little's
+      // Law (custody.ts → `concurrentReads`), which is what drives replication.
+      this.signals.recordRead(cid, Date.now(), Date.now() - start);
       return data;
     } catch (err) {
       this.repairOnReadFailure(cid);

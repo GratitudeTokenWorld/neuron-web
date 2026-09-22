@@ -107,7 +107,7 @@ npm test             # vitest, all of src/**/*.test.ts
 npm run typecheck    # engine + src/storage; NOT the app layer — see below
 ```
 
-Current baseline: **621 tests / 79 files passing**, `npm run build` clean.
+Current baseline: **648 tests / 80 files passing**, `npm run build` clean.
 E2E lives in `e2e/` (Playwright, `npm run e2e`) and has its own skill —
 `.claude/skills/e2e-browser-test/SKILL.md`. Reach for it when a change needs
 verifying in the app rather than in a unit test: every display defect of
@@ -242,6 +242,17 @@ below).
   tidiness beating durability — it deleted redundancy the network had already
   paid bandwidth to create. Over-replication is cheap; under-replication is the
   risk (PRINCIPLES.md → 3, CUSTODY-PROOFS.md → Reframe).
+- **Provider capacity is MEASURED, and calibration is mandatory**
+  (`engine/content/calibration.ts`). A provider declares a device class; probers
+  then walk a concurrency ladder against it using content it already holds, and
+  the knee is its capacity. Mandatory is enforced at the SELECTION layer, not in
+  `validate()`: an uncalibrated provider is credited the smallest rung whatever
+  it declared, so it can still register, hold replicas and count toward the
+  durability floor (Principle 1) while the network refuses to plan bandwidth
+  against an unverified number. Putting it in consensus would reject existing
+  register blocks mid-chain. Results carry `confident`, `lowerBoundOnly` (the
+  ladder ran out — a lower bound, never a maximum) and `proberBound` (the knee
+  was the prober's own ceiling, so it measured us, not them).
 - **Replication above the floor is driven by measured SATURATION, not a read
   count** (Lucian, 2026-09-22; `engine/content/device-capacity.ts`). Nodes
   declare a device class with a concurrent-read limit, so ten phones and ten
