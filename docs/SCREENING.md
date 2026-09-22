@@ -76,6 +76,27 @@ confirming that reader-caches scale popular content for free — they do, and th
 is the path that finds them, so it must be **bounded rather than removed**.
 **Open.**
 
+### 1d. Independence assumed from topology that was never measured
+
+Measured 2026-09-22, TCP connect time: relay-1 to itself **0.16 ms**, relay-1 to
+relay-2 across the private network **~1.1 ms**, laptop to either **~17 ms**.
+Same-host VM-to-VM sits near loopback, so at 1.1 ms the two relays are probably
+different physical hosts — and they are unambiguously the same rack, datacentre,
+power feed, network and hosting provider.
+
+That matters past storage. The identity design leans on **2-of-2 attesters** and
+a **Shamir 2-of-n** recovery share held across relays, and both are described as
+removing a single point of failure. Against an attacker who compromises,
+subpoenas or simply outlasts *cloudify.ro*, they do not: two shares in one
+datacentre is one share. The design is sound; the **deployment** does not yet
+instantiate it, and nothing in the code says so.
+
+The general rule: **independence is a measurement, not an assumption baked into
+a deployment diagram.** Any k-of-n claim should name what it is independent
+*of*. Adding a third attester on unrelated infrastructure is the fix; Lucian's
+laptop is already a third vantage point for probing, which is also what
+`MIN_DISTINCT_PROBERS` needs. **Open.**
+
 ### 2. Silent returns
 
 A `return` with no log is indistinguishable from "the message never arrived",
