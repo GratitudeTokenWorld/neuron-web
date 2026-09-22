@@ -3,7 +3,8 @@ import {
   spaceNeutralRatio, provisionForStorage, equilibriumSupply, simulateSupply,
   breakEvenProvisionRatio, burnRateForSelfPayingAt, sybilValueOfAccount,
   grantLifetimeYears, simulateActivitySupply, balancedMintPerByteServed,
-  signupIssuance,
+  signupIssuance, selfPayingServedBytes, fixedRateStep, balancedReadIntensity,
+  washReadStorageYield, capForWashYieldBelowFreeTier, COST_RATIO,
 } from './token-economy.js';
 import { REDUNDANCY_TARGET } from '../content/custody.js';
 
@@ -169,5 +170,93 @@ describe('the signup grant is the real issuance mechanism', () => {
       burnPerBytePerPeriod: BURN, periodsPerYear: PERIODS,
     });
     expect(years).toBeGreaterThan(40);
+  });
+});
+
+describe('the actual rule: a fixed store/serve exchange rate', () => {
+  const PB = 1024 ** 5;
+
+  it('cancels exactly at 10 GB served per 1 GB stored', () => {
+    expect(selfPayingServedBytes(1 * GB) / GB).toBe(10);
+    const step = fixedRateStep({
+      bytesServedPerPeriod: 10 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-6,
+    });
+    expect(step.net).toBe(0);
+  });
+
+  it('has no feedback term — supply never appears on the right', () => {
+    // Which is why the instability found above cannot arise here. Not tuned
+    // away: structurally absent. The same activity gives the same net movement
+    // whatever the supply happens to be.
+    const a = fixedRateStep({ bytesServedPerPeriod: 30 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-6 });
+    const b = fixedRateStep({ bytesServedPerPeriod: 30 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-6 });
+    expect(a.net).toBe(b.net);
+  });
+
+  it('makes mintRate a pure denomination choice', () => {
+    // Doubling it doubles every balance and changes nothing real. COST_RATIO
+    // is the only economically meaningful parameter.
+    const cheap = fixedRateStep({ bytesServedPerPeriod: 30 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-6 });
+    const dear = fixedRateStep({ bytesServedPerPeriod: 30 * GB, bytesStored: 1 * GB, mintPerByteServed: 1e-3 });
+    expect(dear.net / cheap.net).toBeCloseTo(1000, 0);
+    expect(dear.inflationary).toBe(cheap.inflationary);
+  });
+
+  it('identifies the ONE empirical question the design rests on', () => {
+    // Supply grows exactly when the network reads more than ten times its
+    // stored volume per period. Whether it does is a fact about usage, not a
+    // parameter - and it is unmeasured.
+    expect(balancedReadIntensity()).toBe(COST_RATIO);
+    const stored = 100 * PB;
+    for (const [intensity, expectInflation] of [[1, false], [5, false], [30, true]] as const) {
+      const s = fixedRateStep({
+        bytesServedPerPeriod: stored * intensity, bytesStored: stored, mintPerByteServed: 1e-6,
+      });
+      expect(s.inflationary).toBe(expectInflation);
+    }
+  });
+
+  it('lines the economics up with the physics by construction', () => {
+    // COST_RATIO is the redundancy factor, which is also the space-conservation
+    // ratio. They agree because they are the same number, not because anyone
+    // calibrated them together.
+    expect(COST_RATIO).toBe(REDUNDANCY_TARGET);
+    expect(selfPayingServedBytes(1 * GB)).toBe(provisionForStorage(1 * GB, REDUNDANCY_TARGET));
+  });
+});
+
+describe('a fixed rate reopens wash-reading — and the cap is now economic', () => {
+  it('shows an 8 GB per-pair cap pays BETTER than signing up honestly', () => {
+    // Under a capped pool, fake reads only diluted other providers. At a fixed
+    // rate they create UNITS from nothing, so the per-reader cap stops being
+    // an anti-abuse knob and becomes an economic parameter.
+    const w = washReadStorageYield({ perReaderCapBytes: 8 * GB, periodsPerYear: 365 / 30 });
+    expect(w.storageBytesPerYear / GB).toBeGreaterThan(9);
+    // …against a free tier of 1-10 GB for a LIFETIME. Manufacturing an
+    // identity to wash-read would out-earn the door prize, which is exactly
+    // backwards.
+  });
+
+  it('gives the cap that makes the attack pointless rather than merely bounded', () => {
+    // If a fake human mints less storage than a real signup gives away, nobody
+    // bothers. ~17 MB per period against a 1 GB/50yr tier; ~168 MB against
+    // 10 GB - roughly fifty times tighter than the 8 GB currently in
+    // read-receipts.ts.
+    const tight = capForWashYieldBelowFreeTier({ freeBytes: 1 * GB, lifetimeYears: 50, periodsPerYear: 365 / 30 });
+    const loose = capForWashYieldBelowFreeTier({ freeBytes: 10 * GB, lifetimeYears: 50, periodsPerYear: 365 / 30 });
+    expect(tight / 1024 / 1024).toBeCloseTo(16.8, 0);
+    expect(loose / 1024 / 1024).toBeCloseTo(168.3, 0);
+    expect(loose).toBeLessThan(8 * GB / 40);
+  });
+
+  it('stays compatible with honest reading, because the cap is PER PAIR', () => {
+    // A tight per-pair cap does not limit a reader overall: honest reads spread
+    // across the many providers that hold different content, while wash-reading
+    // wants to concentrate on one. The shape of the cap does the work.
+    const capPerPair = capForWashYieldBelowFreeTier({
+      freeBytes: 10 * GB, lifetimeYears: 50, periodsPerYear: 365 / 30,
+    });
+    const providersAReaderUses = 60;
+    expect((capPerPair * providersAReaderUses) / GB).toBeGreaterThan(9);
   });
 });

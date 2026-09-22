@@ -303,3 +303,114 @@ export function balancedMintPerByteServed(args: {
 export function signupIssuance(args: { humans: number; signupUnits: number }): number {
   return args.humans * args.signupUnits;
 }
+
+// ── The actual rule (Lucian, 2026-09-22) ─────────────────────────────────────
+
+/**
+ * **A fixed exchange rate between storing and serving.**
+ *
+ * The rule, stated plainly: *storing one byte beyond the free allowance costs
+ * what serving ten bytes earns.* Provide 10 GB of SERVED traffic and you have
+ * paid for 1 GB of extra storage; the two cancel exactly.
+ *
+ * Everything above this line modelled emission as a percentage of supply and
+ * burn as an independent quantity — assumptions carried over from the existing
+ * `economy/rewards.ts`, never part of this design. They produced a real result
+ * (that pairing is unstable) but they were answering a question nobody asked.
+ * This section models the rule as given.
+ *
+ * ```
+ * minted per period = bytesServed x mintRate
+ * burned per period = bytesStored x mintRate x COST_RATIO
+ * ```
+ *
+ * Both sides are activity. Supply never appears on the right, so the
+ * instability found above cannot arise here at all — not because it was tuned
+ * away, but because there is no feedback term.
+ *
+ * `mintRate` is a pure denomination choice: doubling it doubles every balance
+ * and changes nothing real. **The only economically meaningful parameter is
+ * `COST_RATIO`**, and Lucian has set it to the redundancy factor, which is also
+ * the space-conservation ratio. The economics and the physics agree by
+ * construction rather than by calibration.
+ */
+export const COST_RATIO = 10;
+
+/** Served bytes needed to pay for a given amount of stored data. */
+export function selfPayingServedBytes(storedBytes: number, costRatio = COST_RATIO): number {
+  return storedBytes * costRatio;
+}
+
+/**
+ * Net supply movement in a period under the fixed-rate rule.
+ *
+ * Supply grows exactly when `bytesServed > costRatio x bytesStored`, i.e. when
+ * the network reads more than ten times its stored volume per period. Nothing
+ * else enters it — not supply, not price, not a policy knob.
+ */
+export function fixedRateStep(args: {
+  bytesServedPerPeriod: number;
+  bytesStored: number;
+  mintPerByteServed: number;
+  costRatio?: number;
+}): EconomyStep & { inflationary: boolean } {
+  const ratio = args.costRatio ?? COST_RATIO;
+  const minted = args.bytesServedPerPeriod * args.mintPerByteServed;
+  const burned = args.bytesStored * args.mintPerByteServed * ratio;
+  return {
+    minted, burned, net: minted - burned, supplyAfter: NaN,
+    inflationary: args.bytesServedPerPeriod > ratio * args.bytesStored,
+  };
+}
+
+/**
+ * The read intensity at which the economy is exactly balanced: bytes served per
+ * byte stored, per period. Equal to `costRatio` — which is the rule restated,
+ * and worth having as a number because it is the one empirical question the
+ * design rests on. **Does the network actually read ten times its stored volume
+ * per period?** Below that it is deflationary, above it inflationary, and
+ * Lucian is content with the inflationary side.
+ */
+export function balancedReadIntensity(costRatio = COST_RATIO): number {
+  return costRatio;
+}
+
+/**
+ * What one colluding human can mint by wash-reading, expressed as the storage
+ * it buys.
+ *
+ * This is the attack a FIXED rate reopens and a capped pool did not have. Under
+ * a pool, fake reads only dilute other providers; under a fixed rate they
+ * create UNITS from nothing. The defences are the per-reader cap and the
+ * distinct-reader floor (`content/read-receipts.ts`), so the yield is bounded
+ * by what one attested human is allowed to claim.
+ */
+export function washReadStorageYield(args: {
+  perReaderCapBytes: number;
+  costRatio?: number;
+  periodsPerYear: number;
+}): { storageBytesPerPeriod: number; storageBytesPerYear: number } {
+  const ratio = args.costRatio ?? COST_RATIO;
+  const perPeriod = args.perReaderCapBytes / ratio;
+  return { storageBytesPerPeriod: perPeriod, storageBytesPerYear: perPeriod * args.periodsPerYear };
+}
+
+/**
+ * The per-reader cap at which wash-reading earns no more than the free
+ * allowance simply gives away.
+ *
+ * The design rule that makes the attack pointless rather than merely bounded:
+ * if a fake human can mint less storage than a real signup hands out for free,
+ * nobody manufactures identities to wash-read — they would be working for less
+ * than the door prize.
+ */
+export function capForWashYieldBelowFreeTier(args: {
+  freeBytes: number;
+  lifetimeYears: number;
+  periodsPerYear: number;
+  costRatio?: number;
+}): number {
+  const ratio = args.costRatio ?? COST_RATIO;
+  const perPeriodAllowance = args.freeBytes / (args.lifetimeYears * args.periodsPerYear);
+  return perPeriodAllowance * ratio;
+}
