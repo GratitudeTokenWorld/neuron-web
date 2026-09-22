@@ -511,6 +511,111 @@ Residual, stated plainly: with the identity gate as weak as it currently is,
 identity gate is the load-bearing defence for the entire payment system**, and
 it is the thing to strengthen next if UNITS are to mean anything.
 
+### 2d. Second attack pass on the assembled design (2026-09-22)
+
+Everything above, screened as one system rather than as separate ideas.
+
+#### C1 - Claim cadence: Lucian is right, and the cost is hidden elsewhere
+
+| Policy | Claims/yr/account | Blocks/yr at 100M accounts | Chain growth | Evidence retention |
+|---|---|---|---|---|
+| 24 h manual floor | 365 | 3.65e10 | 13.3 TB/yr | 2 days |
+| **30-day auto only** | **12.2** | **1.22e9** | **0.44 TB/yr** | **60 days** |
+
+30x less chain, confirmed. **The cost moves rather than disappearing**: a claim
+must be *validatable*, so the evidence has to outlive the interval. Pruned too
+early it does not make a smaller payout, it makes a block every node rejects and
+strands the chain behind it — the failure `claimableEpochDay` already documents.
+So a 30-day cadence makes ~60 days of receipt retention a **consensus-relevant
+constant**, up from two.
+
+Three attacks on the auto-only policy, and two need fixes:
+
+- **Herd day.** A 30-day cycle for everyone puts the whole network's settlement
+  on one day in thirty. FIXED by deriving the claim day from the account id
+  (`claimDayFor`) — measured uniform to within +-3%, needs no coordination and
+  anyone can verify a node claimed on its own day.
+- **Claim-day grinding.** If the pool were split among *whoever claims that
+  day*, an attacker would grind account ids onto quiet days. **The share must be
+  computed over the accrual period, never over who happens to claim.** Stated
+  because the naive implementation is the grindable one.
+- **Offline at claim time.** If only the provider can submit, intermittent
+  nodes — phones, the devices Principle 1 exists for — silently lose earnings.
+  FIX: let **anyone** submit a claim on a provider's behalf. The evidence is
+  reader-signed and the payout goes to the provider regardless, so there is
+  nothing to steal and no reason to withhold. Idempotent, because settlement
+  moves the baseline.
+
+Removing the manual claim costs users liquidity — up to 30 days before earnings
+are spendable. That is a UX cost, not a security one, and it is Lucian's call.
+
+#### C2 - The reward formula, measured
+
+`weight = custodyRate x bytesHeld + serviceRate x bytesServed`, split from the
+capped pool. Projections (`sim/reward-formula.ts`), with supply, fleet and
+device mix all ASSUMED:
+
+**Where the weight goes.** At 1:0.1 a laptop earns 1% more for serving 5 GB than
+for refusing — so the rational strategy is to hoard and decline, a write-only
+archive. At **1:3** serving pays 30% more while custody still carries ~70% of
+earnings, which keeps cold bytes worth holding. That is the defensible band.
+
+**The finding that matters most, and it is uncomfortable.** Weight proportional
+to bytes means earnings proportional to bytes, and the device range is five
+orders of magnitude:
+
+| alpha (concavity) | phone UNIT/yr | datacentre UNIT/yr | inequality | gain from splitting 100 ways |
+|---|---|---|---|---|
+| 1.0 (linear) | 0.00006 | 1.48 | 25,739x | 1.00x |
+| **0.9** | 0.00014 | 1.34 | 9,331x | **1.58x** |
+| 0.75 | 0.00052 | 1.06 | 2,036x | 3.16x |
+| 0.5 | 0.00323 | 0.52 | 161x | 10.00x |
+
+A concave weight compresses the range but **builds in a Sybil incentive**:
+splitting one holding across N identities earns `N^(1-alpha)`. At alpha 0.9,
+splitting 100 ways gains 58% and costs 100 recruited humans — not worth it. At
+0.5 it pays 10x and becomes worth organising. **alpha ~0.9 is the defensible
+point**, and it is safe ONLY because the exponent applies to the per-HUMAN
+total: applied per key, with sub-accounts available, splitting would be free.
+
+**The honest conclusion no weighting fixes:** a phone earns a rounding error at
+every setting, because the pool is small and the fleet is large. Small devices
+participate for **access**, not revenue. The IoT story is "your sensor can use
+the network", never "your sensor pays for itself" — and saying otherwise would
+be the kind of promise this project has to keep.
+
+#### C3 - Sub-accounts, built (`core/sub-accounts.ts`)
+
+Implemented now so stress testing can include them. Two rules carry the whole
+security argument:
+
+- **`rootOf` collapses every key to its human**, and every cap, floor and weight
+  counts against the root. `distinctHumans` is the function the distinct-reader
+  floor must call — otherwise one person with three devices satisfies a
+  three-person threshold alone.
+- **Depth is exactly one.** A sub-account cannot issue sub-accounts: a deeper
+  tree is unbounded, unenumerable by the human at its root, and mintable by
+  whoever compromises any device in it.
+
+Sub-accounts get their own keys, custody, routing reputation and calibration.
+They never get personhood, their own attestation budget, or a vote
+(`consensusWeightFactor` returns 0). Expiry bites on read rather than waiting
+for a sweep, because a delegation that stays effective until a timer runs is a
+window.
+
+#### Where this leaves the design
+
+Settled: reader-attested service, sampled custody, no failure attestation,
+capped proportional emission, bytes-held rather than replica count, auto-only
+claims spread by account id, sub-accounts collapsed to humans.
+
+Open and needing Lucian: the **alpha value** (0.9 recommended), the
+**custody:service ratio** (1:3 recommended), whether to accept 60-day evidence
+retention, and whether losing manual claims is an acceptable UX cost.
+
+Unchanged and still load-bearing: **the identity gate prices every defence
+here**. Sub-accounts make that more true, not less.
+
 ### 3. The stronger move is to remove the payment as well — measured
 
 Applying "what can be REMOVED" one step further: delete the money, and throttle
