@@ -21,82 +21,88 @@ Read in this order — do NOT re-derive what they already record:
 5. `.claude/skills/e2e-browser-test/SKILL.md` — E2E creates its own accounts
    now. There is no fixture to capture.
 
-## State as of HEAD `15a3f29` (verified, not assumed)
+## State as of HEAD `4fac0af` (verified, not assumed)
 
-- **556 tests / 74 files green**, `npm run typecheck` clean, `npm run build`
+- **803 tests / 93 files green**, `npm run typecheck` clean, `npm run build`
   clean.
 - App-layer `tsc -p tsconfig.json` = **121 errors — this is the baseline, never
   add to it.** Take a **per-file** count before and after; the total falling
   does not prove your file did not gain errors.
-- Live probes, both **ALL CHECKS PASSED**:
+- ⚠ **The chain format changed four times this session** — `storage-reward` and
+  `storage-heartbeat` removed, `storage-settle` added, the storage payload
+  reshaped. **Wipe before running against any existing chain**, client and
+  relay. Nothing will migrate and nothing should try to.
+- **Relays** still run `890e047` (2026-09-21). Everything below is committed and
+  **NOT deployed**; `relay/server.ts` changed (the `/providers` scan), so a
+  deploy is needed before any of it is live. Relays are covered by neither
+  typecheck nor tests — re-read edits, and check `pm2 jlist` restart counts
+  **after** 60 s, not immediately.
+- Live probes to run after that deploy, both previously **ALL CHECKS PASSED**:
   `npx tsx scripts/g1-resolve-smoke.mts` (55 checks) and
-  `npx tsx scripts/backfill-smoke.mts` (the archive heal: chains, and the record stores — ⚠ it stops and
-  starts a relay over ssh). Run after every relay deploy — and wait for the relays to finish
-  restarting first, or you get phantom failures.
-- **Relays**: both cloud boxes (`80.97.27.224`, `80.97.27.112`) run **`890e047`**
-  (deployed 2026-09-21). They carry the archive backfill, **verified healing in
-  production** by `scripts/backfill-smoke.mts`. Restart counters were reset to 0
-  when the processes were recreated, so compare against 0, not the old 19. Anything relay-side committed after that needs a deploy before it
-  does anything at all.
-- **E2E**: `npm run e2e`. T8, T9 and T10 all pass unattended. Run the stack as
-  `LOCAL_ONLY=1 TEST_FACE=1 STORAGE_TIMING=fast npm run dev` — see the skill for
-  why `LOCAL_ONLY` is not optional for repeated runs.
+  `npx tsx scripts/backfill-smoke.mts` (⚠ stops and starts a relay over ssh).
+- **E2E**: `npm run e2e` as
+  `LOCAL_ONLY=1 TEST_FACE=1 STORAGE_TIMING=fast npm run dev`. **Not re-run since
+  the storage economy changed** — T8/T9/T10 touch provider registration and
+  custody, so expect them to need updating rather than to pass.
 
-## What shipped this session
+## What shipped this session — the storage economy was rebuilt
 
-- **Core principles** written down (PRINCIPLES.md) and wired into CLAUDE.md,
-  ARCHITECTURE.md and README as the filter every change is judged against.
-- **A synthetic face** (`src/core/test-face.ts`, ⚠ dev-only, on the
-  remove-before-production list) so E2E creates accounts in ~4 s with no human.
-  Only the camera is replaced; attestation, the v3 blob and the Shamir split all
-  run for real.
-- **T8, T9, T10 automated and passing** — the whole storage verification debt.
-- **Four product defects fixed**: the publisher never released its copy after
-  handoff; an account record could regress to a stale, *unsigned* balance; a
-  file's first announcement could be lost behind a 5-minute re-announce; and the
-  lapse message read `0h ago` on a compressed clock.
-- **Phase 4 started**: archive backfill between relays, demand-driven on a miss
-  and rate-limited, deployed and verified live.
+The payment model changed completely. Read CUSTODY-PROOFS.md → sections 2b–2d
+before touching any of it; the short version:
 
-## Open security finding — read before touching rewards
+- **Heartbeats are GONE** (block type, scheduling, epoch counters, uptime
+  scoring and UI). They did three jobs, and all three moved.
+- **Payment is metered by readers, not providers.** `content/read-receipts.ts`
+  holds one cumulative, reader-signed receipt per counterparty; the receipts
+  travel INSIDE a `storage-settle` block so any node re-derives the payout from
+  the same bytes. A provider signs its own settlement and still cannot choose
+  the number. This closed the self-metered-rewards finding that stood open for
+  the previous three sessions.
+- **The lease is renewed by observed service** (`content/custody-sampling.ts` →
+  `CustodyLiveness`), fed by spot checks and ordinary reads. Custody is proven
+  by sampled reads — 1,000× cheaper than checking everything, with detection
+  compounding over the lease.
+- **Routing moved off-chain** to a signed presence beacon
+  (`content/presence.ts`). An address is ephemeral and never belonged on a
+  permanent chain.
+- **Replication is demand-scaled both ways**: a sliding-window read RATE (not a
+  lifetime counter), linear growth to a cap, and surplus released back as
+  uncounted spares. Plus saturation-driven placement from measured device
+  capacity (`content/device-capacity.ts`, `content/calibration.ts`).
+- **A copy means a distinct FAILURE DOMAIN**, inferred from observed
+  co-failure (`content/failure-domain.ts`). `deviceId` is a self-assigned UUID
+  and is a hint only.
+- **Sub-accounts** (`core/sub-accounts.ts`): `lucian.sensor1`, collapsed to one
+  human everywhere a cap, floor or weight is counted.
+- **The sustained-load test exists** (`sim/sustained-load.ts`) and found three
+  real leaks immediately. Run it when adding any keyed structure.
 
-**Storage rewards are self-metered.** The payout is
-`BASE_RATE × min(storedGB, capacityAtStart) × uptime` and both volume terms
-come from the provider itself, validated against the same self-report. A
-provider that stores nothing out-earns an honest 4 GB one by 2500×, so the
-rational strategy is to store nothing. Demonstrated as an adversarial control
-in `provider-ledger.test.ts`; when custody-proven payouts land, that test
-should FAIL and be rewritten as the guarantee. ARCHITECTURE.md → *Open
-security finding*. **Not fixed — it is an economic design decision.** The
-option space is enumerated, trinity-screened and attacked in
-[CUSTODY-PROOFS.md](CUSTODY-PROOFS.md); three questions there block the work,
-the first being whether the network keeps MINTING for storage (under which
-provider/uploader collusion is unfixable by any proof) or the uploader pays.
+Economics are modelled in `sim/token-economy.ts` and `sim/reward-formula.ts`:
+mint per byte served, burn per byte stored at `COST_RATIO` 10 (which is
+`REDUNDANCY_TARGET`, so the economics and the space conservation agree by
+construction). Emission must be tied to ACTIVITY, never to a percentage of
+supply — that pairing has an unstable equilibrium, measured.
 
 ## Your next task, in this order
 
-1. **Phase 4 — the rest of scale hardening.** Backfill for the OTHER archive
-   stores (account directory, pending sends, file index, provider records — each
-   has its own store and no peer-query mechanism yet; same demand-driven rule,
-   never a sync). Then the storage incentive decision — the current direction
-   is to REMOVE payment and throttle on reciprocity instead of proving custody
-   for a payout (CUSTODY-PROOFS.md → *Paying per read and per write*, measured
-   in `sim/reciprocity.ts`) — plus adaptive limits, security bounds, and the
-   sustained load test. Receiver-side inbound admission and the per-sender share
-   of the pending-send index belong here too (ARCHITECTURE.md → *Fan-IN at a
-   billion followers*).
-2. **Finish calibration — the ladder is INERT.** `calibrateProvider` is written
-   and tested but **has no callers**, so only level-1 samples arrive (from spot
-   checks) and `confident` needs two judged rungs. Under `requireMeasured` every
-   provider therefore sits at the floor capacity of 1. Not dangerous — the
-   saturation maths stays conservative and falls back to the read-rate curve
-   when there is no demand evidence — but the feature does nothing until
-   something schedules it. Needs: a cadence (jittered, per `pollIntervalMs`), a
-   rule for which provider to probe, and Lucian's laptop as a third prober so
-   `MIN_DISTINCT_PROBERS` can be met at all.
-3. **Multi-device custody** (decided, unbuilt): per-device chains with an
-   account-signed delegation. Settle the pseudonymous device-group tag first.
-4. **The migration seam**, per caller — 121 app-layer type errors.
+1. **Deploy and re-verify.** Relays are four commits behind and the chain
+   format changed: wipe `.relay-data/` (keep the peer-id and attester keys) and
+   client storage, deploy, then run both live probes. Nothing below is
+   trustworthy until this is done.
+2. **Re-run and repair the E2E suite.** T8/T9/T10 exercise registration and
+   custody, both of which changed shape. Expect edits, not passes.
+3. **Finish the economy's open ends**: the settle path has no UI at all, the
+   publish/service roots are computed but nothing reads them back, and the
+   free-tier allowance (`freeBytes` in `settlementOutcome`) is a parameter
+   nobody sets.
+4. **Backfill for the OTHER archive stores** — account directory, pending
+   sends, file index, provider records. Same demand-driven rule, never a sync.
+5. **Multi-device custody** (decided, unbuilt): per-device chains with an
+   account-signed delegation. `core/sub-accounts.ts` is the delegation half;
+   the device-group tag is still unsettled.
+6. **The migration seam**, per caller — 121 app-layer type errors. The legacy
+   `core/dag-ledger.ts` still carries its own heartbeat and provider code; it
+   is slated for wholesale removal, so do not clean it piecemeal.
 
 ## Traps that each cost a debugging cycle — do not repeat
 
@@ -171,3 +177,17 @@ provider/uploader collusion is unfixable by any proof) or the uploader pays.
 5. **The gossiped `LockoutNotice` penalizes only honest users.** Recommendation:
    delete the two `publishLockout` calls. It changes consensus voting behaviour,
    so it is his call.
+
+6. **Supply / denomination.** The only economically real parameter left in the
+   storage economy: a reference node's SHARE is fixed by the formula, and the
+   supply decides whether that share reads as 1 unit or 1000
+   (CUSTODY-PROOFS.md → C5).
+7. **Free-tier size**, coupled to the per-reader attestation cap — the cap must
+   stay below what the free tier gives away, or wash-reading out-earns signing
+   up honestly. Raise one and re-derive the other.
+8. **A third attester on unrelated infrastructure.** Measured 2026-09-22: the
+   two cloud relays are ~1.1 ms apart and share a datacentre, so 2-of-2
+   attesters and the Shamir 2-of-n are one failure domain against anyone who
+   compromises or subpoenas the host. Lucian's laptop closes the prober half
+   but is unreachable inbound, so it cannot serve as the third attester.
+   Billable, so it is his call.

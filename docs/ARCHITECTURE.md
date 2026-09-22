@@ -152,66 +152,26 @@ where redundancy silently fails first.
 
 ---
 
-## Open security finding: storage rewards are self-metered (2026-09-21)
+## CLOSED: storage rewards were self-metered (2026-09-21 → fixed 2026-09-22)
 
-Found by the first black-hat pass. Recorded here rather than only in a test,
-because the fix is an economic design decision.
+The payout was `BASE_RATE × min(storedGB, capacityAtStart) × uptime`, and both
+volume terms came from the provider being paid — `storedBytes` rode in its own
+heartbeat, `capacityGB` was whatever it declared — while `validate` checked the
+claim against terms computed from that same self-report. The verification was
+circular: a provider storing nothing out-earned an honest 4 GB one by 2500×, so
+the rational strategy was to store nothing.
 
-**Attacker's goal:** earn full storage rewards while holding nothing.
+**Fixed by inverting who reports.** Volume is now attested by the readers who
+were served (`content/read-receipts.ts`), the receipts travel inside the
+settlement block so every node re-derives the payout from the same bytes
+(`content/storage-settlement.ts`), and custody is proven by sampled reads
+rather than announced (`content/custody-sampling.ts`). The heartbeat and reward
+block types are deleted. The adversarial control in `provider-ledger.test.ts`
+was rewritten as the guarantee, exactly as its own comment predicted.
 
-**Path:** the payout is `BASE_RATE × min(storedGB, capacityAtStart) × uptime`.
-`storedBytes` arrives in the provider's OWN heartbeat block and
-`capacityAtStart` is whatever it declared at registration, so both volume terms
-are attacker-chosen. `validate` checks the claimed `storedGB` against
-`rewardTerms`, which is derived from the same self-report — circular. The
-on-chain evidence ceiling bounds counted heartbeats (uptime), which an attacker
-produces honestly and cheaply, and bounds nothing about volume.
-
-**Cost:** one registration and six heartbeats an epoch. No bytes move, nothing
-is served, and no spot check enters the payout path at all.
-
-**Why it matters beyond the theft:** the incentive points the wrong way. A
-provider declaring 10,000 GB and storing nothing out-earns an honest 4 GB
-provider by 2500×, so the rational strategy is to store nothing. Durability is
-a flow property that depends on real holders.
-
-**Demonstrated** in `provider-ledger.test.ts` as an adversarial control, the
-way `face-match.test.ts` keeps the v2 brute force. When custody-proven payouts
-land, that test should FAIL and be rewritten as the guarantee.
-
-**Fix shape (not yet decided).** The option space is enumerated, screened
-through the trinity and then attacked in
-[CUSTODY-PROOFS.md](CUSTODY-PROOFS.md). Summary of where that landed:
-
-- Sealing-based proofs (Filecoin-style PoRep/PoSt) are **rejected on
-  Principle 1c/3c** — they cost hours of CPU and gigabytes of RAM, which
-  excludes phones, browsers and single-board computers from ever being
-  providers. That is the trinity's third leg actually biting.
-- The strongest candidate needs **no new cryptography**: content is already
-  chunked with a per-chunk CID manifest, and `consensus/seed.ts` already
-  derives an unpredictable per-epoch beacon. A provider can therefore derive
-  its own challenge offsets, read those chunks and publish a proof anyone can
-  check against the manifest — **with no challenger to collude with, because
-  nobody issues the challenge.**
-- **Collusion between a provider and an uploader is unfixable by any proof
-  system** while the network MINTS the reward, because every proof passes
-  honestly. It becomes economically pointless the moment the uploader pays
-  instead. That is an economic decision, not a cryptographic one.
-- Honest ceiling: this buys **demonstrated retrievability by a distinct
-  identity**, not physical storage. Outsourcing (fetch-on-challenge) and
-  cross-identity deduplication both survive; the second reduces to the Sybil
-  problem, where it belongs.
-
----
-
-**Direction as of 2026-09-21 — remove the payment rather than prove the claim.**
-Measured in `sim/reciprocity.ts`: throttling reads and writes against a
-pairwise, locally-metered reciprocity budget serves contributors ~8× better than
-free-riders with no mintable value anywhere in the system, which makes this
-finding *disappear* instead of being patched — there is no payout left for a
-self-report to meter. Full option space, the black-hat pass and the three
-measured failure modes: [CUSTODY-PROOFS.md](CUSTODY-PROOFS.md) → *Paying per
-read and per write — and then not paying at all*. Not yet decided or built.
+What replaced it is priced rather than proven, and that is stated where it
+lives: collusion is bounded by a per-reader cap, a distinct-reader floor and
+the identity gate, not made impossible (CUSTODY-PROOFS.md → 2b–2d).
 
 ## The invariant has two dimensions (2026-09-21)
 
