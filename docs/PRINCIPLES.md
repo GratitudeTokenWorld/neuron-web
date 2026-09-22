@@ -105,7 +105,24 @@ what it would take to find out.
 
 *Procedure: [SCREENING.md](SCREENING.md) → Numbers without provenance.*
 
-## 6. The principles evolve with Lucian.
+## 6. Abundance and regeneration, not scarcity.
+
+The universe is abundant: things regenerate and recycle, and so must this
+system. Value here comes from **work done**, never from hoarding — a unit is
+earned by serving and destroyed by consuming, and what matters is that the flow
+tracks real work, not that the total is capped.
+
+A currency that must be hoarded to hold value contradicts a network whose
+durability is itself a flow. It also makes late joiners pay more than early ones
+for the same thing, permanently — which is Principle 1 failing in the economics
+rather than in the code, and is the shape of a scheme where early holders are
+paid by late entrants instead of by utility.
+
+An unbounded supply is therefore not a defect to be corrected. Design for
+circulation, and watch the ratio between what is created and what is consumed
+rather than the total that exists.
+
+## 7. The principles evolve with Lucian.
 
 These rules, the goals behind them and the definitions they use are meant to
 improve continuously, **together with Lucian**: ask for his input rather than

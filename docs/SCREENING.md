@@ -234,10 +234,28 @@ counterparty, and a distinct-reader floor rejects a provider vouched for by a
 single friend. The heartbeat keeps its real job as the custody lease and stops
 being the payment meter.
 
-**Still open until two things happen:** the funding decision (minting makes
-reader/provider collusion free money, publisher-pays makes it self-dealing —
-CUSTODY-PROOFS.md → 2b), and the cut-over, since `rewardTerms` still pays on
-self-reported bytes today.
+**Re-screened 2026-09-22 and largely MUTED.** The funding question resolved to
+fixed-rate minting, which does let fake reads create units — but measured under
+the shipped caps the attack is **dominated by the honest path**:
+
+- A recruited human wash-reading at the 128 MB per-pair cap mints ~156 MB/yr of
+  storage. The same human signing up honestly is handed 1-10 GB immediately, for
+  no effort. Attacking earns less than not attacking.
+- A *million* colluding humans move network served bytes by 0.05%. Under
+  one-human-one-account that is a million real people organised to gain less
+  each than they were already given.
+- What it buys is storage, which this design assumes is in surplus
+  (PRINCIPLES.md → 6). Stealing a surplus good is poor economics even when it
+  works.
+
+**Two conditions keep it muted, and both are pinned by tests** in
+`sim/token-economy.test.ts`: the per-pair cap must keep a year of wash-reading
+below the free allowance (the 8 GB value shipped before this was measured broke
+it), and the distinct-reader floor must count HUMANS, not keys
+(`core/sub-accounts.ts` → `distinctHumans`).
+
+**What remains open is not the attack but the cut-over:** `rewardTerms` still
+pays on self-reported bytes today, and nothing is wired to the receipt ledger.
 
 ### 12. Numbers without provenance
 

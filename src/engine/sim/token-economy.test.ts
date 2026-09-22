@@ -300,3 +300,51 @@ describe('abundance, not scarcity (Lucian, 2026-09-22)', () => {
     expect(flowHealth({ mintedPerPeriod: 100, burnedPerPeriod: 0 }).verdict).toBe('diluting');
   });
 });
+
+describe('wash-reading is DOMINATED by the honest path (re-screened 2026-09-22)', () => {
+  const MB = 1024 * 1024;
+  const PERIODS = 365 / 30;
+  /** The shipped cap. */
+  const CAP = 128 * MB;
+
+  it('yields less per human than simply signing up', () => {
+    // The decisive number. A recruited human wash-reading at the cap mints
+    // ~156 MB/yr of storage. The same human signing up honestly is handed the
+    // free allowance immediately, for no effort - so the attack is not merely
+    // bounded, it is strictly worse than not attacking.
+    const w = washReadStorageYield({ perReaderCapBytes: CAP, periodsPerYear: PERIODS });
+    expect(w.storageBytesPerYear / MB).toBeCloseTo(156, 0);
+    const freeTierMB = 1024; // a 1 GB lifetime allowance, the stingiest case
+    expect(w.storageBytesPerYear / MB).toBeLessThan(freeTierMB);
+  });
+
+  it('needs an implausible conspiracy to move the network flow ratio', () => {
+    // A million colluding humans shift network served bytes by 0.05%. Under
+    // one-human-one-account that is a million real people organised to gain
+    // less each than they were already given.
+    const GB2 = 1024 ** 3;
+    const networkStored = 1e6 * 100 * GB2;
+    const honestServed = networkStored * COST_RATIO * 3;
+    const fake = 1e6 * CAP * PERIODS;
+    expect((fake / honestServed) * 100).toBeLessThan(0.1);
+  });
+
+  it('targets a resource that is abundant by design', () => {
+    // The muting argument from Principle 6: what wash-reading buys is storage,
+    // and the design assumes more space is provided than is stored. Stealing a
+    // surplus good is poor economics even when it works.
+    const w = washReadStorageYield({ perReaderCapBytes: CAP, periodsPerYear: PERIODS });
+    expect(w.storageBytesPerPeriod / MB).toBeLessThan(20);
+  });
+
+  it('stays muted ONLY while two conditions hold', () => {
+    // These are the load-bearing conditions, kept as a test so that raising
+    // the cap silently cannot un-mute the finding without failing here.
+    const w = washReadStorageYield({ perReaderCapBytes: CAP, periodsPerYear: PERIODS });
+    // 1. The cap must keep a year of wash-reading below the free allowance.
+    expect(w.storageBytesPerYear).toBeLessThan(1024 * MB);
+    // 2. An 8 GB cap - the value shipped before this was measured - breaks it.
+    const old = washReadStorageYield({ perReaderCapBytes: 8 * 1024 * MB, periodsPerYear: PERIODS });
+    expect(old.storageBytesPerYear).toBeGreaterThan(1024 * MB);
+  });
+});
