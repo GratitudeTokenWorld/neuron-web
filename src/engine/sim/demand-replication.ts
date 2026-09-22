@@ -74,8 +74,17 @@ export const linearPolicy: TargetFn = (r) =>
 export const linearCappedPolicy: TargetFn = (r) =>
   Math.min(MAX_REPLICA_TARGET, linearPolicy(r));
 
-/** What ships. */
-export const logPolicy: TargetFn = (r) => replicaTarget(r);
+/**
+ * The log2 curve that shipped until 2026-09-22, kept as the comparison that
+ * justified replacing it. No longer what runs.
+ */
+export const logPolicy: TargetFn = (r) => {
+  if (!(r > POPULARITY_FLOOR)) return REDUNDANCY_TARGET;
+  return Math.min(MAX_REPLICA_TARGET, REDUNDANCY_TARGET + Math.floor(Math.log2(r / POPULARITY_FLOOR)) + 1);
+};
+
+/** What ships — linear and capped, driving the real `replicaTarget`. */
+export const shippingPolicy: TargetFn = (r) => replicaTarget(r);
 
 export interface PolicyCost {
   name: string;

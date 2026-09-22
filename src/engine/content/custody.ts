@@ -142,15 +142,26 @@ export function liveHolders(holders: Iterable<string>, isLive: LivePredicate): s
  * *popularity has to add serving capacity rather than only load*
  * (ARCHITECTURE.md → Fan-IN, principle 2).
  *
- * **Why growth is logarithmic rather than linear** (the "one more copy per 10
- * reads an hour" rule, considered 2026-09-22): linear is the correct control law
- * if assigned holders were the only servers, because it holds reads-per-holder
- * constant. They are not. Anyone who fetched a CID can serve it, so serving
- * capacity already grows with the audience at no cost, and the assigned set only
- * has to cover what caches miss. Linear growth would let one viral object
- * conscript the fleet: at a copy per 10 reads/hour, a million reads an hour
- * demands 100,000 leased copies. Measured comparison over a Zipf workload:
- * `sim/demand-replication.ts`.
+ * **Growth is LINEAR, capped** — one more copy per `POPULARITY_FLOOR` reads in
+ * the window (Lucian's rule, adopted 2026-09-22 after measuring it). The
+ * previous log2 curve was chosen to stop a viral object conscripting the fleet,
+ * and `sim/demand-replication.ts` showed that fear was misplaced: over a Zipf
+ * workload uncapped linear costs ~2x total fleet storage, not 100x, because the
+ * tail sits at the floor. The real risk was concentration — one object
+ * demanding 82,721 copies — and `MAX_REPLICA_TARGET` is what answers that, not
+ * the shape of the curve.
+ *
+ * With both capped, log and linear differ by ~11% of fleet storage and 1.6
+ * points of required cache hit rate. What differs materially is responsiveness:
+ * linear reaches the cap at 200 reads/window where log needs ~5 million, so hot
+ * content gets its copies while the demand is still there. That is the entire
+ * point of demand-scaling, and performance on reads is the priority
+ * (CUSTODY-PROOFS.md → Reframe: people abandon an image at three seconds).
+ *
+ * Screened before the switch: security is unchanged (same cap, same
+ * attacker-written target, same clamp on arrival); performance improves where
+ * it is felt and costs ~11% more storage; decentralisation improves slightly,
+ * since more copies sooner means more nodes serving.
  *
  * The cap is not a tuning choice. This target travels inside a `CacheRequest`,
  * so it is a number an ATTACKER writes; `MAX_REPLICA_TARGET` is what stops a
@@ -162,8 +173,11 @@ export function liveHolders(holders: Iterable<string>, isLive: LivePredicate): s
  * raises the number of holders the network holds *responsible*.
  */
 export function replicaTarget(readsPerWindow: number): number {
-  if (!(readsPerWindow > POPULARITY_FLOOR)) return REDUNDANCY_TARGET;
-  const surplus = Math.floor(Math.log2(readsPerWindow / POPULARITY_FLOOR)) + 1;
+  if (!(readsPerWindow > 0)) return REDUNDANCY_TARGET;
+  // One more copy per `POPULARITY_FLOOR` reads in the window — Lucian's rule,
+  // adopted 2026-09-22 after the measurement showed the curve barely matters
+  // once the cap is applied, and that this one reaches the cap far sooner.
+  const surplus = Math.floor(readsPerWindow / POPULARITY_FLOOR);
   return Math.min(MAX_REPLICA_TARGET, REDUNDANCY_TARGET + surplus);
 }
 

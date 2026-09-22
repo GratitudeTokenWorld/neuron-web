@@ -49,6 +49,24 @@ export interface StreamChunk {
   size: number; // stored byte length (after encryption)
 }
 
+/**
+ * Peer addresses retained as block-fetch fallbacks.
+ *
+ * An LRU bound, not a capacity estimate: what matters is that the set has a
+ * remover at all. 256 is far more than a read needs and small enough that the
+ * memory is irrelevant.
+ */
+const MAX_PEER_FALLBACKS = 256;
+
+/**
+ * Peers raced in parallel for one block.
+ *
+ * The amplification bound. A block lives on its assigned holders or on a reader
+ * that cached it, and both are in the priority list or recently useful; asking
+ * everyone was cost without a better hit rate.
+ */
+const MAX_PARALLEL_FETCH = 8;
+
 /** Virtual HTTP port used by each SmokeStore node to serve blocks to peers */
 const SMOKE_BLOCK_PORT = 5891;
 
@@ -236,6 +254,16 @@ export class SmokeStore {
   private fs!: FileSystem.FileSystem;
   private hubUrl: string;
   private started = false;
+  /**
+   * Peers that might hold a block, most-recently-seen last.
+   *
+   * A `Set` with an `add` and no remover until 2026-09-22, seeded from every
+   * peer that ever connected — three defects in one field: unbounded state
+   * keyed by an outsider, a per-read fan-out that grew for the life of the
+   * process, and an amplification vector where one cheap read caused work at
+   * every peer we had ever seen. It is also what makes reader-caches findable
+   * without announcing, so it is BOUNDED rather than removed.
+   */
   private peerFallbacks = new Set<string>();
 
   /** OPFS directory handle for large blocks — null if OPFS unavailable */
@@ -381,7 +409,21 @@ export class SmokeStore {
   }
 
   addPeerFallback(addr: string): void {
-    if (addr) this.peerFallbacks.add(addr);
+    if (!addr) return;
+    // Re-inserting moves it to the end: `Set` preserves insertion order, so
+    // deleting first makes this a plain LRU with no extra structure.
+    this.peerFallbacks.delete(addr);
+    this.peerFallbacks.add(addr);
+    while (this.peerFallbacks.size > MAX_PEER_FALLBACKS) {
+      const oldest = this.peerFallbacks.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.peerFallbacks.delete(oldest);
+    }
+  }
+
+  /** A peer answered — keep it near the front of the queue. */
+  private touchPeerFallback(addr: string): void {
+    if (this.peerFallbacks.has(addr)) this.addPeerFallback(addr);
   }
 
   getAllPeerFallbacks(): string[] {
@@ -505,10 +547,15 @@ export class SmokeStore {
 
     // Peer fetch
     const prioritySet = new Set(priorityPeers ?? []);
+    // Bounded fan-out. `Promise.any` over EVERY known peer turned one read into
+    // N parallel WebRTC fetches — amplification that grew as the node stayed
+    // up. Known holders first, then the most recently useful fallbacks, capped:
+    // a block is either on one of these or the repair path is the right answer,
+    // and asking a hundred peers was never going to find it either.
     const peers = [
       ...Array.from(prioritySet),
-      ...Array.from(this.peerFallbacks).filter(p => !prioritySet.has(p)),
-    ];
+      ...Array.from(this.peerFallbacks).reverse().filter(p => !prioritySet.has(p)),
+    ].slice(0, MAX_PARALLEL_FETCH);
     console.log(`[SmokeStore] retrieve: ${shortCid}… not local — trying ${peers.length} peer(s)`);
     if (peers.length === 0) throw new Error(`Block not found locally and no peer fallbacks: ${shortCid}`);
 
@@ -522,6 +569,7 @@ export class SmokeStore {
       const resp = await this.network.Http.fetch(url);
       if (!resp.ok) throw new Error(`peer ${peer.slice(0, 8)} returned ${resp.status}`);
       const data = new Uint8Array(await resp.arrayBuffer());
+      this.touchPeerFallback(peer);
       const mb = (data.byteLength / 1_048_576).toFixed(2);
       console.log(`[SmokeStore] retrieve: received ${mb} MB from ${peer.slice(0, 12)} in ${(performance.now() - t0).toFixed(0)} ms`);
       // Route to OPFS if large, smoke FS if small

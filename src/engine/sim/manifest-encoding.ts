@@ -121,3 +121,61 @@ export function indexCost(args: {
 }): number {
   return args.files * args.perManifestBytes(args.shape);
 }
+
+// ── Choosing the chunk size ──────────────────────────────────────────────────
+
+/**
+ * What the chunk size actually trades (Lucian asked for it measured,
+ * 2026-09-22).
+ *
+ * Three costs move in opposite directions, so the answer is a minimum rather
+ * than a slope:
+ *
+ * 1. **Manifest bytes** fall as chunks grow — one digest per chunk.
+ * 2. **Round-trip overhead** falls as chunks grow. A reader fetches at most
+ *    `MAX_PARALLEL_FETCH` chunks at once (8, since the fan-out was bounded on
+ *    2026-09-22), so a file takes `ceil(chunks / parallel)` rounds and each
+ *    round pays a latency.
+ * 3. **Device inclusion** falls as chunks grow, and this one is a principle
+ *    rather than a number: a device can only hold content whose chunk fits in
+ *    its free space. Doubling the chunk size halves the set of devices that can
+ *    hold any piece of a large file at all (PRINCIPLES.md → 1).
+ */
+
+/** Chunks a reader fetches concurrently — mirrors `MAX_PARALLEL_FETCH`. */
+export const PARALLEL_FETCH = 8;
+
+/**
+ * Wall-clock to fetch a whole file, modelled.
+ *
+ * ASSUMED: per-peer bandwidth and latency, and that rounds are serial while
+ * chunks within a round are parallel. That is pessimistic — a real client
+ * pipelines — so treat it as an upper bound on the latency term rather than a
+ * prediction.
+ */
+export function downloadModel(args: {
+  fileBytes: number;
+  chunkSize: number;
+  perPeerBytesPerSec: number;
+  latencyMs: number;
+  parallel?: number;
+}): { seconds: number; rounds: number; latencySeconds: number; transferSeconds: number } {
+  const parallel = args.parallel ?? PARALLEL_FETCH;
+  const n = chunkCount({ fileBytes: args.fileBytes, chunkSize: args.chunkSize });
+  const rounds = Math.ceil(n / parallel);
+  const latencySeconds = (rounds * args.latencyMs) / 1000;
+  // Aggregate bandwidth is `parallel` peers at once.
+  const transferSeconds = args.fileBytes / (args.perPeerBytesPerSec * parallel);
+  return { seconds: latencySeconds + transferSeconds, rounds, latencySeconds, transferSeconds };
+}
+
+/**
+ * Share of devices that can hold at least one chunk.
+ *
+ * `freeSpaceBytes` is a sample of the fleet — Principle 1 promises a long tail
+ * of small ones, so this is the number a larger chunk size spends.
+ */
+export function deviceInclusion(chunkSize: number, freeSpaceBytes: readonly number[]): number {
+  if (freeSpaceBytes.length === 0) return 0;
+  return freeSpaceBytes.filter(b => b >= chunkSize).length / freeSpaceBytes.length;
+}

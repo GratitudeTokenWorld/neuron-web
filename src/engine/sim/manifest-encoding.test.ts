@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   chunkCount, jsonBytes, binaryBytes, floorBytes, shareOfFile,
   decompressBreakEvenBitsPerSec, indexCost,
+  downloadModel, deviceInclusion,
 } from './manifest-encoding.js';
 import { chunkContent, DEFAULT_CHUNK_SIZE } from '../content/chunking.js';
 import { hashHex } from '../core/hash.js';
@@ -226,5 +227,68 @@ describe('scaling: where the manifest actually matters', () => {
     const at8 = binaryBytes({ fileBytes: 4 * GB, chunkSize: 8 * MB });
     const at16 = binaryBytes({ fileBytes: 4 * GB, chunkSize: 16 * MB });
     expect(at16).toBeLessThan(at8 * 0.55);
+  });
+});
+
+describe('choosing the chunk size (measured, 2026-09-22)', () => {
+  const FILE = 4 * GB;
+  // ASSUMED fleet: a long tail of small devices, as Principle 1 promises.
+  // Sensor/SBC 64 MB, phones 256 MB - 1 GB, laptops 8 GB, servers 200 GB.
+  const FLEET = [
+    ...new Array(20).fill(64 * MB),
+    ...new Array(30).fill(256 * MB),
+    ...new Array(20).fill(1 * GB),
+    ...new Array(20).fill(8 * GB),
+    ...new Array(10).fill(200 * GB),
+  ];
+
+  it('shows round-trip overhead dominating at small chunk sizes', () => {
+    // The cost that got sharper when the fetch fan-out was bounded to 8: a
+    // reader now pays ceil(chunks / 8) serial rounds.
+    const small = downloadModel({ fileBytes: FILE, chunkSize: 1 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+    const mid = downloadModel({ fileBytes: FILE, chunkSize: 8 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+    const large = downloadModel({ fileBytes: FILE, chunkSize: 32 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+
+    expect(small.rounds).toBe(512);
+    expect(mid.rounds).toBe(64);
+    expect(large.rounds).toBe(16);
+    // Latency cost falls 8x from 1 MB to 8 MB…
+    expect(small.latencySeconds / mid.latencySeconds).toBeCloseTo(8, 0);
+    // …but transfer dominates the total at every size on this link, so the
+    // latency term is not what should decide the default.
+    expect(mid.transferSeconds).toBeGreaterThan(mid.latencySeconds * 20);
+  });
+
+  it('shows device inclusion falling as chunks grow — the real cost', () => {
+    // Principle 1 in a number. Every doubling past a device class's free space
+    // removes that whole class from being able to hold any piece of the file.
+    expect(deviceInclusion(1 * MB, FLEET)).toBe(1);
+    expect(deviceInclusion(8 * MB, FLEET)).toBe(1);
+    expect(deviceInclusion(64 * MB, FLEET)).toBe(1);
+    // Past the smallest class, inclusion starts dropping.
+    expect(deviceInclusion(128 * MB, FLEET)).toBeLessThan(0.85);
+    expect(deviceInclusion(512 * MB, FLEET)).toBeLessThan(0.55);
+  });
+
+  it('finds 8 MB already sits in the flat part of every curve', () => {
+    // The conclusion: at 8 MB the manifest is 0.0004% of the file, the latency
+    // term is under 5% of the download, and 100% of the modelled fleet can
+    // still hold a chunk. Nothing is being paid for that a change would
+    // recover, so the default stays — measured rather than assumed.
+    const m = downloadModel({ fileBytes: FILE, chunkSize: 8 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+    expect(m.latencySeconds / m.seconds).toBeLessThan(0.05);
+    expect(shareOfFile({ fileBytes: FILE, chunkSize: 8 * MB }, binaryBytes({ fileBytes: FILE, chunkSize: 8 * MB })))
+      .toBeLessThan(0.00001);
+    expect(deviceInclusion(8 * MB, FLEET)).toBe(1);
+  });
+
+  it('would cost inclusion to buy back a latency term that is already small', () => {
+    // The trade a larger default would make, stated as numbers: going to
+    // 128 MB saves ~1 second of round-trips on a 4 GB file and removes a fifth
+    // of the modelled fleet from holding any of it.
+    const at8 = downloadModel({ fileBytes: FILE, chunkSize: 8 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+    const at128 = downloadModel({ fileBytes: FILE, chunkSize: 128 * MB, perPeerBytesPerSec: 1.25e6, latencyMs: 17 });
+    expect(at8.latencySeconds - at128.latencySeconds).toBeLessThan(2);
+    expect(deviceInclusion(8 * MB, FLEET) - deviceInclusion(128 * MB, FLEET)).toBeGreaterThan(0.15);
   });
 });

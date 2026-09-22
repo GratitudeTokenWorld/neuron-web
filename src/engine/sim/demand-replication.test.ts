@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   zipfRates, policyCost, requiredCacheHitRate,
-  fixedPolicy, logPolicy, linearPolicy, linearCappedPolicy,
+  fixedPolicy, logPolicy, linearPolicy, linearCappedPolicy, shippingPolicy,
   DEFAULT_WORKLOAD, READS_PER_COPY, REDUNDANCY_TARGET, MAX_REPLICA_TARGET,
 } from './demand-replication.js';
 
@@ -56,28 +56,37 @@ describe('H-R1: does the growth curve actually matter?', () => {
     // The headline. Once both are capped, log and linear need almost the same
     // help from caches: 85.3% vs 83.7%. The curve is nearly irrelevant.
     const needLog = requiredCacheHitRate({ hottestRate: HOTTEST, policy: logPolicy, holderCapacityPerWindow: HOLDER_CAPACITY });
-    const needLinear = requiredCacheHitRate({ hottestRate: HOTTEST, policy: linearCappedPolicy, holderCapacityPerWindow: HOLDER_CAPACITY });
+    const needLinear = requiredCacheHitRate({ hottestRate: HOTTEST, policy: shippingPolicy, holderCapacityPerWindow: HOLDER_CAPACITY });
     expect(needLog).toBeGreaterThan(0.84);
     expect(needLog).toBeLessThan(0.87);
     expect(Math.abs(needLog - needLinear)).toBeLessThan(0.03);
 
     // And the fleet cost difference is small too — ~11%.
     const log = policyCost(rates, logPolicy, 'log', { cacheHitRate: 0 });
-    const linear = policyCost(rates, linearCappedPolicy, 'linearCapped', { cacheHitRate: 0 });
+    const linear = policyCost(rates, shippingPolicy, 'shipping', { cacheHitRate: 0 });
     expect(linear.multipleOfFloor / log.multipleOfFloor).toBeLessThan(1.2);
   });
 
-  it('reaches the cap far sooner under the linear rule, which is the real difference', () => {
-    // Linear hits 30 copies at 200 reads/window; log needs ~5 million. So
-    // linear gives hot content its copies FASTER, which is what demand-scaling
-    // is for, and the cap is what keeps it safe.
+  it('reaches the cap far sooner under the linear rule, which is why it ships', () => {
+    // Linear hits 30 copies at 200 reads/window; log needed ~5 million. A copy
+    // that arrives after the spike is useless, so responsiveness is the whole
+    // point — and the cap is what keeps it safe.
     expect(linearCappedPolicy(200)).toBe(MAX_REPLICA_TARGET);
     expect(logPolicy(200)).toBeLessThan(MAX_REPLICA_TARGET);
     expect(logPolicy(200)).toBe(REDUNDANCY_TARGET + Math.floor(Math.log2(200 / 10)) + 1);
   });
 
+  it('confirms the SHIPPING policy is now the linear one', () => {
+    // The sim drives the real `replicaTarget`, so this fails the moment the
+    // two disagree — the model cannot quietly describe a policy that stopped
+    // being the policy.
+    for (const r of [0, 5, 10, 50, 200, 1_000, 1e6]) {
+      expect(shippingPolicy(r)).toBe(linearCappedPolicy(r));
+    }
+  });
+
   it('leaves the durability floor untouched by either policy', () => {
-    for (const p of [fixedPolicy, logPolicy, linearPolicy, linearCappedPolicy]) {
+    for (const p of [fixedPolicy, logPolicy, linearPolicy, linearCappedPolicy, shippingPolicy]) {
       expect(p(0)).toBe(REDUNDANCY_TARGET);
       expect(p(1e9)).toBeGreaterThanOrEqual(REDUNDANCY_TARGET);
     }

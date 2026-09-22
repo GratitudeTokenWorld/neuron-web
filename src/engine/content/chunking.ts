@@ -74,3 +74,91 @@ export function verifyManifest(manifest: Manifest): boolean {
 }
 
 export type { Cid, Hex };
+
+// ── Compact wire encoding ────────────────────────────────────────────────────
+
+/**
+ * A manifest on the wire: raw 32-byte digests instead of 64-char hex, and no
+ * per-chunk `size` at all.
+ *
+ * Measured in `sim/manifest-encoding.ts` (2026-09-22): 16,400 bytes against
+ * 46,130 as hex-JSON for a 4 GB file — 2.8x — and 2,495 bytes SMALLER than
+ * gzipping that JSON while costing nothing to decompress. Compression was the
+ * idea screened; this is what the measurement recommended instead, because a
+ * SHA-256 is incompressible by construction and everything gzip recovered was
+ * the hex expansion and the JSON scaffolding.
+ *
+ * **The CID is NOT computed over these bytes.** It stays `hashJson` over the
+ * logical fields, so the address of a file never depends on how it was
+ * serialised. Hashing an encoding is how the same file ends up with different
+ * CIDs on different clients — the failure that made compression unacceptable in
+ * the first place, and it would apply just as much to this format.
+ *
+ * Layout, little-endian:
+ *   0  u8    version (1)
+ *   1  u8    reserved (0)
+ *   2  u16   reserved (0)
+ *   4  u64   size
+ *   12 u64   chunkSize
+ *   20 …     32-byte digests, in order
+ *
+ * Every chunk's size is DERIVED: `chunkSize` for all but the last, and the
+ * remainder for the last. Carrying it was pure redundancy.
+ */
+export const MANIFEST_WIRE_VERSION = 1;
+const WIRE_HEADER_BYTES = 20;
+
+export function encodeManifest(manifest: Manifest): Uint8Array {
+  const n = manifest.chunks.length;
+  const out = new Uint8Array(WIRE_HEADER_BYTES + n * 32);
+  const view = new DataView(out.buffer);
+  out[0] = MANIFEST_WIRE_VERSION;
+  view.setBigUint64(4, BigInt(manifest.size), true);
+  view.setBigUint64(12, BigInt(manifest.chunkSize), true);
+  for (let i = 0; i < n; i++) {
+    const hex = manifest.chunks[i]!.cid;
+    for (let b = 0; b < 32; b++) {
+      out[WIRE_HEADER_BYTES + i * 32 + b] = parseInt(hex.slice(b * 2, b * 2 + 2), 16);
+    }
+  }
+  return out;
+}
+
+/**
+ * Decode a wire manifest, or `null` if it is malformed.
+ *
+ * Returns null rather than throwing, and checks the declared sizes against the
+ * actual byte length BEFORE trusting either: this parses untrusted input, so a
+ * header claiming a billion chunks must cost nothing to reject.
+ */
+export function decodeManifest(bytes: Uint8Array): Manifest | null {
+  if (bytes.length < WIRE_HEADER_BYTES) return null;
+  if (bytes[0] !== MANIFEST_WIRE_VERSION) return null;
+  const body = bytes.length - WIRE_HEADER_BYTES;
+  if (body % 32 !== 0) return null;
+  const n = body / 32;
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const size = Number(view.getBigUint64(4, true));
+  const chunkSize = Number(view.getBigUint64(12, true));
+  if (!Number.isSafeInteger(size) || !Number.isSafeInteger(chunkSize)) return null;
+  if (size < 0 || chunkSize <= 0) return null;
+  // The chunk count is implied by size and chunkSize; a mismatch means the
+  // header and the body disagree, so neither can be trusted.
+  if (n !== Math.ceil(size / chunkSize) && !(size === 0 && n === 0)) return null;
+
+  const hex = '0123456789abcdef';
+  const chunks: ChunkRef[] = [];
+  for (let i = 0; i < n; i++) {
+    let cid = '';
+    for (let b = 0; b < 32; b++) {
+      const v = bytes[WIRE_HEADER_BYTES + i * 32 + b]!;
+      cid += hex[v >> 4]! + hex[v & 15]!;
+    }
+    // Derived, not transmitted.
+    const isLast = i === n - 1;
+    chunks.push({ cid, size: isLast ? size - chunkSize * (n - 1) : chunkSize });
+  }
+  const cid = hashJson({ size, chunkSize, chunks });
+  return { cid, size, chunkSize, chunks };
+}

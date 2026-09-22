@@ -864,9 +864,62 @@ export class StorageManager extends EventEmitter {
     const delay = pollIntervalMs(spotCheckBaseMs(), population);
     this.spotCheckTimer = setTimeout(() => {
       this.runSpotChecks()
+        .then(() => this.runDueCalibration())
         .catch(() => {})
         .finally(() => this.scheduleNextSpotCheck());
     }, delay);
+  }
+
+  /**
+   * Calibrate ONE provider whose measurement is missing or stale.
+   *
+   * Rides the spot-check timer rather than owning one: that timer already
+   * scales with population and jitters (`pollIntervalMs`), which is exactly
+   * what a probe needs — a million clients calibrating on a fixed interval is
+   * the thundering herd this codebase keeps warning about, except here every
+   * request is deliberately expensive.
+   *
+   * One provider per sweep, not all of them. The probe's cost IS the thing
+   * being measured, so calibrating the whole fleet each round would be a
+   * self-inflicted load test on other people's machines.
+   */
+  private async runDueCalibration(): Promise<void> {
+    if (!this.started) return;
+    const now = Date.now();
+    const ttl = this.calibrationTtlMs();
+
+    // Only providers we have a reason to measure: ones holding content we
+    // track. Probing strangers would be work for someone else's benefit and an
+    // easy way to be pointed at a victim.
+    const holders = new Set<string>();
+    for (const tracked of this.trackedCids.values()) {
+      for (const pub of tracked.confirmedProviders) holders.add(pub);
+    }
+    if (holders.size === 0) return;
+
+    const due = [...holders].filter(pub => {
+      const at = this.calibratedAt.get(pub) ?? 0;
+      if (now - at <= ttl) return false;
+      return !!this.providerOf(pub)?.smokeAddr;
+    });
+    if (due.length === 0) return;
+
+    // Round-robin by staleness, so one unreachable provider cannot starve the
+    // rest of the fleet of measurements.
+    due.sort((a, b) => (this.calibratedAt.get(a) ?? 0) - (this.calibratedAt.get(b) ?? 0));
+    const target = due[0]!;
+
+    const cid = [...this.trackedCids.entries()]
+      .find(([, t]) => t.confirmedProviders.has(target))?.[0];
+    if (!cid) return;
+
+    console.log(`[StorageManager] Calibrating ${target.slice(0, 12)}… against ${cid.slice(0, 16)}…`);
+    await this.calibrateProvider(target, cid).catch(err => {
+      // Say why. A silent return here is indistinguishable from the timer not
+      // firing (SCREENING.md → 2).
+      console.warn(`[StorageManager] Calibration of ${target.slice(0, 12)}… failed:`,
+        err instanceof Error ? err.message : String(err));
+    });
   }
 
   // ── Heartbeats ────────────────────────────────────────────────────────────

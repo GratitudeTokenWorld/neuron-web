@@ -33,9 +33,10 @@ describe('liveHolders', () => {
 });
 
 describe('replicaTarget', () => {
-  it('does not move for ordinary content', () => {
+  it('does not move for content nobody is reading', () => {
     expect(replicaTarget(0)).toBe(REDUNDANCY_TARGET);
-    expect(replicaTarget(POPULARITY_FLOOR)).toBe(REDUNDANCY_TARGET);
+    // Below one full step, the surplus is zero.
+    expect(replicaTarget(POPULARITY_FLOOR - 1)).toBe(REDUNDANCY_TARGET);
   });
 
   it('guarantees the durability floor however unpopular the file', () => {
@@ -46,16 +47,24 @@ describe('replicaTarget', () => {
     }
   });
 
-  it('grows logarithmically with demand, never linearly', () => {
-    const at200 = replicaTarget(200);
-    const at400 = replicaTarget(400);
-    const at800 = replicaTarget(800);
-    expect(at200).toBeGreaterThan(REDUNDANCY_TARGET);
-    // Each doubling of demand buys exactly one more holder.
-    expect(at400 - at200).toBe(1);
-    expect(at800 - at400).toBe(1);
-    // A 1000x demand spike must not buy 1000x the holders.
-    expect(replicaTarget(100_000)).toBeLessThan(REDUNDANCY_TARGET + 20);
+  it('grows linearly with demand — one copy per POPULARITY_FLOOR reads', () => {
+    // Switched from log2 on 2026-09-22 (Lucian). The measurement in
+    // sim/demand-replication.ts showed the cap does the work, not the curve,
+    // and that linear reaches the cap far sooner — which is the whole point of
+    // demand-scaling, since a copy that arrives after the spike is useless.
+    expect(replicaTarget(POPULARITY_FLOOR)).toBe(REDUNDANCY_TARGET + 1);
+    expect(replicaTarget(POPULARITY_FLOOR * 5)).toBe(REDUNDANCY_TARGET + 5);
+    // Each further step buys exactly one more holder, until the cap.
+    const a = replicaTarget(POPULARITY_FLOOR * 3);
+    const b = replicaTarget(POPULARITY_FLOOR * 4);
+    expect(b - a).toBe(1);
+  });
+
+  it('reaches the cap while the spike is still happening', () => {
+    // The property the log curve did not have: under log2 the cap needed ~5
+    // million reads per window, so hot content got its copies long after
+    // anyone wanted them.
+    expect(replicaTarget(POPULARITY_FLOOR * 20)).toBe(MAX_REPLICA_TARGET);
   });
 
   it('is capped, so one viral object cannot conscript the fleet', () => {
