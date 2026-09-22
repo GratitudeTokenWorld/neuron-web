@@ -32,14 +32,18 @@ Read in this order — do NOT re-derive what they already record:
   `storage-heartbeat` removed, `storage-settle` added, the storage payload
   reshaped. **Wipe before running against any existing chain**, client and
   relay. Nothing will migrate and nothing should try to.
-- **Relays** still run `890e047` (2026-09-21). Everything below is committed and
-  **NOT deployed**; `relay/server.ts` changed (the `/providers` scan), so a
-  deploy is needed before any of it is live. Relays are covered by neither
-  typecheck nor tests — re-read edits, and check `pm2 jlist` restart counts
-  **after** 60 s, not immediately.
-- Live probes to run after that deploy, both previously **ALL CHECKS PASSED**:
-  `npx tsx scripts/g1-resolve-smoke.mts` (55 checks) and
-  `npx tsx scripts/backfill-smoke.mts` (⚠ stops and starts a relay over ssh).
+- **Relays run `0498a82`, deployed 2026-09-22** — both boxes, both `online` at
+  4 restarts checked after 60 s, federated and at generation 19. The handoff
+  previously claimed `890e047`; they were already at `f88f769`, so trust
+  `git log --oneline -1` on the box over this file.
+  `npx tsx scripts/g1-resolve-smoke.mts` — **ALL CHECKS PASSED** after the
+  deploy. `scripts/backfill-smoke.mts` not re-run (⚠ it stops and starts a
+  relay over ssh).
+- Relays are covered by neither typecheck nor tests — re-read edits, and check
+  `pm2 jlist` restart counts **after** 60 s, not immediately.
+- **The relay archives still hold old-format blocks** and that is harmless:
+  relays do not validate storage blocks, and `/providers` now folds only
+  register/deregister. CLIENTS are the ones that need a wipe.
 - **E2E**: `npm run e2e` as
   `LOCAL_ONLY=1 TEST_FACE=1 STORAGE_TIMING=fast npm run dev`. **Not re-run since
   the storage economy changed** — T8/T9/T10 touch provider registration and
