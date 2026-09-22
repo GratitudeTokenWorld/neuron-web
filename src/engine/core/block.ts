@@ -42,13 +42,24 @@ export type BlockType =
   | 'storage-register'
   | 'storage-deregister'
   | 'storage-heartbeat'
-  | 'storage-reward';
+  | 'storage-settle';
 
 /**
  * Payload for the four `storage-*` block types. One optional object rather than
  * six flat fields, so the storage economy stays legible next to the payment and
  * NFT fields — `canonicalJson` sorts nested keys, so hashing stays deterministic.
  */
+/** The receipt shape as it appears on the wire (mirrors `content/read-receipts.ts`). */
+export interface ReadReceiptWire {
+  reader: string;
+  provider: string;
+  counter: number;
+  bytesTotal: number;
+  readsTotal: number;
+  lastLatencyMs: number;
+  ts: number;
+}
+
 export interface StoragePayload {
   /** register: declared capacity in GB — an upper bound offered, not usage. */
   capacityGB?: number;
@@ -68,10 +79,25 @@ export interface StoragePayload {
   storedBytes?: number;
   /** heartbeat: ISO 3166-1 alpha-2, self-reported; feeds geographic diversity. */
   countryCode?: string;
-  /** reward: the epoch claimed, plus the evidence its amount was derived from. */
-  epochDay?: number;
-  storedGB?: number;
-  heartbeatCount?: number;
+  /**
+   * settle: the reader-signed receipts the payout is derived from.
+   *
+   * They travel IN the block because validation may not depend on state a
+   * particular node happens to hold — a peer that had not seen the same
+   * receipts would reject a correctly-issued block and strand every block
+   * behind it. Carrying them makes the settlement self-contained: any node
+   * re-derives the same number from the same bytes.
+   *
+   * Bounded by `MAX_RECEIPTS_PER_SETTLEMENT`; readers that do not fit roll over
+   * to the next settlement, because their baselines only move when they are
+   * actually settled.
+   */
+  receipts?: ReadonlyArray<{ receipt: ReadReceiptWire; signature: string }>;
+  /** settle: the settlement period, strictly increasing per account. */
+  periodIndex?: number;
+  /** settle: roots of the off-chain publish and service records. */
+  publishRoot?: string;
+  serviceRoot?: string;
 }
 
 /** The signed content of a block (everything except the derived root/hash/sig). */
@@ -168,10 +194,11 @@ function canonicalContent(c: BlockContent): Record<string, unknown> {
     c.type === 'storage-register' || c.type === 'storage-deregister' || c.type === 'storage-heartbeat'
   ) {
     out.storage = c.storage;
-  } else if (c.type === 'storage-reward') {
-    // The claim AND the minted amount are both signed: a reward's whole security
-    // argument is that the amount can be re-derived from on-chain evidence and
-    // compared against what the signer committed to.
+  } else if (c.type === 'storage-settle') {
+    // The receipts AND the minted amount are both signed. The settlement's
+    // whole security argument is that any node can re-derive the amount from
+    // the receipts carried here and compare it with what the signer committed
+    // to — so both have to be inside the signature.
     out.storage = c.storage;
     out.amount = c.amount?.toString();
   }

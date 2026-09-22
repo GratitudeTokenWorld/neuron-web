@@ -291,7 +291,7 @@ export class NeuronNode extends EventEmitter {
     });
 
     this.storage.on('storage:heartbeat-sent', (d: unknown) => this.emit('storage:heartbeat-sent', d));
-    this.storage.on('storage:reward-issued',  (d: unknown) => this.emit('storage:reward-issued', d));
+    this.ledger.on('storage:settled', (d: unknown) => this.emit('storage:settled', d));
     this.storage.on('storage:cached',          (d: unknown) => this.emit('storage:cached', d));
 
     for (const pub of this.localKeys.keys()) {

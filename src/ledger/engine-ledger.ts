@@ -712,11 +712,12 @@ export class EngineLedger extends EventEmitter {
       case 'storage-heartbeat':
         this.emit('storage:heartbeat', { pub: block.accountId, timestamp: block.timestamp });
         break;
-      case 'storage-reward':
-        this.emit('storage:reward', {
+      case 'storage-settle':
+        this.emit('storage:settled', {
           pub: block.accountId,
           amount: Number(block.amount ?? 0n),
-          epochDay: block.storage?.epochDay ?? 0,
+          periodIndex: block.storage?.periodIndex ?? 0,
+          readers: block.storage?.receipts?.length ?? 0,
         });
         break;
       default:
@@ -854,9 +855,11 @@ export class EngineLedger extends EventEmitter {
       if (block.type === 'storage-register' || block.type === 'storage-deregister' || block.type === 'storage-heartbeat') {
         if (block.balance !== head.balance) return { success: false, error: `${block.type} must preserve balance` };
       }
-      if (block.type === 'storage-reward') {
-        if (block.amount === undefined || block.amount <= 0n) return { success: false, error: 'storage-reward amount must be positive' };
-        if (block.balance !== head.balance + block.amount) return { success: false, error: 'storage-reward balance inconsistent' };
+      if (block.type === 'storage-settle') {
+        // The minted amount must match the balance movement exactly, so the
+        // figure validated against the receipts is the figure actually paid.
+        if (block.amount === undefined || block.amount <= 0n) return { success: false, error: 'storage-settle amount must be positive' };
+        if (block.balance !== head.balance + block.amount) return { success: false, error: 'storage-settle balance inconsistent' };
       }
       if (block.type.startsWith('storage-')) {
         const err = this.providerLedger.validate(block, Date.now());

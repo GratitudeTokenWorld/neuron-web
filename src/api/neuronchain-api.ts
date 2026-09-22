@@ -74,7 +74,7 @@ export class NeuronChainAPI extends EventEmitter {
       'contract:deployed', 'contract:executed', 'contract:error',
       'inbox:signal', 'auto:received', 'resync',
       'storage:registered', 'storage:deregistered', 'storage:heartbeat-sent',
-      'storage:reward-issued', 'storage:cached', 'storage:deleted', 'storage:replaced',
+      'storage:settled', 'storage:cached', 'storage:deleted', 'storage:replaced',
       'node:started', 'node:stopped',
     ];
     for (const ev of events) {

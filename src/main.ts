@@ -3600,9 +3600,10 @@ function wireNodeEvents() {
     addLog(`Heartbeat sent for ${resolveNamePlain(pub)}`, 'info');
     refreshStorage();
   });
-  node.on('storage:reward-issued', (d: unknown) => {
-    const { pub, amount } = d as { pub: string; amount: number };
-    addLog(`Storage reward: +${formatUNIT(amount)} UNIT for ${resolveNamePlain(pub)}`, 'success');
+  node.on('storage:settled', (d: unknown) => {
+    const { pub, amount, readers } = d as { pub: string; amount: number; readers: number };
+    addLog(`Settled: +${formatUNIT(amount)} UNIT for ${resolveNamePlain(pub)}`
+      + ` (attested by ${readers} reader${readers === 1 ? '' : 's'})`, 'success');
     refreshStorage();
   });
   node.on('storage:cached', (d: unknown) => {

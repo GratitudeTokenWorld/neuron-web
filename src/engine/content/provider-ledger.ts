@@ -1,3 +1,5 @@
+import { creditFromSignedReceipts, receiptPayload, MAX_RECEIPTS_PER_SETTLEMENT } from './read-receipts.js';
+import { verify } from '../core/keys.js';
 import type { Block } from '../core/block.js';
 
 /**
@@ -247,6 +249,8 @@ export interface StorageProviderState {
   avgLatencyMs: number;
   spotCheckPassRate: number;
   score: number;
+  /** Highest settlement period applied for this provider (-1 = never settled). */
+  lastSettledPeriod?: number;
   /**
    * True when this record came from discovery rather than from a chain we hold
    * (see provider-discovery.ts). Its `score` and `heartbeatsLast24h` are NOT
@@ -306,6 +310,18 @@ export class ProviderLedger {
 
   private readonly epochs = new Map<string, Map<number, EpochRecord>>();
   /** pub → capacity changes over time, oldest first. One entry per register/deregister. */
+  /**
+   * Cumulative bytes already settled, per (provider, reader).
+   *
+   * Derived only from settle blocks that have been APPLIED, so every node that
+   * holds the same chain holds the same baselines — which is what lets
+   * validation be deterministic without anyone sharing receipt history.
+   */
+  private readonly settledBytes = new Map<string, Map<string, number>>();
+
+  /** Highest settled period per provider, so a period can never be replayed. */
+  private readonly lastSettledPeriod = new Map<string, number>();
+
   private readonly capacityHistory = new Map<string, { ts: number; capacityGB: number }[]>();
   /** pub → timestamps of recent counted heartbeats (bounded ring). */
   private readonly heartbeatTimes = new Map<string, number[]>();
@@ -422,6 +438,28 @@ export class ProviderLedger {
    * counted*: it renews nothing, earns nothing, and the chain stays intact. Safety
    * comes from the reward ceiling, which only counts renewals.
    */
+  /** Baselines for one provider — empty until its first settlement. */
+  settledFor(pub: string): ReadonlyMap<string, number> {
+    return this.settledBytes.get(pub) ?? new Map();
+  }
+
+  /**
+   * What a settle block is worth, re-derived from the receipts it carries.
+   *
+   * Pure in everything that matters: the only state it reads is the settled
+   * baselines, which come from applied blocks. Two nodes holding the same chain
+   * cannot disagree.
+   */
+  settlementCredit(block: Block): { payableBytes: number; distinctReaders: number; reason: string } {
+    const receipts = block.storage?.receipts ?? [];
+    return creditFromSignedReceipts({
+      provider: block.accountId,
+      receipts: receipts.map(r => ({ receipt: r.receipt, signature: r.signature })),
+      verify: (payload, signature, reader) => verify(signature, payload, reader),
+      settledBytes: this.settledFor(block.accountId),
+    });
+  }
+
   validate(block: Block, now: number): string | null {
     switch (block.type) {
       case 'storage-register': {
@@ -454,6 +492,35 @@ export class ProviderLedger {
         }
         return null;
       }
+      case 'storage-settle': {
+        const st = block.storage;
+        if (!st) return 'storage-settle: missing storage payload';
+        if (typeof st.periodIndex !== 'number') return 'storage-settle: missing periodIndex';
+        const last = this.lastSettledPeriod.get(block.accountId) ?? -1;
+        if (st.periodIndex <= last) {
+          // Replaying a period would pay twice for the same bytes: the
+          // baselines have already moved past them.
+          return `storage-settle: period ${st.periodIndex} is not after ${last}`;
+        }
+        const receipts = st.receipts ?? [];
+        if (receipts.length > MAX_RECEIPTS_PER_SETTLEMENT) {
+          // Bounded so one block cannot be arbitrarily large. Readers that do
+          // not fit simply settle next period — their baselines have not moved.
+          return `storage-settle: ${receipts.length} receipts exceeds ${MAX_RECEIPTS_PER_SETTLEMENT}`;
+        }
+        const derived = this.settlementCredit(block);
+        if (derived.payableBytes <= 0) return `storage-settle: ${derived.reason}`;
+        const claimed = Number(block.amount ?? 0n);
+        if (!(claimed > 0)) return 'storage-settle: amount must be positive';
+        if (claimed > derived.payableBytes) {
+          // THE check. The provider signs this block and is paid by it, and
+          // still cannot choose the number: every node recomputes it from the
+          // reader-signed receipts carried inside.
+          return `storage-settle: amount ${claimed} exceeds ${derived.payableBytes} supported by receipts`;
+        }
+        return null;
+      }
+
       default:
         return null;
     }
@@ -467,6 +534,7 @@ export class ProviderLedger {
       case 'storage-register': return this.applyRegister(block);
       case 'storage-deregister': return this.applyDeregister(block);
       case 'storage-heartbeat': return this.applyHeartbeat(block, now);
+      case 'storage-settle': return this.applySettle(block);
       default: return;
     }
   }
@@ -511,6 +579,30 @@ export class ProviderLedger {
     // back past the gap to the *old* declaration and pay for days it was away.
     this.pushCapacity(pub, block.timestamp, 0);
     this.providers.delete(pub);
+  }
+
+  /**
+   * Move the baselines so the same bytes can never be settled twice.
+   *
+   * Only receipts that actually verified are advanced, and only up to the
+   * cumulative total they attested — so a receipt rejected during validation
+   * leaves its reader's baseline untouched and it can settle later.
+   */
+  private applySettle(block: Block): void {
+    const st = block.storage;
+    if (!st || typeof st.periodIndex !== 'number') return;
+    let baselines = this.settledBytes.get(block.accountId);
+    if (!baselines) { baselines = new Map(); this.settledBytes.set(block.accountId, baselines); }
+    for (const env of st.receipts ?? []) {
+      const r = env.receipt;
+      if (r.provider !== block.accountId || r.reader === r.provider) continue;
+      if (!verify(env.signature, receiptPayload(r), r.reader)) continue;
+      const prev = baselines.get(r.reader) ?? 0;
+      if (r.bytesTotal > prev) baselines.set(r.reader, r.bytesTotal);
+    }
+    this.lastSettledPeriod.set(block.accountId, st.periodIndex);
+    const p = this.providers.get(block.accountId);
+    if (p) p.lastSettledPeriod = st.periodIndex;
   }
 
   private applyHeartbeat(block: Block, now: number): void {
