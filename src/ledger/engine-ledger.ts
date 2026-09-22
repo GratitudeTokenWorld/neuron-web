@@ -186,7 +186,12 @@ export class EngineLedger extends EventEmitter {
    * reward evidence. Pure engine module — the ledger only signs blocks and enforces
    * balance conservation on top of it.
    */
-  private readonly providerLedger = new ProviderLedger();
+  /**
+   * Public so the network layer can feed it reader-attested service volume,
+   * which since 2026-09-22 is the ONLY thing that makes a reward payable
+   * (`content/read-receipts.ts` -> `content/storage-settlement.ts`).
+   */
+  readonly providerLedger = new ProviderLedger();
 
   constructor(
     readonly network: 'mainnet' | 'testnet' = 'testnet',
@@ -688,7 +693,10 @@ export class EngineLedger extends EventEmitter {
     // and being rejected mid-chain would strand everything after it.
     const now = Date.now();
     const epochDay = claimableEpochDay(now);
-    const terms = this.providerLedger.rewardTerms(pub, epochDay);
+    // Issuance requires reader-signed evidence; validation does not (see
+    // `rewardTerms`). A node will not MINT on a self-report, and still accepts
+    // peers' blocks so a chain is never stranded mid-migration.
+    const terms = this.providerLedger.rewardTerms(pub, epochDay, { requireAttested: true });
     if (typeof terms === 'string') return { error: `Storage reward: ${terms}` };
     return this.appendStorageBlock(
       pub, keys, 'storage-reward', head.balance + BigInt(terms.amount),

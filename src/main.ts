@@ -716,7 +716,7 @@ function showAccountDetail(pub: string) {
       <div class="stats-grid">
         <div class="stat-item"><div class="stat-label">Capacity</div><div class="stat-value">${provider.capacityGB} GB</div></div>
         <div class="stat-item"><div class="stat-label">Score</div><div class="stat-value">${provider.score.toFixed(2)}</div></div>
-        <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${node.storage.getUptimePct(pub)}%</div></div>
+        <div class="stat-item" title="Liveness only — earnings are metered by reader-signed receipts, not by uptime."><div class="stat-label">Uptime (liveness)</div><div class="stat-value">${node.storage.getUptimePct(pub)}%</div></div>
         <div class="stat-item"><div class="stat-label">Rate</div><div class="stat-value">${formatUNIT(provider.earningRate)} UNIT/day</div></div>
         <div class="stat-item"><div class="stat-label">Total Earned</div><div class="stat-value">${formatUNIT(provider.totalEarned)} UNIT</div></div>
         <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '-'}</div></div>
@@ -4056,13 +4056,27 @@ function refreshStorage() {
       const myUsed = p.lastActualStoredBytes > 0
         ? `<div style="font-size:10px;color:var(--text-muted)">${fmtBytes(p.lastActualStoredBytes)} used</div>`
         : '<div style="font-size:10px;color:var(--text-muted)">empty — declared capacity earns nothing</div>';
+      // Earnings stopped being metered by uptime on 2026-09-22: volume is only
+      // payable when READERS attest it, and this path fails closed without
+      // that. So a row showing "100% uptime" beside an earning rate would be
+      // claiming a causal link that no longer exists — the same defect as
+      // rendering the unmeasured as fact, one level up.
+      //
+      // Until settlement is wired end to end there is nothing attested, so the
+      // honest rate is "—" with the reason attached, not a number.
+      const attested = node.ledger.storageProviders.get(servingAccount.pub);
+      const rateCell = p.earningRate > 0
+        ? formatUNIT(p.earningRate)
+        : '<span title="Earnings are metered by reader-signed receipts (storage-settlement). '
+          + 'Uptime is a liveness signal and no longer determines pay.">— not yet attested</span>';
+      void attested;
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB${myUsed}</td>
-        <td title="${p.heartbeatsLast24h} renewal block(s) in the counting window (one epoch + half an interval of slack)">${
+        <td title="Liveness only — ${p.heartbeatsLast24h} renewal block(s) in the counting window. Does NOT determine earnings.">${
           uptime}${uptimeFraction === undefined ? '' : ` (${shown}/${due} renewals)`}</td>
         <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
-        <td>${formatUNIT(p.earningRate)}</td>
+        <td>${rateCell}</td>
         <td>${formatUNIT(p.totalEarned)}</td>
         <td>${lastReward}</td>
       </tr>`;

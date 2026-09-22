@@ -321,6 +321,14 @@ export class ProviderLedger {
   private readonly epochs = new Map<string, Map<number, EpochRecord>>();
   /** pub → capacity changes over time, oldest first. One entry per register/deregister. */
   private readonly capacityHistory = new Map<string, { ts: number; capacityGB: number }[]>();
+  /**
+   * Reader-attested service volume, keyed `pub:epochDay`.
+   *
+   * Populated from settled receipts, never from a provider's own report. Empty
+   * means "nobody has vouched for this provider yet", which pays zero — the
+   * fail-closed direction.
+   */
+  private readonly attestedGB = new Map<string, number>();
   /** pub → timestamps of recent counted heartbeats (bounded ring). */
   private readonly heartbeatTimes = new Map<string, number[]>();
 
@@ -425,7 +433,46 @@ export class ProviderLedger {
    *
    * Returns a string when no reward is owed at all.
    */
-  rewardTerms(pub: string, epochDay: number): RewardTerms | string {
+  /**
+   * Record reader-attested service for an epoch. The ONLY way volume becomes
+   * payable.
+   */
+  setAttestedGB(pub: string, epochDay: number, gb: number): void {
+    if (!(gb > 0)) return;
+    this.attestedGB.set(`${pub}:${epochDay}`, gb);
+  }
+
+  /** Drop attestations for epochs no longer claimable, so the map has a remover. */
+  sweepAttested(oldestClaimableEpochDay: number): number {
+    let removed = 0;
+    for (const k of [...this.attestedGB.keys()]) {
+      const day = Number(k.slice(k.lastIndexOf(':') + 1));
+      if (Number.isFinite(day) && day < oldestClaimableEpochDay) {
+        this.attestedGB.delete(k);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * `requireAttested` gates ISSUANCE only, never validation.
+   *
+   * This distinction is load-bearing and was found by a test rather than by
+   * design. Attestation lives in LOCAL state — receipts this node happens to
+   * have seen — while `validate` runs on every peer. Gating validation on it
+   * made a correctly-issued reward block rejected by any peer that had not
+   * seen the same receipts, which strands every later block on that chain as
+   * non-sequential. That is the exact failure mode CLAUDE.md warns about, and
+   * it is how NFTs once vanished on reload.
+   *
+   * So: a node refuses to CREATE a reward it cannot justify from reader-signed
+   * evidence, and still ACCEPTS peers' blocks under the existing on-chain
+   * evidence ceiling. Making validation attestation-aware requires the
+   * evidence to travel IN the block — `content/storage-settlement.ts` — which
+   * is the remaining half of the migration.
+   */
+  rewardTerms(pub: string, epochDay: number, opts?: { requireAttested?: boolean }): RewardTerms | string {
     const p = this.providers.get(pub);
     if (!p || p.capacityGB <= 0) return 'not a registered storage provider';
     if (p.lastRewardEpoch >= epochDay) return `epoch ${epochDay} already rewarded`;
@@ -456,6 +503,37 @@ export class ProviderLedger {
     const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_EPOCH, 1);
     const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
     if (amount <= 0) return 'calculated reward is zero';
+
+    // ── FAIL CLOSED ON SELF-REPORTED VOLUME (2026-09-22) ────────────────────
+    //
+    // Everything above is computed from numbers the PAYEE supplied: its own
+    // `storedBytes` heartbeats and its own declared capacity. `validate` then
+    // checked the claim against terms derived from that same self-report, so
+    // the verification was circular and bounded nothing (SCREENING.md → 11).
+    //
+    // The replacement is reader-attested receipts settled through
+    // `content/storage-settlement.ts`. Until a settlement supplies attested
+    // volume, this path pays NOTHING — it does not fall back to the old
+    // figures. Fail-closed is the only safe direction while a payment path is
+    // being migrated: paying on unverifiable numbers "just until the new code
+    // lands" is how a temporary measure becomes the live one.
+    //
+    // The arithmetic is kept rather than deleted so the legacy chains that
+    // contain these blocks still replay, and so the exact shape of what was
+    // wrong stays visible next to what replaced it. Delete it with the rest of
+    // the legacy path once settlement is wired end to end.
+    if (!opts?.requireAttested) {
+      // Validation path: bounded by the on-chain evidence ceiling as before.
+      return { epochDay, storedGB: effectiveGB, heartbeatCount, amount };
+    }
+    if (!this.attestedGB.has(`${pub}:${epochDay}`)) {
+      return 'no reader-attested service for this epoch — self-reported volume is not payable';
+    }
+    const attested = this.attestedGB.get(`${pub}:${epochDay}`)!;
+    const payableGB = Math.min(effectiveGB, attested);
+    const attestedAmount = Math.floor(BASE_STORAGE_RATE_MILLI * payableGB * uptimeFactor);
+    if (attestedAmount <= 0) return 'attested reward is zero';
+    return { epochDay, storedGB: payableGB, heartbeatCount, amount: attestedAmount };
 
     return { epochDay, storedGB: effectiveGB, heartbeatCount, amount };
   }

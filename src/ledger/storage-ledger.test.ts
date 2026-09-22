@@ -49,7 +49,7 @@ class Chain {
    *  throwaway accumulator rebuilt from what has actually been committed. */
   private readonly committed: string[] = [];
   private head: Block;
-  constructor(private readonly keys: SignerKeys, open: Block) {
+  constructor(readonly keys: SignerKeys, open: Block) {
     this.committed.push(open.hash);
     this.head = open;
   }
@@ -97,8 +97,18 @@ async function provider(capacityGB = 10) {
   return { ledger, keys, chain };
 }
 
-/** A full day of heartbeats on epoch `TODAY - 2`, each reporting `storedGB` held. */
-function fullDayOfHeartbeats(ledger: EngineLedger, chain: Chain, storedGB: number): void {
+/**
+ * A full day of heartbeats on epoch `TODAY - 2`, each reporting `storedGB` held.
+ *
+ * Also records reader attestation for the same volume. Since 2026-09-22 a
+ * reward is payable only against reader-signed evidence and this path fails
+ * closed without it, so a test about the REWARD arithmetic has to supply the
+ * attestation the network would. `attest: false` exercises the fail-closed
+ * rule itself.
+ */
+function fullDayOfHeartbeats(
+  ledger: EngineLedger, chain: Chain, storedGB: number, attest = true,
+): void {
   for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
     const { result } = chain.push(
       ledger, 'storage-heartbeat', DAY1 + i * HEARTBEAT_INTERVAL_MS,
@@ -106,6 +116,7 @@ function fullDayOfHeartbeats(ledger: EngineLedger, chain: Chain, storedGB: numbe
     );
     expect(result.success).toBe(true);
   }
+  if (attest) ledger.providerLedger.setAttestedGB(chain.keys.pub, TODAY - 2, storedGB);
 }
 
 afterEach(() => { vi.useRealTimers(); });
@@ -283,6 +294,9 @@ describe('an early heartbeat must not truncate the chain', () => {
     expect(ledger.countHeartbeatsLast24h(keys.pub, DAY1 + HEARTBEAT_INTERVAL_MS)).toBe(2);
 
     // And the spam bought nothing: a reward still prices at 2/6 uptime.
+    // Attested separately — uptime is what this test is about, and since
+    // 2026-09-22 no reward computes at all without reader-signed volume.
+    ledger.providerLedger.setAttestedGB(keys.pub, TODAY - 2, 1);
     const amount = BigInt(Math.floor(BASE_STORAGE_RATE_MILLI * 1 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
     const claim = chain.push(
       ledger, 'storage-reward', DAY1 + REWARD_EPOCH_MS, { epochDay: TODAY - 2, storedGB: 1 },
@@ -338,6 +352,10 @@ describe('local issuance (the create* path)', () => {
     }
 
     vi.setSystemTime(DAY1 + REWARD_EPOCH_MS);   // next day: yesterday is claimable
+    // Reader-signed volume for the claimed epoch. Without it the reward path
+    // fails closed (2026-09-22) — which is the point, and is covered by its own
+    // test; this one is about the end-to-end issue/accept round trip.
+    ledger.providerLedger.setAttestedGB(keys.pub, TODAY - 2, 6);
     const reward = await ledger.createStorageReward(keys.pub, keys);
     expect(reward.error).toBeUndefined();
     const expected = BASE_STORAGE_RATE_MILLI * 6;

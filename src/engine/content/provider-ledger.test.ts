@@ -157,6 +157,7 @@ describe('deregistering does not launder the account history', () => {
     // Only the FIRST heartbeat of the day counts: the rest are inside the
     // interval, measured against a clock the attacker cannot destroy.
     expect(pl.heartbeatsInEpoch(PUB, 100)).toBe(1);
+    pl.setAttestedGB(PUB, 100, 1000);   // readers vouch; uptime is what is under test
     const terms = pl.rewardTerms(PUB, 100);
     if (typeof terms === 'string') throw new Error(terms);
     expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 1000 * (1 / MAX_HEARTBEATS_PER_EPOCH)));
@@ -192,11 +193,19 @@ describe('deregistering does not launder the account history', () => {
 
 describe('reward terms', () => {
   /** A full day of heartbeats reporting `storedBytes`, on epoch `day`. */
-  function fullDay(pl: ProviderLedger, day: number, storedBytes: number): void {
+  /**
+   * A full day of heartbeats.
+   *
+   * `attest` defaults to true because most tests here are about the reward
+   * ARITHMETIC, and since 2026-09-22 no arithmetic runs at all without
+   * reader-attested volume. Pass false to exercise the fail-closed rule.
+   */
+  function fullDay(pl: ProviderLedger, day: number, storedBytes: number, attest = true): void {
     for (let i = 0; i < MAX_HEARTBEATS_PER_EPOCH; i++) {
       const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes }), ts);
     }
+    if (attest) pl.setAttestedGB(PUB, day, storedBytes / GB_BYTES);
   }
 
   it('pays for bytes actually held, scaled by uptime', () => {
@@ -211,44 +220,63 @@ describe('reward terms', () => {
   });
 
   /**
-   * ⚠ ADVERSARIAL CONTROL — this test asserts a WEAKNESS, not a guarantee.
+   * Was an ADVERSARIAL CONTROL, now the GUARANTEE — rewritten 2026-09-22
+   * exactly as the original comment predicted it would be.
    *
-   * Attacker's goal: earn full storage rewards while holding nothing.
+   * The old reward was `BASE_RATE x min(storedGB, capacityAtStart) x uptime`,
+   * and both volume terms came from the provider being paid: `storedBytes`
+   * rode in its own heartbeat and `capacityGB` was whatever it declared.
+   * `validate` checked the claim against terms computed from that same
+   * self-report, so the verification was circular and a provider storing
+   * NOTHING earned the full rate for a declaration.
    *
-   * The payout is `BASE_RATE × min(storedGB, capacityAtStart) × uptime`. Both
-   * terms come from the provider itself: `storedBytes` rides in its own
-   * heartbeat block, and `capacityAtStart` is whatever it declared when it
-   * registered. The on-chain "evidence ceiling" bounds UPTIME (counted
-   * heartbeats), which is cheap to produce honestly — it bounds nothing about
-   * volume. `validate` then checks the claimed `storedGB` against
-   * `rewardTerms`, which is computed from the same self-report, so the
-   * verification is circular.
-   *
-   * Cost to the attacker: one registration and six heartbeats per epoch. No
-   * bytes are transferred, no content is served, no spot check is involved in
-   * the payout at all.
-   *
-   * Kept as a control the way `face-match.test.ts` keeps the v2 brute force:
-   * when custody-proven payouts land (ARCHITECTURE → Phase 4), this test
-   * should FAIL and be rewritten as the guarantee.
+   * Volume is now payable only when readers attest it
+   * (`content/read-receipts.ts`, settled through `storage-settlement.ts`), and
+   * this path FAILS CLOSED: no attestation, no payment. It does not fall back
+   * to the old figures, because paying on unverifiable numbers "just until the
+   * new code lands" is how a temporary measure becomes the live one.
    */
-  it('ATTACK: a provider that stores nothing earns the full rate by declaring capacity', () => {
+  it('GUARANTEE: declaring capacity and self-reporting bytes now earns NOTHING', () => {
     const HUGE_GB = 10_000;
-    const pl = registered(HUGE_GB, DAY - REWARD_EPOCH_MS);   // costs nothing to declare
-    fullDay(pl, 100, HUGE_GB * GB_BYTES);                    // self-reported, never verified
+    const pl = registered(HUGE_GB, DAY - REWARD_EPOCH_MS);
+    fullDay(pl, 100, HUGE_GB * GB_BYTES, /* attest */ false);
+    // `requireAttested` gates ISSUANCE. Validation deliberately does not use
+    // it: attestation is local state, so gating validation on it would make a
+    // correctly-issued block rejected by peers that had not seen the same
+    // receipts, stranding every later block on the chain.
+    expect(pl.rewardTerms(PUB, 100, { requireAttested: true })).toMatch(/not payable/);
+    // …and a peer validating the same chain is unaffected.
+    expect(typeof pl.rewardTerms(PUB, 100)).not.toBe('string');
+  });
 
-    const terms = pl.rewardTerms(PUB, 100);
+  it('pays only up to what readers attested, never what was self-reported', () => {
+    const pl = registered(10_000, DAY - REWARD_EPOCH_MS);
+    fullDay(pl, 100, 10_000 * GB_BYTES, false);
+    pl.setAttestedGB(PUB, 100, 4);   // readers vouch for 4 GB of the 10,000 claimed
+    const terms = pl.rewardTerms(PUB, 100, { requireAttested: true });
     if (typeof terms === 'string') throw new Error(terms);
-    expect(terms.storedGB).toBe(HUGE_GB);
-    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * HUGE_GB);
+    expect(terms.storedGB).toBe(4);
+    expect(terms.amount).toBe(BASE_STORAGE_RATE_MILLI * 4);
+  });
 
-    // And the honest provider next door, holding 4 GB for real, earns 2500×
-    // less for doing actual work. The incentive points the wrong way.
-    const honest = registered(10, DAY - REWARD_EPOCH_MS);
-    fullDay(honest, 100, 4 * GB_BYTES);
-    const honestTerms = honest.rewardTerms(PUB, 100);
-    if (typeof honestTerms === 'string') throw new Error(honestTerms);
-    expect(terms.amount / honestTerms.amount).toBe(HUGE_GB / 4);
+  it('keeps the declared-capacity ceiling too — attestation does not lift it', () => {
+    // Both bounds apply: never past what was offered, never past what was
+    // witnessed. The tighter one wins.
+    const pl = registered(2, DAY - REWARD_EPOCH_MS);
+    fullDay(pl, 100, 2 * GB_BYTES, false);
+    pl.setAttestedGB(PUB, 100, 500);
+    const terms = pl.rewardTerms(PUB, 100, { requireAttested: true });
+    if (typeof terms === 'string') throw new Error(terms);
+    expect(terms.storedGB).toBe(2);
+  });
+
+  it('sweeps attestations for epochs that can no longer be claimed', () => {
+    // Keyed by a provider an outsider chooses, so it needs a remover
+    // (SCREENING.md -> 1).
+    const pl = registered(10, DAY - REWARD_EPOCH_MS);
+    pl.setAttestedGB(PUB, 90, 5);
+    pl.setAttestedGB(PUB, 100, 5);
+    expect(pl.sweepAttested(95)).toBe(1);
   });
 
   it('caps payment at declared capacity — over-reporting bytes earns nothing extra', () => {
@@ -266,6 +294,7 @@ describe('reward terms', () => {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 6 * GB_BYTES }), ts);
     }
+    pl.setAttestedGB(PUB, 100, 6);
     const terms = pl.rewardTerms(PUB, 100);
     if (typeof terms === 'string') throw new Error(terms);
     expect(terms.amount).toBe(Math.floor(BASE_STORAGE_RATE_MILLI * 6 * (2 / MAX_HEARTBEATS_PER_EPOCH)));
@@ -335,6 +364,7 @@ describe('reward terms', () => {
       const ts = DAY + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 6 * GB_BYTES }), ts);
     }
+    pl.setAttestedGB(PUB, claimableEpochDay(DAY + REWARD_EPOCH_MS), 6);
     const terms = pl.rewardTerms(PUB, claimableEpochDay(DAY + REWARD_EPOCH_MS));
     if (typeof terms === 'string') throw new Error(terms);
     expect(terms.epochDay).toBe(100);
@@ -364,6 +394,7 @@ describe('reward validation', () => {
       const ts = day * REWARD_EPOCH_MS + i * HEARTBEAT_INTERVAL_MS;
       pl.apply(blk('storage-heartbeat', ts, { storedBytes: 8 * GB_BYTES }), ts);
     }
+    pl.setAttestedGB(PUB, day, 8);
     const terms = pl.rewardTerms(PUB, day);
     if (typeof terms === 'string') throw new Error(terms);
     return terms.amount;
